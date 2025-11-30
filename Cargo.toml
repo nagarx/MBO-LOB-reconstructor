@@ -2,7 +2,7 @@
 name = "mbo-lob-reconstructor"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.82"
 authors = ["nagarx"]
 description = "High-performance MBO → LOB reconstruction and analytics for deep learning preprocessing"
 documentation = "https://docs.rs/mbo-lob-reconstructor"
