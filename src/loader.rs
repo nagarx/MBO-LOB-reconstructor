@@ -10,8 +10,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use tlob_rust::loader::DbnLoader;
-//! use tlob_rust::lob::LobReconstructor;
+//! use mbo_lob_reconstructor::{DbnLoader, LobReconstructor};
 //!
 //! // Create loader
 //! let mut loader = DbnLoader::new("path/to/file.dbn.zst")?;

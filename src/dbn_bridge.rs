@@ -11,7 +11,7 @@
 //!
 //! ```ignore
 //! use dbn::MboMsg;
-//! use tlob_rust::dbn_bridge::DbnBridge;
+//! use mbo_lob_reconstructor::DbnBridge;
 //!
 //! // Assuming you have a dbn::MboMsg from the decoder
 //! let dbn_msg: MboMsg = /* ... */;
