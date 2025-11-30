@@ -112,11 +112,11 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+pub mod analytics;
 pub mod error;
-pub mod types;
 pub mod lob;
 pub mod statistics;
-pub mod analytics;
+pub mod types;
 
 #[cfg(feature = "databento")]
 #[cfg_attr(docsrs, doc(cfg(feature = "databento")))]
@@ -128,16 +128,16 @@ pub mod loader;
 
 // Re-exports - Core types
 pub use error::{Result, TlobError};
-pub use types::{Action, MboMessage, Order, Side, LobState, BookConsistency};
+pub use types::{Action, BookConsistency, LobState, MboMessage, Order, Side};
 
 // Re-exports - LOB reconstruction
-pub use lob::{LobReconstructor, MultiSymbolLob, LobStats, LobConfig, CrossedQuotePolicy};
+pub use lob::{CrossedQuotePolicy, LobConfig, LobReconstructor, LobStats, MultiSymbolLob};
 
 // Re-exports - Statistics for ML
-pub use statistics::{RunningStats, DayStats, NormalizationParams};
+pub use statistics::{DayStats, NormalizationParams, RunningStats};
 
 // Re-exports - Analytics
-pub use analytics::{DepthStats, MarketImpact, LiquidityMetrics};
+pub use analytics::{DepthStats, LiquidityMetrics, MarketImpact};
 
 // Re-exports - Databento support (feature-gated)
 #[cfg(feature = "databento")]
@@ -145,4 +145,3 @@ pub use dbn_bridge::DbnBridge;
 
 #[cfg(feature = "databento")]
 pub use loader::{DbnLoader, LoaderStats};
-

@@ -10,13 +10,17 @@
 //! ```bash
 //! cargo test --test integration_test --release
 //! ```
+//!
+//! Note: These tests require the `databento` feature (enabled by default).
+
+#![cfg(feature = "databento")]
 
 use std::path::Path;
 use std::time::Instant;
 
 use mbo_lob_reconstructor::{
-    DbnLoader, LobReconstructor, DayStats, NormalizationParams,
-    LobConfig, CrossedQuotePolicy, BookConsistency,
+    BookConsistency, CrossedQuotePolicy, DayStats, DbnLoader, LobConfig, LobReconstructor,
+    NormalizationParams,
 };
 
 /// Path to the test data file (first day of NVDA data)
@@ -29,7 +33,7 @@ fn test_data_available() -> bool {
         return true;
     }
     // Try from workspace root
-    let workspace_path = format!("../{}", TEST_DATA_PATH);
+    let workspace_path = format!("../{TEST_DATA_PATH}");
     Path::new(&workspace_path).exists()
 }
 
@@ -38,7 +42,7 @@ fn get_test_data_path() -> String {
     if Path::new(TEST_DATA_PATH).exists() {
         TEST_DATA_PATH.to_string()
     } else {
-        format!("../{}", TEST_DATA_PATH)
+        format!("../{TEST_DATA_PATH}")
     }
 }
 
@@ -49,12 +53,12 @@ fn get_test_data_path() -> String {
 #[test]
 fn test_basic_reconstruction_with_real_data() {
     if !test_data_available() {
-        eprintln!("⚠️  Skipping test: test data not available at {}", TEST_DATA_PATH);
+        eprintln!("⚠️  Skipping test: test data not available at {TEST_DATA_PATH}");
         return;
     }
 
     let path = get_test_data_path();
-    println!("\n📂 Testing basic reconstruction with: {}", path);
+    println!("\n📂 Testing basic reconstruction with: {path}");
 
     let loader = DbnLoader::new(&path)
         .expect("Failed to create loader")
@@ -86,12 +90,26 @@ fn test_basic_reconstruction_with_real_data() {
 
     let elapsed = start.elapsed();
 
-    println!("  ✅ Processed {} messages in {:.2}s", processed, elapsed.as_secs_f64());
-    println!("  ✅ Valid LOB states: {} ({:.1}%)", valid_states, (valid_states as f64 / processed as f64) * 100.0);
-    println!("  ✅ Throughput: {:.0} msg/s", processed as f64 / elapsed.as_secs_f64());
+    println!(
+        "  ✅ Processed {} messages in {:.2}s",
+        processed,
+        elapsed.as_secs_f64()
+    );
+    println!(
+        "  ✅ Valid LOB states: {} ({:.1}%)",
+        valid_states,
+        (valid_states as f64 / processed as f64) * 100.0
+    );
+    println!(
+        "  ✅ Throughput: {:.0} msg/s",
+        processed as f64 / elapsed.as_secs_f64()
+    );
 
     // Assertions
-    assert!(processed >= 100_000, "Should process at least 100K messages");
+    assert!(
+        processed >= 100_000,
+        "Should process at least 100K messages"
+    );
     assert!(valid_states > processed / 2, "Most states should be valid");
 }
 
@@ -107,7 +125,7 @@ fn test_enriched_analytics_with_real_data() {
     }
 
     let path = get_test_data_path();
-    println!("\n📂 Testing enriched analytics with: {}", path);
+    println!("\n📂 Testing enriched analytics with: {path}");
 
     let loader = DbnLoader::new(&path)
         .expect("Failed to create loader")
@@ -144,10 +162,12 @@ fn test_enriched_analytics_with_real_data() {
                 // Test depth imbalance
                 if let Some(imbalance) = state.depth_imbalance() {
                     imbalance_sum += imbalance;
-                    
+
                     // Imbalance should be in [-1, 1]
-                    assert!(imbalance >= -1.0 && imbalance <= 1.0, 
-                            "Imbalance {} out of range", imbalance);
+                    assert!(
+                        (-1.0..=1.0).contains(&imbalance),
+                        "Imbalance {imbalance} out of range"
+                    );
                 }
 
                 // Test total volumes
@@ -158,8 +178,14 @@ fn test_enriched_analytics_with_real_data() {
                 // Test active levels
                 let active_bid = state.active_bid_levels();
                 let active_ask = state.active_ask_levels();
-                assert!(active_bid <= state.levels, "Active bid levels should not exceed total levels");
-                assert!(active_ask <= state.levels, "Active ask levels should not exceed total levels");
+                assert!(
+                    active_bid <= state.levels,
+                    "Active bid levels should not exceed total levels"
+                );
+                assert!(
+                    active_ask <= state.levels,
+                    "Active ask levels should not exceed total levels"
+                );
 
                 analytics_count += 1;
             }
@@ -176,19 +202,25 @@ fn test_enriched_analytics_with_real_data() {
     let avg_vwap_ask = vwap_ask_sum / analytics_count as f64;
     let avg_imbalance = imbalance_sum / analytics_count as f64;
 
-    println!("  📊 Analytics from {} valid states:", analytics_count);
-    println!("     Avg Microprice:    ${:.4}", avg_microprice);
-    println!("     Avg VWAP (bid):    ${:.4}", avg_vwap_bid);
-    println!("     Avg VWAP (ask):    ${:.4}", avg_vwap_ask);
-    println!("     Avg Imbalance:     {:.4}", avg_imbalance);
+    println!("  📊 Analytics from {analytics_count} valid states:");
+    println!("     Avg Microprice:    ${avg_microprice:.4}");
+    println!("     Avg VWAP (bid):    ${avg_vwap_bid:.4}");
+    println!("     Avg VWAP (ask):    ${avg_vwap_ask:.4}");
+    println!("     Avg Imbalance:     {avg_imbalance:.4}");
 
     // Sanity checks
     assert!(analytics_count >= 40_000, "Should have enough valid states");
     assert!(avg_microprice > 0.0, "Microprice should be positive");
     assert!(avg_vwap_bid > 0.0, "VWAP bid should be positive");
     assert!(avg_vwap_ask > 0.0, "VWAP ask should be positive");
-    assert!(avg_vwap_bid <= avg_vwap_ask, "VWAP bid should be <= VWAP ask (normal market)");
-    assert!(avg_imbalance.abs() < 0.5, "Average imbalance should be relatively balanced");
+    assert!(
+        avg_vwap_bid <= avg_vwap_ask,
+        "VWAP bid should be <= VWAP ask (normal market)"
+    );
+    assert!(
+        avg_imbalance.abs() < 0.5,
+        "Average imbalance should be relatively balanced"
+    );
 
     println!("  ✅ All enriched analytics tests passed");
 }
@@ -205,7 +237,7 @@ fn test_book_consistency_detection() {
     }
 
     let path = get_test_data_path();
-    println!("\n📂 Testing book consistency detection with: {}", path);
+    println!("\n📂 Testing book consistency detection with: {path}");
 
     let config = LobConfig::new(10)
         .with_crossed_quote_policy(CrossedQuotePolicy::Allow)
@@ -230,7 +262,7 @@ fn test_book_consistency_detection() {
 
         if let Ok(state) = lob.process_message(&msg) {
             total += 1;
-            
+
             match state.check_consistency() {
                 BookConsistency::Valid => valid += 1,
                 BookConsistency::Empty => empty += 1,
@@ -248,22 +280,48 @@ fn test_book_consistency_detection() {
     let stats = lob.stats();
 
     println!("  📊 Book Consistency Results:");
-    println!("     Total states:     {}", total);
-    println!("     Valid:            {} ({:.2}%)", valid, (valid as f64 / total as f64) * 100.0);
-    println!("     Empty:            {} ({:.2}%)", empty, (empty as f64 / total as f64) * 100.0);
-    println!("     Crossed:          {} ({:.4}%)", crossed, (crossed as f64 / total as f64) * 100.0);
-    println!("     Locked:           {} ({:.4}%)", locked, (locked as f64 / total as f64) * 100.0);
+    println!("     Total states:     {total}");
+    println!(
+        "     Valid:            {} ({:.2}%)",
+        valid,
+        (valid as f64 / total as f64) * 100.0
+    );
+    println!(
+        "     Empty:            {} ({:.2}%)",
+        empty,
+        (empty as f64 / total as f64) * 100.0
+    );
+    println!(
+        "     Crossed:          {} ({:.4}%)",
+        crossed,
+        (crossed as f64 / total as f64) * 100.0
+    );
+    println!(
+        "     Locked:           {} ({:.4}%)",
+        locked,
+        (locked as f64 / total as f64) * 100.0
+    );
     println!("  📊 Stats tracking:");
     println!("     crossed_quotes:   {}", stats.crossed_quotes);
     println!("     locked_quotes:    {}", stats.locked_quotes);
 
     // Assertions
-    assert_eq!(crossed, stats.crossed_quotes, "Crossed count should match stats");
-    assert_eq!(locked, stats.locked_quotes, "Locked count should match stats");
-    
+    assert_eq!(
+        crossed, stats.crossed_quotes,
+        "Crossed count should match stats"
+    );
+    assert_eq!(
+        locked, stats.locked_quotes,
+        "Locked count should match stats"
+    );
+
     // In normal market data, vast majority should be valid
     let valid_ratio = valid as f64 / total as f64;
-    assert!(valid_ratio > 0.5, "Most states should be valid, got {:.2}%", valid_ratio * 100.0);
+    assert!(
+        valid_ratio > 0.5,
+        "Most states should be valid, got {:.2}%",
+        valid_ratio * 100.0
+    );
 
     println!("  ✅ Book consistency detection tests passed");
 }
@@ -280,7 +338,7 @@ fn test_day_stats_tracking() {
     }
 
     let path = get_test_data_path();
-    println!("\n📂 Testing DayStats tracking with: {}", path);
+    println!("\n📂 Testing DayStats tracking with: {path}");
 
     let loader = DbnLoader::new(&path)
         .expect("Failed to create loader")
@@ -313,33 +371,61 @@ fn test_day_stats_tracking() {
     println!("     Empty snapshots:  {}", day_stats.empty_snapshots);
     println!("     Crossed quotes:   {}", day_stats.crossed_quotes);
     println!("     Locked quotes:    {}", day_stats.locked_quotes);
-    println!("     Data quality:     {:.2}%", day_stats.data_quality_ratio() * 100.0);
+    println!(
+        "     Data quality:     {:.2}%",
+        day_stats.data_quality_ratio() * 100.0
+    );
     println!();
     println!("  📊 Price Statistics:");
     println!("     Mid-price mean:   ${:.4}", day_stats.mid_price.mean);
     println!("     Mid-price std:    ${:.4}", day_stats.mid_price.std());
-    println!("     Mid-price range:  ${:.4} - ${:.4}", day_stats.mid_price.min, day_stats.mid_price.max);
+    println!(
+        "     Mid-price range:  ${:.4} - ${:.4}",
+        day_stats.mid_price.min, day_stats.mid_price.max
+    );
     println!();
     println!("  📊 Spread Statistics:");
     println!("     Spread mean:      ${:.6}", day_stats.spread.mean);
-    println!("     Spread (bps):     {:.2} bps", day_stats.spread_bps.mean);
+    println!(
+        "     Spread (bps):     {:.2} bps",
+        day_stats.spread_bps.mean
+    );
     println!();
     println!("  📊 Volume Statistics:");
     println!("     Bid size mean:    {:.0}", day_stats.best_bid_size.mean);
     println!("     Ask size mean:    {:.0}", day_stats.best_ask_size.mean);
-    println!("     Imbalance mean:   {:.4}", day_stats.depth_imbalance.mean);
+    println!(
+        "     Imbalance mean:   {:.4}",
+        day_stats.depth_imbalance.mean
+    );
 
     // Assertions
-    assert_eq!(day_stats.total_messages, processed, "Total messages should match");
+    assert_eq!(
+        day_stats.total_messages, processed,
+        "Total messages should match"
+    );
     assert!(day_stats.valid_snapshots > 0, "Should have valid snapshots");
     assert!(day_stats.mid_price.count > 0, "Should have mid-price data");
-    assert!(day_stats.mid_price.mean > 0.0, "Mid-price should be positive");
-    assert!(day_stats.spread.mean >= 0.0, "Spread should be non-negative");
-    assert!(day_stats.spread_bps.mean >= 0.0, "Spread bps should be non-negative");
-    
+    assert!(
+        day_stats.mid_price.mean > 0.0,
+        "Mid-price should be positive"
+    );
+    assert!(
+        day_stats.spread.mean >= 0.0,
+        "Spread should be non-negative"
+    );
+    assert!(
+        day_stats.spread_bps.mean >= 0.0,
+        "Spread bps should be non-negative"
+    );
+
     // Check data quality
     let quality = day_stats.data_quality_ratio();
-    assert!(quality > 0.3, "Data quality should be reasonable, got {:.2}%", quality * 100.0);
+    assert!(
+        quality > 0.3,
+        "Data quality should be reasonable, got {:.2}%",
+        quality * 100.0
+    );
 
     println!("  ✅ DayStats tracking tests passed");
 }
@@ -356,7 +442,7 @@ fn test_normalization_params_from_real_data() {
     }
 
     let path = get_test_data_path();
-    println!("\n📂 Testing NormalizationParams with: {}", path);
+    println!("\n📂 Testing NormalizationParams with: {path}");
 
     let loader = DbnLoader::new(&path)
         .expect("Failed to create loader")
@@ -392,30 +478,38 @@ fn test_normalization_params_from_real_data() {
     println!();
     println!("  📊 Sample means (first 4 features):");
     for i in 0..4.min(params.means.len()) {
-        println!("     {}: mean={:.4}, std={:.4}", 
-                 params.feature_names[i], params.means[i], params.stds[i]);
+        println!(
+            "     {}: mean={:.4}, std={:.4}",
+            params.feature_names[i], params.means[i], params.stds[i]
+        );
     }
 
     // Test normalization/denormalization round-trip
     let test_value = 100.0;
     let normalized = params.normalize(test_value, 0);
     let denormalized = params.denormalize(normalized, 0);
-    
+
     println!();
     println!("  📊 Normalization round-trip test:");
-    println!("     Original:         {:.4}", test_value);
-    println!("     Normalized:       {:.4}", normalized);
-    println!("     Denormalized:     {:.4}", denormalized);
+    println!("     Original:         {test_value:.4}");
+    println!("     Normalized:       {normalized:.4}");
+    println!("     Denormalized:     {denormalized:.4}");
 
     // Assertions
-    assert_eq!(params.means.len(), 40, "Should have 40 features (10 levels × 4)");
+    assert_eq!(
+        params.means.len(),
+        40,
+        "Should have 40 features (10 levels × 4)"
+    );
     assert_eq!(params.stds.len(), 40, "Stds should match means length");
     assert_eq!(params.feature_names.len(), 40, "Feature names should match");
     assert!(params.sample_count > 0, "Should have samples");
-    
+
     // Round-trip should be close
-    assert!((test_value - denormalized).abs() < 0.001, 
-            "Round-trip should preserve value");
+    assert!(
+        (test_value - denormalized).abs() < 0.001,
+        "Round-trip should preserve value"
+    );
 
     println!("  ✅ NormalizationParams tests passed");
 }
@@ -432,7 +526,7 @@ fn test_crossed_quote_policy_use_last_valid() {
     }
 
     let path = get_test_data_path();
-    println!("\n📂 Testing UseLastValid policy with: {}", path);
+    println!("\n📂 Testing UseLastValid policy with: {path}");
 
     let config = LobConfig::new(10)
         .with_crossed_quote_policy(CrossedQuotePolicy::UseLastValid)
@@ -454,7 +548,7 @@ fn test_crossed_quote_policy_use_last_valid() {
 
         if let Ok(state) = lob.process_message(&msg) {
             total += 1;
-            
+
             // With UseLastValid policy, we should never get a crossed state back
             if state.is_crossed() {
                 crossed_returned += 1;
@@ -469,9 +563,9 @@ fn test_crossed_quote_policy_use_last_valid() {
     let stats = lob.stats();
 
     println!("  📊 UseLastValid Policy Results:");
-    println!("     Total processed:  {}", total);
+    println!("     Total processed:  {total}");
     println!("     Crossed detected: {} (internal)", stats.crossed_quotes);
-    println!("     Crossed returned: {} (to user)", crossed_returned);
+    println!("     Crossed returned: {crossed_returned} (to user)");
 
     // With UseLastValid, we should get 0 crossed states returned
     // (they should be replaced with last valid)
@@ -491,7 +585,7 @@ fn test_performance_with_real_data() {
     }
 
     let path = get_test_data_path();
-    println!("\n📂 Testing performance with: {}", path);
+    println!("\n📂 Testing performance with: {path}");
 
     let loader = DbnLoader::new(&path)
         .expect("Failed to create loader")
@@ -522,22 +616,44 @@ fn test_performance_with_real_data() {
     let ns_per_msg = elapsed.as_nanos() as f64 / processed as f64;
 
     println!("  ⚡ Performance Results:");
-    println!("     Messages:         {}", processed);
+    println!("     Messages:         {processed}");
     println!("     Time:             {:.2}s", elapsed.as_secs_f64());
-    println!("     Throughput:       {:.0} msg/s", throughput);
-    println!("     Latency:          {:.0} ns/msg", ns_per_msg);
+    println!("     Throughput:       {throughput:.0} msg/s");
+    println!("     Latency:          {ns_per_msg:.0} ns/msg");
 
-    // Performance assertions
-    // Target: >100K msg/s (should be much higher)
-    assert!(throughput > 100_000.0, 
-            "Throughput should be >100K msg/s, got {:.0}", throughput);
-    
-    // Target: <10μs per message
-    assert!(ns_per_msg < 10_000.0, 
-            "Latency should be <10μs, got {:.0}ns", ns_per_msg);
+    // Performance assertions - only strict in release mode
+    // Debug mode is ~10x slower due to no optimizations
+    #[cfg(debug_assertions)]
+    {
+        // Relaxed thresholds for debug builds
+        assert!(
+            throughput > 10_000.0,
+            "Throughput should be >10K msg/s even in debug, got {throughput:.0}"
+        );
+        println!("  ✅ Performance test passed (debug mode, relaxed thresholds)");
+    }
 
-    println!("  ✅ Performance tests passed (>{:.0}K msg/s, <{:.0}μs/msg)", 
-             throughput / 1000.0, ns_per_msg / 1000.0);
+    #[cfg(not(debug_assertions))]
+    {
+        // Strict thresholds for release builds
+        // Target: >100K msg/s (should be much higher)
+        assert!(
+            throughput > 100_000.0,
+            "Throughput should be >100K msg/s, got {throughput:.0}"
+        );
+
+        // Target: <10μs per message
+        assert!(
+            ns_per_msg < 10_000.0,
+            "Latency should be <10μs, got {ns_per_msg:.0}ns"
+        );
+
+        println!(
+            "  ✅ Performance tests passed (>{:.0}K msg/s, <{:.0}μs/msg)",
+            throughput / 1000.0,
+            ns_per_msg / 1000.0
+        );
+    }
 }
 
 // ============================================================================
@@ -552,7 +668,7 @@ fn test_full_day_processing() {
     }
 
     let path = get_test_data_path();
-    println!("\n📂 Full day processing test with: {}", path);
+    println!("\n📂 Full day processing test with: {path}");
     println!("   (This may take a while...)\n");
 
     let config = LobConfig::new(10)
@@ -565,7 +681,7 @@ fn test_full_day_processing() {
 
     let mut lob = LobReconstructor::with_config(config);
     let mut day_stats = DayStats::new("2025-02-03");
-    
+
     let mut processed = 0u64;
     let mut skipped = 0u64;
     let mut errors = 0u64;
@@ -594,8 +710,12 @@ fn test_full_day_processing() {
         // Progress report
         if processed - last_report >= report_interval {
             let elapsed = start.elapsed().as_secs_f64();
-            println!("  ⏱️  Processed: {:>10} | Rate: {:>8.0} msg/s | Time: {:.1}s",
-                     processed, processed as f64 / elapsed, elapsed);
+            println!(
+                "  ⏱️  Processed: {:>10} | Rate: {:>8.0} msg/s | Time: {:.1}s",
+                processed,
+                processed as f64 / elapsed,
+                elapsed
+            );
             last_report = processed;
         }
     }
@@ -609,14 +729,17 @@ fn test_full_day_processing() {
     println!("  ═══════════════════════════════════════════════════════════");
     println!();
     println!("  📈 Message Statistics:");
-    println!("     Processed:        {:>12}", processed);
-    println!("     Skipped:          {:>12}", skipped);
-    println!("     Errors:           {:>12}", errors);
-    println!("     Total:            {:>12}", processed + skipped + errors);
+    println!("     Processed:        {processed:>12}");
+    println!("     Skipped:          {skipped:>12}");
+    println!("     Errors:           {errors:>12}");
+    println!(
+        "     Total:            {:>12}",
+        processed + skipped + errors
+    );
     println!();
     println!("  ⚡ Performance:");
     println!("     Total time:       {:>12.2}s", elapsed.as_secs_f64());
-    println!("     Throughput:       {:>12.0} msg/s", throughput);
+    println!("     Throughput:       {throughput:>12.0} msg/s");
     println!();
     println!("  📊 LOB Statistics (from stats):");
     let stats = lob.stats();
@@ -627,26 +750,32 @@ fn test_full_day_processing() {
     println!("  📊 DayStats Summary:");
     println!("     Valid snapshots:  {:>12}", day_stats.valid_snapshots);
     println!("     Empty snapshots:  {:>12}", day_stats.empty_snapshots);
-    println!("     Data quality:     {:>11.2}%", day_stats.data_quality_ratio() * 100.0);
+    println!(
+        "     Data quality:     {:>11.2}%",
+        day_stats.data_quality_ratio() * 100.0
+    );
     println!();
     println!("  📊 Price Statistics:");
     println!("     Mid-price mean:   ${:>11.4}", day_stats.mid_price.mean);
-    println!("     Mid-price std:    ${:>11.4}", day_stats.mid_price.std());
+    println!(
+        "     Mid-price std:    ${:>11.4}",
+        day_stats.mid_price.std()
+    );
     println!("     Spread (bps):     {:>11.2}", day_stats.spread_bps.mean);
     println!();
     println!("  📊 Final LOB State:");
     let final_state = lob.get_lob_state();
     if let Some(mid) = final_state.mid_price() {
-        println!("     Mid-price:        ${:>11.4}", mid);
+        println!("     Mid-price:        ${mid:>11.4}");
     }
     if let Some(spread) = final_state.spread() {
-        println!("     Spread:           ${:>11.6}", spread);
+        println!("     Spread:           ${spread:>11.6}");
     }
     if let Some(microprice) = final_state.microprice() {
-        println!("     Microprice:       ${:>11.4}", microprice);
+        println!("     Microprice:       ${microprice:>11.4}");
     }
     if let Some(imbalance) = final_state.depth_imbalance() {
-        println!("     Imbalance:        {:>12.4}", imbalance);
+        println!("     Imbalance:        {imbalance:>12.4}");
     }
     println!();
 
@@ -673,7 +802,7 @@ fn test_depth_stats_with_real_data() {
     }
 
     let path = get_test_data_path();
-    println!("\n📂 Testing DepthStats with: {}", path);
+    println!("\n📂 Testing DepthStats with: {path}");
 
     let loader = DbnLoader::new(&path)
         .expect("Failed to create loader")
@@ -692,12 +821,12 @@ fn test_depth_stats_with_real_data() {
 
         if let Ok(state) = lob.process_message(&msg) {
             processed += 1;
-            
+
             // Sample every 1000 messages
             if processed % 1000 == 0 && state.is_valid() {
                 let bid_stats = DepthStats::from_lob_state(&state, Side::Bid);
                 let ask_stats = DepthStats::from_lob_state(&state, Side::Ask);
-                
+
                 if !bid_stats.is_empty() {
                     bid_stats_samples.push(bid_stats);
                 }
@@ -713,40 +842,62 @@ fn test_depth_stats_with_real_data() {
     }
 
     // Calculate averages
-    let avg_bid_volume: f64 = bid_stats_samples.iter()
+    let avg_bid_volume: f64 = bid_stats_samples
+        .iter()
         .map(|s| s.total_volume as f64)
-        .sum::<f64>() / bid_stats_samples.len() as f64;
-    
-    let avg_ask_volume: f64 = ask_stats_samples.iter()
-        .map(|s| s.total_volume as f64)
-        .sum::<f64>() / ask_stats_samples.len() as f64;
-    
-    let avg_bid_levels: f64 = bid_stats_samples.iter()
-        .map(|s| s.levels_count as f64)
-        .sum::<f64>() / bid_stats_samples.len() as f64;
-    
-    let avg_ask_levels: f64 = ask_stats_samples.iter()
-        .map(|s| s.levels_count as f64)
-        .sum::<f64>() / ask_stats_samples.len() as f64;
-    
-    let avg_bid_concentration: f64 = bid_stats_samples.iter()
-        .map(|s| s.concentration_ratio)
-        .sum::<f64>() / bid_stats_samples.len() as f64;
+        .sum::<f64>()
+        / bid_stats_samples.len() as f64;
 
-    println!("  📊 DepthStats Results ({} samples):", bid_stats_samples.len());
+    let avg_ask_volume: f64 = ask_stats_samples
+        .iter()
+        .map(|s| s.total_volume as f64)
+        .sum::<f64>()
+        / ask_stats_samples.len() as f64;
+
+    let avg_bid_levels: f64 = bid_stats_samples
+        .iter()
+        .map(|s| s.levels_count as f64)
+        .sum::<f64>()
+        / bid_stats_samples.len() as f64;
+
+    let avg_ask_levels: f64 = ask_stats_samples
+        .iter()
+        .map(|s| s.levels_count as f64)
+        .sum::<f64>()
+        / ask_stats_samples.len() as f64;
+
+    let avg_bid_concentration: f64 = bid_stats_samples
+        .iter()
+        .map(|s| s.concentration_ratio)
+        .sum::<f64>()
+        / bid_stats_samples.len() as f64;
+
+    println!(
+        "  📊 DepthStats Results ({} samples):",
+        bid_stats_samples.len()
+    );
     println!();
     println!("  📊 Bid Side:");
-    println!("     Avg total volume: {:.0}", avg_bid_volume);
-    println!("     Avg levels:       {:.1}", avg_bid_levels);
-    println!("     Avg concentration:{:.2}%", avg_bid_concentration * 100.0);
+    println!("     Avg total volume: {avg_bid_volume:.0}");
+    println!("     Avg levels:       {avg_bid_levels:.1}");
+    println!(
+        "     Avg concentration:{:.2}%",
+        avg_bid_concentration * 100.0
+    );
     println!();
     println!("  📊 Ask Side:");
-    println!("     Avg total volume: {:.0}", avg_ask_volume);
-    println!("     Avg levels:       {:.1}", avg_ask_levels);
+    println!("     Avg total volume: {avg_ask_volume:.0}");
+    println!("     Avg levels:       {avg_ask_levels:.1}");
 
     // Assertions
-    assert!(!bid_stats_samples.is_empty(), "Should have bid stats samples");
-    assert!(!ask_stats_samples.is_empty(), "Should have ask stats samples");
+    assert!(
+        !bid_stats_samples.is_empty(),
+        "Should have bid stats samples"
+    );
+    assert!(
+        !ask_stats_samples.is_empty(),
+        "Should have ask stats samples"
+    );
     assert!(avg_bid_volume > 0.0, "Bid volume should be positive");
     assert!(avg_ask_volume > 0.0, "Ask volume should be positive");
     assert!(avg_bid_levels > 0.0, "Should have bid levels");
@@ -769,7 +920,7 @@ fn test_market_impact_with_real_data() {
     }
 
     let path = get_test_data_path();
-    println!("\n📂 Testing MarketImpact with: {}", path);
+    println!("\n📂 Testing MarketImpact with: {path}");
 
     let loader = DbnLoader::new(&path)
         .expect("Failed to create loader")
@@ -787,7 +938,7 @@ fn test_market_impact_with_real_data() {
 
         if let Ok(state) = lob.process_message(&msg) {
             processed += 1;
-            
+
             // Sample every 1000 messages
             if processed % 1000 == 0 && state.is_valid() {
                 // Simulate buying 1000 shares
@@ -804,30 +955,33 @@ fn test_market_impact_with_real_data() {
     }
 
     // Calculate averages
-    let avg_slippage_bps: f64 = impact_samples.iter()
-        .map(|i| i.slippage_bps)
-        .sum::<f64>() / impact_samples.len() as f64;
-    
-    let avg_levels_consumed: f64 = impact_samples.iter()
-        .map(|i| i.levels_consumed as f64)
-        .sum::<f64>() / impact_samples.len() as f64;
-    
-    let avg_fill_ratio: f64 = impact_samples.iter()
-        .map(|i| i.fill_ratio())
-        .sum::<f64>() / impact_samples.len() as f64;
-    
-    let fully_filled_count = impact_samples.iter()
-        .filter(|i| i.can_fill())
-        .count();
+    let avg_slippage_bps: f64 =
+        impact_samples.iter().map(|i| i.slippage_bps).sum::<f64>() / impact_samples.len() as f64;
 
-    println!("  📊 MarketImpact Results for 1000 shares ({} samples):", impact_samples.len());
+    let avg_levels_consumed: f64 = impact_samples
+        .iter()
+        .map(|i| i.levels_consumed as f64)
+        .sum::<f64>()
+        / impact_samples.len() as f64;
+
+    let avg_fill_ratio: f64 =
+        impact_samples.iter().map(|i| i.fill_ratio()).sum::<f64>() / impact_samples.len() as f64;
+
+    let fully_filled_count = impact_samples.iter().filter(|i| i.can_fill()).count();
+
+    println!(
+        "  📊 MarketImpact Results for 1000 shares ({} samples):",
+        impact_samples.len()
+    );
     println!();
-    println!("     Avg slippage:     {:.2} bps", avg_slippage_bps);
-    println!("     Avg levels used:  {:.1}", avg_levels_consumed);
+    println!("     Avg slippage:     {avg_slippage_bps:.2} bps");
+    println!("     Avg levels used:  {avg_levels_consumed:.1}");
     println!("     Avg fill ratio:   {:.2}%", avg_fill_ratio * 100.0);
-    println!("     Fully filled:     {} ({:.1}%)", 
-             fully_filled_count, 
-             (fully_filled_count as f64 / impact_samples.len() as f64) * 100.0);
+    println!(
+        "     Fully filled:     {} ({:.1}%)",
+        fully_filled_count,
+        (fully_filled_count as f64 / impact_samples.len() as f64) * 100.0
+    );
 
     // Sample a specific impact
     if let Some(sample) = impact_samples.last() {
@@ -836,8 +990,14 @@ fn test_market_impact_with_real_data() {
         println!("     Best price:       ${:.4}", sample.best_price);
         println!("     Avg price:        ${:.4}", sample.avg_price);
         println!("     Worst price:      ${:.4}", sample.worst_price);
-        println!("     Slippage:         ${:.6} ({:.2} bps)", sample.slippage, sample.slippage_bps);
-        println!("     Filled:           {} / {}", sample.filled_quantity, sample.requested_quantity);
+        println!(
+            "     Slippage:         ${:.6} ({:.2} bps)",
+            sample.slippage, sample.slippage_bps
+        );
+        println!(
+            "     Filled:           {} / {}",
+            sample.filled_quantity, sample.requested_quantity
+        );
     }
 
     // Assertions
@@ -862,7 +1022,7 @@ fn test_liquidity_metrics_with_real_data() {
     }
 
     let path = get_test_data_path();
-    println!("\n📂 Testing LiquidityMetrics with: {}", path);
+    println!("\n📂 Testing LiquidityMetrics with: {path}");
 
     let loader = DbnLoader::new(&path)
         .expect("Failed to create loader")
@@ -880,7 +1040,7 @@ fn test_liquidity_metrics_with_real_data() {
 
         if let Ok(state) = lob.process_message(&msg) {
             processed += 1;
-            
+
             // Sample every 1000 messages
             if processed % 1000 == 0 && state.is_valid() {
                 let metrics = LiquidityMetrics::from_lob_state(&state);
@@ -896,28 +1056,36 @@ fn test_liquidity_metrics_with_real_data() {
     }
 
     // Calculate averages
-    let avg_spread_bps: f64 = metrics_samples.iter()
-        .map(|m| m.spread_bps)
-        .sum::<f64>() / metrics_samples.len() as f64;
-    
-    let avg_total_volume: f64 = metrics_samples.iter()
-        .map(|m| m.total_volume as f64)
-        .sum::<f64>() / metrics_samples.len() as f64;
-    
-    let avg_imbalance: f64 = metrics_samples.iter()
-        .map(|m| m.volume_imbalance)
-        .sum::<f64>() / metrics_samples.len() as f64;
-    
-    let avg_levels: f64 = metrics_samples.iter()
-        .map(|m| m.total_levels as f64)
-        .sum::<f64>() / metrics_samples.len() as f64;
+    let avg_spread_bps: f64 =
+        metrics_samples.iter().map(|m| m.spread_bps).sum::<f64>() / metrics_samples.len() as f64;
 
-    println!("  📊 LiquidityMetrics Results ({} samples):", metrics_samples.len());
+    let avg_total_volume: f64 = metrics_samples
+        .iter()
+        .map(|m| m.total_volume as f64)
+        .sum::<f64>()
+        / metrics_samples.len() as f64;
+
+    let avg_imbalance: f64 = metrics_samples
+        .iter()
+        .map(|m| m.volume_imbalance)
+        .sum::<f64>()
+        / metrics_samples.len() as f64;
+
+    let avg_levels: f64 = metrics_samples
+        .iter()
+        .map(|m| m.total_levels as f64)
+        .sum::<f64>()
+        / metrics_samples.len() as f64;
+
+    println!(
+        "  📊 LiquidityMetrics Results ({} samples):",
+        metrics_samples.len()
+    );
     println!();
-    println!("     Avg spread:       {:.2} bps", avg_spread_bps);
-    println!("     Avg total volume: {:.0}", avg_total_volume);
-    println!("     Avg imbalance:    {:.4}", avg_imbalance);
-    println!("     Avg total levels: {:.1}", avg_levels);
+    println!("     Avg spread:       {avg_spread_bps:.2} bps");
+    println!("     Avg total volume: {avg_total_volume:.0}");
+    println!("     Avg imbalance:    {avg_imbalance:.4}");
+    println!("     Avg total levels: {avg_levels:.1}");
 
     // Sample a specific metrics
     if let Some(sample) = metrics_samples.last() {
@@ -925,7 +1093,10 @@ fn test_liquidity_metrics_with_real_data() {
         println!("  📊 Sample Metrics (last):");
         println!("     Mid-price:        ${:.4}", sample.mid_price);
         println!("     Microprice:       ${:.4}", sample.microprice);
-        println!("     Spread:           ${:.6} ({:.2} bps)", sample.spread, sample.spread_bps);
+        println!(
+            "     Spread:           ${:.6} ({:.2} bps)",
+            sample.spread, sample.spread_bps
+        );
         println!("     Bid volume:       {}", sample.bid_depth.total_volume);
         println!("     Ask volume:       {}", sample.ask_depth.total_volume);
         println!("     Book pressure:    {:.4}", sample.book_pressure());
@@ -946,7 +1117,7 @@ fn test_liquidity_metrics_with_real_data() {
 
 #[test]
 fn test_edge_case_empty_book() {
-    use mbo_lob_reconstructor::{LobState, Side, DepthStats, MarketImpact, LiquidityMetrics};
+    use mbo_lob_reconstructor::{DepthStats, LiquidityMetrics, LobState, MarketImpact, Side};
 
     println!("\n📂 Testing edge cases: Empty book");
 
@@ -995,7 +1166,7 @@ fn test_edge_case_empty_book() {
 
 #[test]
 fn test_edge_case_one_sided_book() {
-    use mbo_lob_reconstructor::{LobState, Side, DepthStats, MarketImpact, LiquidityMetrics};
+    use mbo_lob_reconstructor::{DepthStats, LiquidityMetrics, LobState, MarketImpact, Side};
 
     println!("\n📂 Testing edge cases: One-sided book");
 
@@ -1042,7 +1213,7 @@ fn test_edge_case_one_sided_book() {
 
 #[test]
 fn test_edge_case_extreme_prices() {
-    use mbo_lob_reconstructor::{MboMessage, Action, Side};
+    use mbo_lob_reconstructor::{Action, MboMessage, Side};
 
     println!("\n📂 Testing edge cases: Extreme prices");
 
@@ -1078,8 +1249,8 @@ fn test_edge_case_extreme_prices() {
     assert!(spread > 0.0);
     assert!(state.is_consistent());
 
-    println!("  High price mid: ${:.4}", mid);
-    println!("  High price spread: ${:.4}", spread);
+    println!("  High price mid: ${mid:.4}");
+    println!("  High price spread: ${spread:.4}");
 
     // Reset and test very low prices
     lob.reset();
@@ -1110,14 +1281,14 @@ fn test_edge_case_extreme_prices() {
     assert!(spread_low > 0.0);
     assert!(state.is_consistent());
 
-    println!("  Low price mid: ${:.6}", mid_low);
-    println!("  Low price spread: ${:.6}", spread_low);
+    println!("  Low price mid: ${mid_low:.6}");
+    println!("  Low price spread: ${spread_low:.6}");
     println!("  ✅ Extreme prices edge cases passed");
 }
 
 #[test]
 fn test_edge_case_large_sizes() {
-    use mbo_lob_reconstructor::{MboMessage, Action, Side, MarketImpact};
+    use mbo_lob_reconstructor::{Action, MarketImpact, MboMessage, Side};
 
     println!("\n📂 Testing edge cases: Large order sizes");
 
@@ -1159,15 +1330,15 @@ fn test_edge_case_large_sizes() {
     let imbalance = state.depth_imbalance().unwrap();
     assert!(imbalance.abs() < 0.001);
 
-    println!("  Max size: {}", max_size);
-    println!("  Bid volume: {}", bid_vol);
-    println!("  Ask volume: {}", ask_vol);
+    println!("  Max size: {max_size}");
+    println!("  Bid volume: {bid_vol}");
+    println!("  Ask volume: {ask_vol}");
     println!("  ✅ Large sizes edge cases passed");
 }
 
 #[test]
 fn test_edge_case_rapid_updates() {
-    use mbo_lob_reconstructor::{MboMessage, Action, Side};
+    use mbo_lob_reconstructor::{Action, MboMessage, Side};
 
     println!("\n📂 Testing edge cases: Rapid order updates");
 
@@ -1185,18 +1356,18 @@ fn test_edge_case_rapid_updates() {
             Action::Modify,
             Side::Bid,
             100_000_000_000 + (i * 1_000_000), // Price changes slightly
-            1000 - i as u32, // Size decreases
+            1000 - i as u32,                   // Size decreases
         );
         lob.process_message(&modify).unwrap();
     }
 
     // Should still have exactly 1 order
     assert_eq!(lob.order_count(), 1);
-    
+
     // Cancel the order
     let cancel = MboMessage::new(1, Action::Cancel, Side::Bid, 100_099_000_000, 901);
     lob.process_message(&cancel).unwrap();
-    
+
     assert_eq!(lob.order_count(), 0);
 
     println!("  ✅ Rapid updates edge cases passed");
@@ -1204,7 +1375,7 @@ fn test_edge_case_rapid_updates() {
 
 #[test]
 fn test_edge_case_many_price_levels() {
-    use mbo_lob_reconstructor::{MboMessage, Action, Side};
+    use mbo_lob_reconstructor::{Action, MboMessage, Side};
 
     println!("\n📂 Testing edge cases: Many price levels");
 
@@ -1303,13 +1474,13 @@ fn test_edge_case_statistics_numerical_stability() {
 
 #[test]
 fn test_edge_case_normalization_roundtrip() {
-    use mbo_lob_reconstructor::{DayStats, NormalizationParams, LobState};
+    use mbo_lob_reconstructor::{DayStats, LobState, NormalizationParams};
 
     println!("\n📂 Testing edge cases: Normalization roundtrip");
 
     // Create day stats with known values
     let mut day_stats = DayStats::new("test");
-    
+
     for i in 0..100 {
         let mut state = LobState::new(10);
         let price = 100.0 + (i as f64) * 0.01;
@@ -1325,15 +1496,14 @@ fn test_edge_case_normalization_roundtrip() {
 
     // Test roundtrip for various values
     let test_values = [50.0, 100.0, 150.0, 0.0, -50.0, 1e6];
-    
+
     for &original in &test_values {
         let normalized = params.normalize(original, 0);
         let denormalized = params.denormalize(normalized, 0);
-        
+
         assert!(
             (original - denormalized).abs() < 1e-10,
-            "Roundtrip failed: {} -> {} -> {}",
-            original, normalized, denormalized
+            "Roundtrip failed: {original} -> {normalized} -> {denormalized}"
         );
     }
 
@@ -1344,4 +1514,3 @@ fn test_edge_case_normalization_roundtrip() {
     println!("  Roundtrip tests passed for {} values", test_values.len());
     println!("  ✅ Normalization roundtrip edge cases passed");
 }
-

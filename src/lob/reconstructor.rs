@@ -395,8 +395,8 @@ impl LobReconstructor {
 
         // Add to appropriate side
         let price_level = match msg.side {
-            Side::Bid => self.bids.entry(msg.price).or_insert_with(AHashMap::new),
-            Side::Ask => self.asks.entry(msg.price).or_insert_with(AHashMap::new),
+            Side::Bid => self.bids.entry(msg.price).or_default(),
+            Side::Ask => self.asks.entry(msg.price).or_default(),
             Side::None => {
                 // Non-directional orders are ignored
                 return Ok(());

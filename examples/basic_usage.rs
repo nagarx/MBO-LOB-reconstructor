@@ -101,15 +101,15 @@ fn main() {
     println!("=================================================================\n");
 
     if let Some(mid) = state.mid_price() {
-        println!("Mid-price: ${:.4}", mid);
+        println!("Mid-price: ${mid:.4}");
     }
 
     if let Some(spread) = state.spread() {
-        println!("Spread: ${:.4}", spread);
+        println!("Spread: ${spread:.4}");
     }
 
     if let Some(spread_bps) = state.spread_bps() {
-        println!("Spread (bps): {:.2}", spread_bps);
+        println!("Spread (bps): {spread_bps:.2}");
     }
 
     println!("\nBid Side:");

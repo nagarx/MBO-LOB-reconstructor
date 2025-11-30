@@ -65,7 +65,7 @@ impl TlobError {
 // Implement From for common error types for ergonomic error handling
 impl From<std::io::Error> for TlobError {
     fn from(err: std::io::Error) -> Self {
-        TlobError::Generic(format!("IO error: {}", err))
+        TlobError::Generic(format!("IO error: {err}"))
     }
 }
 

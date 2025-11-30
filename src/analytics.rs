@@ -23,8 +23,8 @@
 //! println!("Slippage: {:.2} bps", impact.slippage_bps);
 //! ```
 
-use serde::{Deserialize, Serialize};
 use crate::types::{LobState, Side};
+use serde::{Deserialize, Serialize};
 
 // ============================================================================
 // Depth Statistics
@@ -42,37 +42,37 @@ use crate::types::{LobState, Side};
 pub struct DepthStats {
     /// Which side of the book (Bid or Ask)
     pub side: Side,
-    
+
     /// Total volume across all analyzed levels
     pub total_volume: u64,
-    
+
     /// Number of active price levels (with non-zero size)
     pub levels_count: usize,
-    
+
     /// Average size per level
     pub avg_level_size: f64,
-    
+
     /// Volume-weighted average price (VWAP)
     pub weighted_avg_price: f64,
-    
+
     /// Smallest level size found
     pub min_level_size: u64,
-    
+
     /// Largest level size found
     pub max_level_size: u64,
-    
+
     /// Standard deviation of level sizes
     pub std_dev_level_size: f64,
-    
+
     /// Best price on this side
     pub best_price: Option<f64>,
-    
+
     /// Worst price on this side (furthest from mid)
     pub worst_price: Option<f64>,
-    
+
     /// Price range (worst - best) in dollars
     pub price_range: f64,
-    
+
     /// Concentration ratio: volume at best level / total volume
     pub concentration_ratio: f64,
 }
@@ -125,17 +125,17 @@ impl DepthStats {
 
         let levels_count = active_levels.len();
         let sizes_only: Vec<u64> = active_levels.iter().map(|(_, s)| *s).collect();
-        
+
         // Total volume
         let total_volume: u64 = sizes_only.iter().sum();
-        
+
         // Average level size
         let avg_level_size = total_volume as f64 / levels_count as f64;
-        
+
         // Min/max level size
         let min_level_size = *sizes_only.iter().min().unwrap_or(&0);
         let max_level_size = *sizes_only.iter().max().unwrap_or(&0);
-        
+
         // Standard deviation of level sizes
         let variance: f64 = sizes_only
             .iter()
@@ -143,9 +143,10 @@ impl DepthStats {
                 let diff = s as f64 - avg_level_size;
                 diff * diff
             })
-            .sum::<f64>() / levels_count as f64;
+            .sum::<f64>()
+            / levels_count as f64;
         let std_dev_level_size = variance.sqrt();
-        
+
         // VWAP (volume-weighted average price)
         let total_value: f64 = active_levels
             .iter()
@@ -156,17 +157,17 @@ impl DepthStats {
         } else {
             0.0
         };
-        
+
         // Best and worst prices
         let best_price = active_levels.first().map(|(p, _)| *p);
         let worst_price = active_levels.last().map(|(p, _)| *p);
-        
+
         // Price range
         let price_range = match (best_price, worst_price) {
             (Some(best), Some(worst)) => (worst - best).abs(),
             _ => 0.0,
         };
-        
+
         // Concentration ratio (volume at best level / total volume)
         let best_level_volume = active_levels.first().map(|(_, s)| *s).unwrap_or(0);
         let concentration_ratio = if total_volume > 0 {
@@ -196,9 +197,9 @@ impl DepthStats {
     pub fn is_empty(&self) -> bool {
         self.levels_count == 0 || self.total_volume == 0
     }
-    
+
     /// Get the coefficient of variation (std_dev / mean) for level sizes.
-    /// 
+    ///
     /// Higher values indicate more uneven liquidity distribution.
     #[inline]
     pub fn size_coefficient_of_variation(&self) -> f64 {
@@ -226,37 +227,37 @@ impl DepthStats {
 pub struct MarketImpact {
     /// Side of the order (Buy = takes from Ask, Sell = takes from Bid)
     pub side: Side,
-    
+
     /// Requested order quantity
     pub requested_quantity: u64,
-    
+
     /// Average execution price across all fills (in dollars)
     pub avg_price: f64,
-    
+
     /// Best available price before execution (in dollars)
     pub best_price: f64,
-    
+
     /// Worst (furthest) execution price (in dollars)
     pub worst_price: f64,
-    
+
     /// Absolute slippage from best price (in dollars)
     pub slippage: f64,
-    
+
     /// Slippage in basis points
     pub slippage_bps: f64,
-    
+
     /// Number of price levels that would be consumed
     pub levels_consumed: usize,
-    
+
     /// Total quantity available to fill the order
     pub total_quantity_available: u64,
-    
+
     /// Quantity that would be filled
     pub filled_quantity: u64,
-    
+
     /// Quantity that could not be filled (insufficient liquidity)
     pub unfilled_quantity: u64,
-    
+
     /// Individual fills as (price_dollars, quantity) pairs
     pub fills: Vec<(f64, u64)>,
 }
@@ -413,7 +414,7 @@ impl MarketImpact {
         if self.avg_price == 0.0 || mid_price == 0.0 {
             return 0.0;
         }
-        
+
         match self.side {
             Side::Ask => mid_price - self.avg_price, // Buy: want lower price
             Side::Bid => self.avg_price - mid_price, // Sell: want higher price
@@ -431,31 +432,31 @@ impl MarketImpact {
 pub struct LiquidityMetrics {
     /// Bid side depth statistics
     pub bid_depth: DepthStats,
-    
+
     /// Ask side depth statistics
     pub ask_depth: DepthStats,
-    
+
     /// Total volume on both sides
     pub total_volume: u64,
-    
+
     /// Volume imbalance: (bid - ask) / (bid + ask)
     pub volume_imbalance: f64,
-    
+
     /// Spread in dollars
     pub spread: f64,
-    
+
     /// Spread in basis points
     pub spread_bps: f64,
-    
+
     /// Mid-price in dollars
     pub mid_price: f64,
-    
+
     /// Microprice (volume-weighted mid)
     pub microprice: f64,
-    
+
     /// Average depth per level (both sides)
     pub avg_depth_per_level: f64,
-    
+
     /// Total active levels (both sides)
     pub total_levels: usize,
 }
@@ -465,27 +466,27 @@ impl LiquidityMetrics {
     pub fn from_lob_state(state: &LobState) -> Self {
         let bid_depth = DepthStats::from_lob_state(state, Side::Bid);
         let ask_depth = DepthStats::from_lob_state(state, Side::Ask);
-        
+
         let total_volume = bid_depth.total_volume + ask_depth.total_volume;
         let total_levels = bid_depth.levels_count + ask_depth.levels_count;
-        
+
         let volume_imbalance = if total_volume > 0 {
             (bid_depth.total_volume as f64 - ask_depth.total_volume as f64) / total_volume as f64
         } else {
             0.0
         };
-        
+
         let avg_depth_per_level = if total_levels > 0 {
             total_volume as f64 / total_levels as f64
         } else {
             0.0
         };
-        
+
         let spread = state.spread().unwrap_or(0.0);
         let mid_price = state.mid_price().unwrap_or(0.0);
         let spread_bps = state.spread_bps().unwrap_or(0.0);
         let microprice = state.microprice().unwrap_or(mid_price);
-        
+
         Self {
             bid_depth,
             ask_depth,
@@ -552,4 +553,3 @@ mod tests {
         assert_eq!(metrics.total_volume, 900);
     }
 }
-

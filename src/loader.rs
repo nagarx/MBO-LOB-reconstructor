@@ -98,7 +98,7 @@ impl DbnLoader {
 
         // Get file size
         let file_size = std::fs::metadata(&path)
-            .map_err(|e| TlobError::generic(format!("Failed to read file metadata: {}", e)))?
+            .map_err(|e| TlobError::generic(format!("Failed to read file metadata: {e}")))?
             .len();
 
         Ok(Self {
@@ -138,14 +138,14 @@ impl DbnLoader {
     /// and uncompressed DBN files.
     fn open_decoder(&self) -> Result<DbnFileDecoder> {
         let file = File::open(&self.path)
-            .map_err(|e| TlobError::generic(format!("Failed to open file: {}", e)))?;
+            .map_err(|e| TlobError::generic(format!("Failed to open file: {e}")))?;
 
         let reader = BufReader::new(file);
 
         // Use zstd decoder with buffering
         // The zstd decoder can handle both compressed and uncompressed data
         dbn::decode::dbn::Decoder::with_zstd_buffer(reader)
-            .map_err(|e| TlobError::generic(format!("Failed to create decoder: {}", e)))
+            .map_err(|e| TlobError::generic(format!("Failed to create decoder: {e}")))
     }
 
     /// Iterate over all MBO messages in the file.
@@ -232,11 +232,11 @@ impl<D: DecodeRecord> Iterator for MessageIterator<D> {
                 Ok(None) => return None,      // End of file
                 Err(e) => {
                     if self.skip_invalid {
-                        log::warn!("Failed to decode DBN record: {}", e);
+                        log::warn!("Failed to decode DBN record: {e}");
                         self.stats.messages_skipped += 1;
                         continue;
                     } else {
-                        log::error!("Failed to decode DBN record: {}", e);
+                        log::error!("Failed to decode DBN record: {e}");
                         return None;
                     }
                 }
@@ -250,11 +250,11 @@ impl<D: DecodeRecord> Iterator for MessageIterator<D> {
                 }
                 Err(e) => {
                     if self.skip_invalid {
-                        log::warn!("Skipping invalid message: {}", e);
+                        log::warn!("Skipping invalid message: {e}");
                         self.stats.messages_skipped += 1;
                         continue;
                     } else {
-                        log::error!("Invalid message: {}", e);
+                        log::error!("Invalid message: {e}");
                         return None;
                     }
                 }

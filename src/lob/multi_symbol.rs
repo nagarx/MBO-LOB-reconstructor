@@ -82,8 +82,7 @@ impl MultiSymbolLob {
 
         if self.lobs.contains_key(&symbol) {
             return Err(TlobError::generic(format!(
-                "Symbol {} already exists",
-                symbol
+                "Symbol {symbol} already exists"
             )));
         }
 

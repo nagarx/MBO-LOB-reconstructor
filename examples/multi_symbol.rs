@@ -61,18 +61,18 @@ fn main() {
         let state = multi_lob.get_state(symbol).unwrap();
         let symbol_stats = multi_lob.symbol_stats(symbol).unwrap();
 
-        println!("{} LOB:", symbol);
+        println!("{symbol} LOB:");
 
         if let Some(mid) = state.mid_price() {
-            println!("  Mid-price: ${:.4}", mid);
+            println!("  Mid-price: ${mid:.4}");
         }
 
         if let Some(spread) = state.spread() {
-            println!("  Spread: ${:.4}", spread);
+            println!("  Spread: ${spread:.4}");
         }
 
         if let Some(spread_bps) = state.spread_bps() {
-            println!("  Spread (bps): {:.2}", spread_bps);
+            println!("  Spread (bps): {spread_bps:.2}");
         }
 
         println!("  Best bid: ${:.2}", state.best_bid.unwrap() as f64 / 1e9);
@@ -95,7 +95,7 @@ fn main() {
     symbols.sort_by_key(|(sym, _)| *sym);
 
     for (symbol, count) in symbols {
-        println!("  {}: {}", symbol, count);
+        println!("  {symbol}: {count}");
     }
 
     println!("\n✓ Multi-symbol example complete!");

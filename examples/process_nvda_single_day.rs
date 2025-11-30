@@ -41,13 +41,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let dbn_path = &args[1];
-    println!("📂 Input file: {}", dbn_path);
+    println!("📂 Input file: {dbn_path}");
 
     // Create loader
     let loader = DbnLoader::new(dbn_path)?.skip_invalid(true); // Skip invalid messages instead of crashing
 
     let file_size_mb = loader.stats().file_size as f64 / 1_000_000.0;
-    println!("📊 File size: {:.2} MB", file_size_mb);
+    println!("📊 File size: {file_size_mb:.2} MB");
     println!();
 
     // Create LOB reconstructor (10 levels)
@@ -92,7 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 lob_error_count += 1;
                 log::error!(
                     "LOB processing error at message {}: order_id={}, action={:?}, side={:?}, price={}, size={}, error={}",
-                    message_count, mbo_msg.order_id, mbo_msg.action, mbo_msg.side, 
+                    message_count, mbo_msg.order_id, mbo_msg.action, mbo_msg.side,
                     mbo_msg.price as f64 / 1e9, mbo_msg.size, e
                 );
 
@@ -174,9 +174,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     println!("⚡ PERFORMANCE:");
-    println!("  Total time:                {:>12.2} seconds", total_time);
-    println!("  Throughput:                {:>12.0} msg/s", throughput);
-    println!("  Throughput:                {:>12.2} MB/s", throughput_mb);
+    println!("  Total time:                {total_time:>12.2} seconds");
+    println!("  Throughput:                {throughput:>12.0} msg/s");
+    println!("  Throughput:                {throughput_mb:>12.2} MB/s");
     println!();
 
     println!("📈 FINAL LOB STATE:");
@@ -196,13 +196,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let final_state = lob.get_lob_state();
     if let Some(mid) = final_state.mid_price() {
-        println!("  Mid-price:                 {:>12.4}", mid);
+        println!("  Mid-price:                 {mid:>12.4}");
     }
     if let Some(spread) = final_state.spread() {
-        println!("  Spread:                    {:>12.4}", spread);
+        println!("  Spread:                    {spread:>12.4}");
     }
     if let Some(spread_bps) = final_state.spread_bps() {
-        println!("  Spread (bps):              {:>12.2}", spread_bps);
+        println!("  Spread (bps):              {spread_bps:>12.2}");
     }
     println!();
 
@@ -243,8 +243,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let speedup_vs_python = throughput / 20_000.0; // Assuming Python does ~20K msg/s
 
     println!("🎯 EFFICIENCY METRICS:");
-    println!("  Time per message:          {:>12.2} ns", ns_per_msg);
-    println!("  Speedup vs Python (~20K):  {:>12.1}x", speedup_vs_python);
+    println!("  Time per message:          {ns_per_msg:>12.2} ns");
+    println!("  Speedup vs Python (~20K):  {speedup_vs_python:>12.1}x");
     println!();
 
     println!("✨ SUCCESS! Ready for production use.");

@@ -517,24 +517,24 @@ impl NormalizationParams {
             // Ask price
             means.push(price_mean);
             stds.push(price_std);
-            feature_names.push(format!("ask_price_{}", i));
+            feature_names.push(format!("ask_price_{i}"));
 
             // Ask size
             means.push(size_mean);
             stds.push(size_std);
-            feature_names.push(format!("ask_size_{}", i));
+            feature_names.push(format!("ask_size_{i}"));
         }
 
         for i in 0..levels {
             // Bid price
             means.push(price_mean);
             stds.push(price_std);
-            feature_names.push(format!("bid_price_{}", i));
+            feature_names.push(format!("bid_price_{i}"));
 
             // Bid size
             means.push(size_mean);
             stds.push(size_std);
-            feature_names.push(format!("bid_size_{}", i));
+            feature_names.push(format!("bid_size_{i}"));
         }
 
         Self {
@@ -566,15 +566,14 @@ impl NormalizationParams {
 
     /// Save to JSON file.
     pub fn save_json(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(path, json)
     }
 
     /// Load from JSON file.
     pub fn load_json(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
         let json = std::fs::read_to_string(path)?;
-        serde_json::from_str(&json).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        serde_json::from_str(&json).map_err(std::io::Error::other)
     }
 }
 
