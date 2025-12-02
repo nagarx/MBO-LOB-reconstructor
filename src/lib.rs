@@ -117,6 +117,7 @@ pub mod error;
 pub mod lob;
 pub mod statistics;
 pub mod types;
+pub mod warnings;
 
 #[cfg(feature = "databento")]
 #[cfg_attr(docsrs, doc(cfg(feature = "databento")))]
@@ -138,6 +139,9 @@ pub use statistics::{DayStats, NormalizationParams, RunningStats};
 
 // Re-exports - Analytics
 pub use analytics::{DepthStats, LiquidityMetrics, MarketImpact};
+
+// Re-exports - Warnings
+pub use warnings::{Warning, WarningCategory, WarningSummary, WarningTracker, WarningTrackerConfig};
 
 // Re-exports - Databento support (feature-gated)
 #[cfg(feature = "databento")]

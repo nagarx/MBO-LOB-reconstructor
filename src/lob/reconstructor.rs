@@ -148,6 +148,87 @@ pub struct LobStats {
 
     /// Last timestamp processed (nanoseconds since epoch)
     pub last_timestamp: Option<i64>,
+    
+    // =========================================================================
+    // Warning Counters (for tracking anomalies without failing)
+    // =========================================================================
+    
+    /// Number of cancels for orders not found
+    pub cancel_order_not_found: u64,
+    
+    /// Number of cancels where price level was missing
+    pub cancel_price_level_missing: u64,
+    
+    /// Number of cancels where order was not at expected price level
+    pub cancel_order_at_level_missing: u64,
+    
+    /// Number of trades for orders not found
+    pub trade_order_not_found: u64,
+    
+    /// Number of trades where price level was missing
+    pub trade_price_level_missing: u64,
+    
+    /// Number of trades where order was not at expected price level
+    pub trade_order_at_level_missing: u64,
+    
+    /// Number of book clears/resets
+    pub book_clears: u64,
+    
+    /// Number of no-op (Action::None) messages
+    pub noop_messages: u64,
+}
+
+impl LobStats {
+    /// Check if there were any warnings during processing.
+    pub fn has_warnings(&self) -> bool {
+        self.cancel_order_not_found > 0
+            || self.cancel_price_level_missing > 0
+            || self.cancel_order_at_level_missing > 0
+            || self.trade_order_not_found > 0
+            || self.trade_price_level_missing > 0
+            || self.trade_order_at_level_missing > 0
+    }
+    
+    /// Get total number of warnings.
+    pub fn total_warnings(&self) -> u64 {
+        self.cancel_order_not_found
+            + self.cancel_price_level_missing
+            + self.cancel_order_at_level_missing
+            + self.trade_order_not_found
+            + self.trade_price_level_missing
+            + self.trade_order_at_level_missing
+    }
+    
+    /// Export stats to JSON file.
+    pub fn export_to_file(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        use std::io::Write;
+        let file = std::fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        
+        writeln!(writer, "{{")?;
+        writeln!(writer, "  \"messages_processed\": {},", self.messages_processed)?;
+        writeln!(writer, "  \"active_orders\": {},", self.active_orders)?;
+        writeln!(writer, "  \"bid_levels\": {},", self.bid_levels)?;
+        writeln!(writer, "  \"ask_levels\": {},", self.ask_levels)?;
+        writeln!(writer, "  \"errors\": {},", self.errors)?;
+        writeln!(writer, "  \"crossed_quotes\": {},", self.crossed_quotes)?;
+        writeln!(writer, "  \"locked_quotes\": {},", self.locked_quotes)?;
+        writeln!(writer, "  \"last_timestamp\": {},", self.last_timestamp.unwrap_or(0))?;
+        writeln!(writer, "  \"warnings\": {{")?;
+        writeln!(writer, "    \"cancel_order_not_found\": {},", self.cancel_order_not_found)?;
+        writeln!(writer, "    \"cancel_price_level_missing\": {},", self.cancel_price_level_missing)?;
+        writeln!(writer, "    \"cancel_order_at_level_missing\": {},", self.cancel_order_at_level_missing)?;
+        writeln!(writer, "    \"trade_order_not_found\": {},", self.trade_order_not_found)?;
+        writeln!(writer, "    \"trade_price_level_missing\": {},", self.trade_price_level_missing)?;
+        writeln!(writer, "    \"trade_order_at_level_missing\": {},", self.trade_order_at_level_missing)?;
+        writeln!(writer, "    \"total\": {}", self.total_warnings())?;
+        writeln!(writer, "  }},")?;
+        writeln!(writer, "  \"book_clears\": {},", self.book_clears)?;
+        writeln!(writer, "  \"noop_messages\": {}", self.noop_messages)?;
+        writeln!(writer, "}}")?;
+        
+        writer.flush()
+    }
 }
 
 impl LobReconstructor {
@@ -236,6 +317,22 @@ impl LobReconstructor {
             Action::Modify => self.modify_order(msg)?,
             Action::Cancel => self.cancel_order(msg)?,
             Action::Trade | Action::Fill => self.process_trade(msg)?,
+            Action::Clear => {
+                self.stats.book_clears += 1;
+                if self.config.log_warnings {
+                    log::info!(
+                        "Book clear received (msg #{}, ts={:?}, orders_before={})",
+                        self.stats.messages_processed,
+                        msg.timestamp,
+                        self.orders.len()
+                    );
+                }
+                self.reset();
+            }
+            Action::None => {
+                // No-op, may carry flags or other info
+                self.stats.noop_messages += 1;
+            }
         }
 
         // Update statistics
@@ -441,34 +538,26 @@ impl LobReconstructor {
     }
 
     /// Cancel (remove) an order from the book.
+    ///
+    /// Handles both full and partial cancellations based on the `size` field.
+    /// Uses soft error handling - anomalies are tracked in stats but don't fail.
     #[inline]
     fn cancel_order(&mut self, msg: &MboMessage) -> Result<()> {
-        // Get existing order
-        let order = match self.orders.get(&msg.order_id) {
-            Some(order) => *order,
-            None => {
-                // Order not found, might have been already cancelled
-                // This is not necessarily an error in real markets
-                return Ok(());
-            }
-        };
-
-        // Remove order
-        self.remove_order_internal(msg.order_id, &order)?;
-
-        Ok(())
-    }
-
-    /// Process a trade (execution).
-    ///
-    /// Trade reduces order size or removes it completely.
-    #[inline]
-    fn process_trade(&mut self, msg: &MboMessage) -> Result<()> {
         // Get existing order
         let mut order = match self.orders.get(&msg.order_id) {
             Some(order) => *order,
             None => {
-                // Trade for unknown order, ignore
+                // Order not found - common in real markets (already cancelled, late message, etc.)
+                // Track as warning, don't fail
+                self.stats.cancel_order_not_found += 1;
+                if self.config.log_warnings {
+                    log::debug!(
+                        "Cancel: order {} not found (msg #{}, ts={:?})",
+                        msg.order_id,
+                        self.stats.messages_processed,
+                        msg.timestamp
+                    );
+                }
                 return Ok(());
             }
         };
@@ -483,12 +572,19 @@ impl LobReconstructor {
         let price_level = match price_level {
             Some(level) => level,
             None => {
-                // Price level doesn't exist, inconsistent state
-                self.stats.errors += 1;
-                return Err(TlobError::InconsistentState(format!(
-                    "Price level {} not found for order {}",
-                    order.price, msg.order_id
-                )));
+                // Price level doesn't exist - data anomaly, but recoverable
+                // Clean up the orphaned order tracking and continue
+                self.stats.cancel_price_level_missing += 1;
+                self.orders.remove(&msg.order_id);
+                if self.config.log_warnings {
+                    log::warn!(
+                        "Cancel: price level {} not found for order {} (msg #{}, cleaning up)",
+                        order.price as f64 / 1e9,
+                        msg.order_id,
+                        self.stats.messages_processed
+                    );
+                }
+                return Ok(());
             }
         };
 
@@ -496,12 +592,120 @@ impl LobReconstructor {
         let order_size = match price_level.get_mut(&msg.order_id) {
             Some(size) => size,
             None => {
-                // Order not at price level, inconsistent state
-                self.stats.errors += 1;
-                return Err(TlobError::InconsistentState(format!(
-                    "Order {} not found at price level {}",
-                    msg.order_id, order.price
-                )));
+                // Order not at price level - data anomaly, but recoverable
+                // Clean up the orphaned order tracking and continue
+                self.stats.cancel_order_at_level_missing += 1;
+                self.orders.remove(&msg.order_id);
+                if self.config.log_warnings {
+                    log::warn!(
+                        "Cancel: order {} not found at price level {} (msg #{}, cleaning up)",
+                        msg.order_id,
+                        order.price as f64 / 1e9,
+                        self.stats.messages_processed
+                    );
+                }
+                return Ok(());
+            }
+        };
+
+        // Check if partial or full cancel
+        if msg.size >= *order_size {
+            // Full cancel - remove order entirely
+            price_level.remove(&msg.order_id);
+
+            // Remove empty price level
+            if price_level.is_empty() {
+                match order.side {
+                    Side::Bid => {
+                        self.bids.remove(&order.price);
+                    }
+                    Side::Ask => {
+                        self.asks.remove(&order.price);
+                    }
+                    Side::None => {}
+                }
+            }
+
+            // Remove from order tracking
+            self.orders.remove(&msg.order_id);
+        } else {
+            // Partial cancel - reduce size
+            *order_size -= msg.size;
+            order.size -= msg.size;
+            self.orders.insert(msg.order_id, order);
+        }
+
+        Ok(())
+    }
+
+    /// Process a trade (execution).
+    ///
+    /// Trade reduces order size or removes it completely.
+    /// Uses soft error handling - anomalies are tracked in stats but don't fail.
+    #[inline]
+    fn process_trade(&mut self, msg: &MboMessage) -> Result<()> {
+        // Get existing order
+        let mut order = match self.orders.get(&msg.order_id) {
+            Some(order) => *order,
+            None => {
+                // Trade for unknown order - common for aggressor side trades
+                // Track as warning, don't fail
+                self.stats.trade_order_not_found += 1;
+                if self.config.log_warnings {
+                    log::debug!(
+                        "Trade: order {} not found (msg #{}, ts={:?})",
+                        msg.order_id,
+                        self.stats.messages_processed,
+                        msg.timestamp
+                    );
+                }
+                return Ok(());
+            }
+        };
+
+        // Get price level
+        let price_level = match order.side {
+            Side::Bid => self.bids.get_mut(&order.price),
+            Side::Ask => self.asks.get_mut(&order.price),
+            Side::None => return Ok(()),
+        };
+
+        let price_level = match price_level {
+            Some(level) => level,
+            None => {
+                // Price level doesn't exist - data anomaly, but recoverable
+                // Clean up the orphaned order tracking and continue
+                self.stats.trade_price_level_missing += 1;
+                self.orders.remove(&msg.order_id);
+                if self.config.log_warnings {
+                    log::warn!(
+                        "Trade: price level {} not found for order {} (msg #{}, cleaning up)",
+                        order.price as f64 / 1e9,
+                        msg.order_id,
+                        self.stats.messages_processed
+                    );
+                }
+                return Ok(());
+            }
+        };
+
+        // Get order at price level
+        let order_size = match price_level.get_mut(&msg.order_id) {
+            Some(size) => size,
+            None => {
+                // Order not at price level - data anomaly, but recoverable
+                // Clean up the orphaned order tracking and continue
+                self.stats.trade_order_at_level_missing += 1;
+                self.orders.remove(&msg.order_id);
+                if self.config.log_warnings {
+                    log::warn!(
+                        "Trade: order {} not found at price level {} (msg #{}, cleaning up)",
+                        msg.order_id,
+                        order.price as f64 / 1e9,
+                        self.stats.messages_processed
+                    );
+                }
+                return Ok(());
             }
         };
 
@@ -627,14 +831,26 @@ impl LobReconstructor {
     }
 
     /// Reset the LOB to empty state.
+    /// Reset the order book state.
+    ///
+    /// Clears all orders and price levels but preserves statistics.
+    /// This is called when an `Action::Clear` message is received.
     pub fn reset(&mut self) {
         self.bids.clear();
         self.asks.clear();
         self.orders.clear();
         self.best_bid = None;
         self.best_ask = None;
-        self.stats = LobStats::default();
         self.last_valid_state = None;
+        // Note: stats are preserved across resets for monitoring purposes
+    }
+    
+    /// Fully reset the reconstructor including statistics.
+    ///
+    /// Use this when starting a new day or completely fresh state.
+    pub fn full_reset(&mut self) {
+        self.reset();
+        self.stats = LobStats::default();
     }
 
     /// Get current statistics.
@@ -1025,5 +1241,225 @@ mod tests {
         // Total counts
         assert_eq!(lob.stats().locked_quotes, 1);
         assert_eq!(lob.stats().crossed_quotes, 1);
+    }
+
+    // =========================================================================
+    // Partial Cancel Tests
+    // =========================================================================
+
+    #[test]
+    fn test_partial_cancel_preserves_order() {
+        let mut lob = LobReconstructor::new(10);
+
+        // Add order with 100 shares
+        lob.process_message(&create_test_message(1, Action::Add, Side::Bid, 100.0, 100))
+            .unwrap();
+        assert_eq!(lob.order_count(), 1);
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 100);
+
+        // Partial cancel: remove 30 shares
+        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 30))
+            .unwrap();
+
+        // Order should still exist with 70 shares
+        assert_eq!(lob.order_count(), 1);
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 70);
+    }
+
+    #[test]
+    fn test_multiple_partial_cancels() {
+        let mut lob = LobReconstructor::new(10);
+
+        // Add order with 100 shares
+        lob.process_message(&create_test_message(1, Action::Add, Side::Bid, 100.0, 100))
+            .unwrap();
+
+        // First partial cancel: remove 20 shares (80 remaining)
+        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 20))
+            .unwrap();
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 80);
+
+        // Second partial cancel: remove 30 shares (50 remaining)
+        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 30))
+            .unwrap();
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 50);
+
+        // Third partial cancel: remove 50 shares (0 remaining = full cancel)
+        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 50))
+            .unwrap();
+        assert_eq!(lob.order_count(), 0);
+        assert_eq!(lob.bid_levels(), 0);
+    }
+
+    #[test]
+    fn test_partial_cancel_at_bbo_preserves_price() {
+        let mut lob = LobReconstructor::new(10);
+
+        // Add best bid at $100.00
+        lob.process_message(&create_test_message(1, Action::Add, Side::Bid, 100.0, 100))
+            .unwrap();
+        // Add second level at $99.99
+        lob.process_message(&create_test_message(2, Action::Add, Side::Bid, 99.99, 200))
+            .unwrap();
+
+        assert_eq!(lob.get_lob_state().best_bid, Some(100_000_000_000));
+
+        // Partial cancel at BBO - price should NOT change
+        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 50))
+            .unwrap();
+
+        // Best bid should still be $100.00
+        assert_eq!(lob.get_lob_state().best_bid, Some(100_000_000_000));
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 50);
+    }
+
+    #[test]
+    fn test_full_cancel_removes_price_level() {
+        let mut lob = LobReconstructor::new(10);
+
+        // Add best bid at $100.00
+        lob.process_message(&create_test_message(1, Action::Add, Side::Bid, 100.0, 100))
+            .unwrap();
+        // Add second level at $99.99
+        lob.process_message(&create_test_message(2, Action::Add, Side::Bid, 99.99, 200))
+            .unwrap();
+
+        assert_eq!(lob.bid_levels(), 2);
+
+        // Full cancel at BBO - price level should be removed
+        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 100))
+            .unwrap();
+
+        // Best bid should now be $99.99
+        assert_eq!(lob.bid_levels(), 1);
+        assert_eq!(lob.get_lob_state().best_bid, Some(99_990_000_000));
+    }
+
+    #[test]
+    fn test_over_cancel_removes_order() {
+        let mut lob = LobReconstructor::new(10);
+
+        // Add order with 50 shares
+        lob.process_message(&create_test_message(1, Action::Add, Side::Bid, 100.0, 50))
+            .unwrap();
+
+        // Cancel more than exists (100 > 50) - should remove entirely
+        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 100))
+            .unwrap();
+
+        assert_eq!(lob.order_count(), 0);
+    }
+
+    // =========================================================================
+    // Action::Clear Tests
+    // =========================================================================
+
+    #[test]
+    fn test_clear_resets_book() {
+        // Disable validation since Clear messages may have dummy values
+        let config = LobConfig::new(10).with_logging(false).with_validation(false);
+        let mut lob = LobReconstructor::with_config(config);
+
+        // Build up some state
+        lob.process_message(&create_test_message(1, Action::Add, Side::Bid, 100.0, 100))
+            .unwrap();
+        lob.process_message(&create_test_message(2, Action::Add, Side::Ask, 100.01, 200))
+            .unwrap();
+        lob.process_message(&create_test_message(3, Action::Add, Side::Bid, 99.99, 150))
+            .unwrap();
+
+        assert_eq!(lob.order_count(), 3);
+        assert_eq!(lob.bid_levels(), 2);
+        assert_eq!(lob.ask_levels(), 1);
+
+        // Clear the book (use dummy values since Clear doesn't need them)
+        let msg = MboMessage::new(0, Action::Clear, Side::None, 0, 0);
+        lob.process_message(&msg).unwrap();
+
+        // Book should be empty
+        assert_eq!(lob.order_count(), 0);
+        assert_eq!(lob.bid_levels(), 0);
+        assert_eq!(lob.ask_levels(), 0);
+        assert!(lob.get_lob_state().best_bid.is_none());
+        assert!(lob.get_lob_state().best_ask.is_none());
+
+        // Stats should track the clear
+        assert_eq!(lob.stats().book_clears, 1);
+    }
+
+    // =========================================================================
+    // Action::None Tests
+    // =========================================================================
+
+    #[test]
+    fn test_none_action_is_noop() {
+        // Disable validation since None messages may have dummy values
+        let config = LobConfig::new(10).with_logging(false).with_validation(false);
+        let mut lob = LobReconstructor::with_config(config);
+
+        // Add an order
+        lob.process_message(&create_test_message(1, Action::Add, Side::Bid, 100.0, 100))
+            .unwrap();
+
+        let state_before = lob.get_lob_state();
+        let orders_before = lob.order_count();
+
+        // Process None action (use dummy values since None doesn't need them)
+        let msg = MboMessage::new(999, Action::None, Side::None, 0, 0);
+        lob.process_message(&msg).unwrap();
+
+        // State should be unchanged
+        assert_eq!(lob.order_count(), orders_before);
+        assert_eq!(lob.get_lob_state().best_bid, state_before.best_bid);
+
+        // Stats should track the noop
+        assert_eq!(lob.stats().noop_messages, 1);
+    }
+
+    // =========================================================================
+    // Soft Error Handling Tests
+    // =========================================================================
+
+    #[test]
+    fn test_cancel_unknown_order_is_ok() {
+        let config = LobConfig::new(10).with_logging(false);
+        let mut lob = LobReconstructor::with_config(config);
+
+        // Cancel an order that doesn't exist - should not fail
+        let result =
+            lob.process_message(&create_test_message(999, Action::Cancel, Side::Bid, 100.0, 50));
+
+        assert!(result.is_ok());
+        assert_eq!(lob.stats().cancel_order_not_found, 1);
+    }
+
+    #[test]
+    fn test_trade_unknown_order_is_ok() {
+        let config = LobConfig::new(10).with_logging(false);
+        let mut lob = LobReconstructor::with_config(config);
+
+        // Trade for an order that doesn't exist - should not fail
+        let result =
+            lob.process_message(&create_test_message(999, Action::Trade, Side::Bid, 100.0, 50));
+
+        assert!(result.is_ok());
+        assert_eq!(lob.stats().trade_order_not_found, 1);
+    }
+
+    #[test]
+    fn test_warning_stats_accumulate() {
+        let config = LobConfig::new(10).with_logging(false);
+        let mut lob = LobReconstructor::with_config(config);
+
+        // Multiple unknown order operations
+        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 50))
+            .unwrap();
+        lob.process_message(&create_test_message(2, Action::Cancel, Side::Bid, 100.0, 50))
+            .unwrap();
+        lob.process_message(&create_test_message(3, Action::Trade, Side::Bid, 100.0, 50))
+            .unwrap();
+
+        assert_eq!(lob.stats().cancel_order_not_found, 2);
+        assert_eq!(lob.stats().trade_order_not_found, 1);
     }
 }

@@ -73,8 +73,10 @@ impl DbnBridge {
         match action {
             b'A' => Ok(Action::Add),
             b'M' => Ok(Action::Modify),
-            b'C' | b'R' => Ok(Action::Cancel), // 'R' = reduce, treat as cancel
+            b'C' => Ok(Action::Cancel),
+            b'R' => Ok(Action::Clear),
             b'T' | b'F' => Ok(Action::Trade),  // 'F' = fill, treat as trade
+            b'N' => Ok(Action::None),
             _ => Err(TlobError::InvalidAction(action)),
         }
     }
@@ -192,9 +194,10 @@ mod tests {
         assert_eq!(DbnBridge::convert_action(b'A').unwrap(), Action::Add);
         assert_eq!(DbnBridge::convert_action(b'M').unwrap(), Action::Modify);
         assert_eq!(DbnBridge::convert_action(b'C').unwrap(), Action::Cancel);
-        assert_eq!(DbnBridge::convert_action(b'R').unwrap(), Action::Cancel);
+        assert_eq!(DbnBridge::convert_action(b'R').unwrap(), Action::Clear);
         assert_eq!(DbnBridge::convert_action(b'T').unwrap(), Action::Trade);
         assert_eq!(DbnBridge::convert_action(b'F').unwrap(), Action::Trade);
+        assert_eq!(DbnBridge::convert_action(b'N').unwrap(), Action::None);
 
         // Invalid action
         assert!(DbnBridge::convert_action(b'X').is_err());

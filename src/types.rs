@@ -22,6 +22,10 @@ pub enum Action {
     Trade = b'T',
     /// Fill (alternative trade representation)
     Fill = b'F',
+    /// Clear/Reset the book
+    Clear = b'R',
+    /// No-op action (may carry flags or other information)
+    None = b'N',
 }
 
 impl Action {
@@ -33,7 +37,9 @@ impl Action {
             b'C' => Some(Action::Cancel),
             b'T' => Some(Action::Trade),
             b'F' => Some(Action::Fill),
-            _ => None,
+            b'R' => Some(Action::Clear),
+            b'N' => Some(Action::None),
+            _ => Option::None,
         }
     }
 
@@ -555,7 +561,9 @@ mod tests {
         assert_eq!(Action::from_byte(b'C'), Some(Action::Cancel));
         assert_eq!(Action::from_byte(b'T'), Some(Action::Trade));
         assert_eq!(Action::from_byte(b'F'), Some(Action::Fill));
-        assert_eq!(Action::from_byte(b'X'), None);
+        assert_eq!(Action::from_byte(b'R'), Some(Action::Clear));
+        assert_eq!(Action::from_byte(b'N'), Some(Action::None));
+        assert_eq!(Action::from_byte(b'X'), Option::None);
     }
 
     #[test]
@@ -565,6 +573,8 @@ mod tests {
         assert_eq!(Action::Cancel.to_byte(), b'C');
         assert_eq!(Action::Trade.to_byte(), b'T');
         assert_eq!(Action::Fill.to_byte(), b'F');
+        assert_eq!(Action::Clear.to_byte(), b'R');
+        assert_eq!(Action::None.to_byte(), b'N');
     }
 
     #[test]
