@@ -141,7 +141,9 @@ pub use statistics::{DayStats, NormalizationParams, RunningStats};
 pub use analytics::{DepthStats, LiquidityMetrics, MarketImpact};
 
 // Re-exports - Warnings
-pub use warnings::{Warning, WarningCategory, WarningSummary, WarningTracker, WarningTrackerConfig};
+pub use warnings::{
+    Warning, WarningCategory, WarningSummary, WarningTracker, WarningTrackerConfig,
+};
 
 // Re-exports - Databento support (feature-gated)
 #[cfg(feature = "databento")]

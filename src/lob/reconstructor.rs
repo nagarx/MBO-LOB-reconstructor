@@ -148,32 +148,31 @@ pub struct LobStats {
 
     /// Last timestamp processed (nanoseconds since epoch)
     pub last_timestamp: Option<i64>,
-    
+
     // =========================================================================
     // Warning Counters (for tracking anomalies without failing)
     // =========================================================================
-    
     /// Number of cancels for orders not found
     pub cancel_order_not_found: u64,
-    
+
     /// Number of cancels where price level was missing
     pub cancel_price_level_missing: u64,
-    
+
     /// Number of cancels where order was not at expected price level
     pub cancel_order_at_level_missing: u64,
-    
+
     /// Number of trades for orders not found
     pub trade_order_not_found: u64,
-    
+
     /// Number of trades where price level was missing
     pub trade_price_level_missing: u64,
-    
+
     /// Number of trades where order was not at expected price level
     pub trade_order_at_level_missing: u64,
-    
+
     /// Number of book clears/resets
     pub book_clears: u64,
-    
+
     /// Number of no-op (Action::None) messages
     pub noop_messages: u64,
 }
@@ -188,7 +187,7 @@ impl LobStats {
             || self.trade_price_level_missing > 0
             || self.trade_order_at_level_missing > 0
     }
-    
+
     /// Get total number of warnings.
     pub fn total_warnings(&self) -> u64 {
         self.cancel_order_not_found
@@ -198,35 +197,67 @@ impl LobStats {
             + self.trade_price_level_missing
             + self.trade_order_at_level_missing
     }
-    
+
     /// Export stats to JSON file.
     pub fn export_to_file(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
         use std::io::Write;
         let file = std::fs::File::create(path)?;
         let mut writer = std::io::BufWriter::new(file);
-        
+
         writeln!(writer, "{{")?;
-        writeln!(writer, "  \"messages_processed\": {},", self.messages_processed)?;
+        writeln!(
+            writer,
+            "  \"messages_processed\": {},",
+            self.messages_processed
+        )?;
         writeln!(writer, "  \"active_orders\": {},", self.active_orders)?;
         writeln!(writer, "  \"bid_levels\": {},", self.bid_levels)?;
         writeln!(writer, "  \"ask_levels\": {},", self.ask_levels)?;
         writeln!(writer, "  \"errors\": {},", self.errors)?;
         writeln!(writer, "  \"crossed_quotes\": {},", self.crossed_quotes)?;
         writeln!(writer, "  \"locked_quotes\": {},", self.locked_quotes)?;
-        writeln!(writer, "  \"last_timestamp\": {},", self.last_timestamp.unwrap_or(0))?;
+        writeln!(
+            writer,
+            "  \"last_timestamp\": {},",
+            self.last_timestamp.unwrap_or(0)
+        )?;
         writeln!(writer, "  \"warnings\": {{")?;
-        writeln!(writer, "    \"cancel_order_not_found\": {},", self.cancel_order_not_found)?;
-        writeln!(writer, "    \"cancel_price_level_missing\": {},", self.cancel_price_level_missing)?;
-        writeln!(writer, "    \"cancel_order_at_level_missing\": {},", self.cancel_order_at_level_missing)?;
-        writeln!(writer, "    \"trade_order_not_found\": {},", self.trade_order_not_found)?;
-        writeln!(writer, "    \"trade_price_level_missing\": {},", self.trade_price_level_missing)?;
-        writeln!(writer, "    \"trade_order_at_level_missing\": {},", self.trade_order_at_level_missing)?;
+        writeln!(
+            writer,
+            "    \"cancel_order_not_found\": {},",
+            self.cancel_order_not_found
+        )?;
+        writeln!(
+            writer,
+            "    \"cancel_price_level_missing\": {},",
+            self.cancel_price_level_missing
+        )?;
+        writeln!(
+            writer,
+            "    \"cancel_order_at_level_missing\": {},",
+            self.cancel_order_at_level_missing
+        )?;
+        writeln!(
+            writer,
+            "    \"trade_order_not_found\": {},",
+            self.trade_order_not_found
+        )?;
+        writeln!(
+            writer,
+            "    \"trade_price_level_missing\": {},",
+            self.trade_price_level_missing
+        )?;
+        writeln!(
+            writer,
+            "    \"trade_order_at_level_missing\": {},",
+            self.trade_order_at_level_missing
+        )?;
         writeln!(writer, "    \"total\": {}", self.total_warnings())?;
         writeln!(writer, "  }},")?;
         writeln!(writer, "  \"book_clears\": {},", self.book_clears)?;
         writeln!(writer, "  \"noop_messages\": {}", self.noop_messages)?;
         writeln!(writer, "}}")?;
-        
+
         writer.flush()
     }
 }
@@ -844,7 +875,7 @@ impl LobReconstructor {
         self.last_valid_state = None;
         // Note: stats are preserved across resets for monitoring purposes
     }
-    
+
     /// Fully reset the reconstructor including statistics.
     ///
     /// Use this when starting a new day or completely fresh state.
@@ -1258,8 +1289,14 @@ mod tests {
         assert_eq!(lob.get_lob_state().bid_sizes[0], 100);
 
         // Partial cancel: remove 30 shares
-        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 30))
-            .unwrap();
+        lob.process_message(&create_test_message(
+            1,
+            Action::Cancel,
+            Side::Bid,
+            100.0,
+            30,
+        ))
+        .unwrap();
 
         // Order should still exist with 70 shares
         assert_eq!(lob.order_count(), 1);
@@ -1275,18 +1312,36 @@ mod tests {
             .unwrap();
 
         // First partial cancel: remove 20 shares (80 remaining)
-        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 20))
-            .unwrap();
+        lob.process_message(&create_test_message(
+            1,
+            Action::Cancel,
+            Side::Bid,
+            100.0,
+            20,
+        ))
+        .unwrap();
         assert_eq!(lob.get_lob_state().bid_sizes[0], 80);
 
         // Second partial cancel: remove 30 shares (50 remaining)
-        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 30))
-            .unwrap();
+        lob.process_message(&create_test_message(
+            1,
+            Action::Cancel,
+            Side::Bid,
+            100.0,
+            30,
+        ))
+        .unwrap();
         assert_eq!(lob.get_lob_state().bid_sizes[0], 50);
 
         // Third partial cancel: remove 50 shares (0 remaining = full cancel)
-        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 50))
-            .unwrap();
+        lob.process_message(&create_test_message(
+            1,
+            Action::Cancel,
+            Side::Bid,
+            100.0,
+            50,
+        ))
+        .unwrap();
         assert_eq!(lob.order_count(), 0);
         assert_eq!(lob.bid_levels(), 0);
     }
@@ -1305,8 +1360,14 @@ mod tests {
         assert_eq!(lob.get_lob_state().best_bid, Some(100_000_000_000));
 
         // Partial cancel at BBO - price should NOT change
-        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 50))
-            .unwrap();
+        lob.process_message(&create_test_message(
+            1,
+            Action::Cancel,
+            Side::Bid,
+            100.0,
+            50,
+        ))
+        .unwrap();
 
         // Best bid should still be $100.00
         assert_eq!(lob.get_lob_state().best_bid, Some(100_000_000_000));
@@ -1327,8 +1388,14 @@ mod tests {
         assert_eq!(lob.bid_levels(), 2);
 
         // Full cancel at BBO - price level should be removed
-        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 100))
-            .unwrap();
+        lob.process_message(&create_test_message(
+            1,
+            Action::Cancel,
+            Side::Bid,
+            100.0,
+            100,
+        ))
+        .unwrap();
 
         // Best bid should now be $99.99
         assert_eq!(lob.bid_levels(), 1);
@@ -1344,8 +1411,14 @@ mod tests {
             .unwrap();
 
         // Cancel more than exists (100 > 50) - should remove entirely
-        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 100))
-            .unwrap();
+        lob.process_message(&create_test_message(
+            1,
+            Action::Cancel,
+            Side::Bid,
+            100.0,
+            100,
+        ))
+        .unwrap();
 
         assert_eq!(lob.order_count(), 0);
     }
@@ -1357,7 +1430,9 @@ mod tests {
     #[test]
     fn test_clear_resets_book() {
         // Disable validation since Clear messages may have dummy values
-        let config = LobConfig::new(10).with_logging(false).with_validation(false);
+        let config = LobConfig::new(10)
+            .with_logging(false)
+            .with_validation(false);
         let mut lob = LobReconstructor::with_config(config);
 
         // Build up some state
@@ -1394,7 +1469,9 @@ mod tests {
     #[test]
     fn test_none_action_is_noop() {
         // Disable validation since None messages may have dummy values
-        let config = LobConfig::new(10).with_logging(false).with_validation(false);
+        let config = LobConfig::new(10)
+            .with_logging(false)
+            .with_validation(false);
         let mut lob = LobReconstructor::with_config(config);
 
         // Add an order
@@ -1426,8 +1503,13 @@ mod tests {
         let mut lob = LobReconstructor::with_config(config);
 
         // Cancel an order that doesn't exist - should not fail
-        let result =
-            lob.process_message(&create_test_message(999, Action::Cancel, Side::Bid, 100.0, 50));
+        let result = lob.process_message(&create_test_message(
+            999,
+            Action::Cancel,
+            Side::Bid,
+            100.0,
+            50,
+        ));
 
         assert!(result.is_ok());
         assert_eq!(lob.stats().cancel_order_not_found, 1);
@@ -1439,8 +1521,13 @@ mod tests {
         let mut lob = LobReconstructor::with_config(config);
 
         // Trade for an order that doesn't exist - should not fail
-        let result =
-            lob.process_message(&create_test_message(999, Action::Trade, Side::Bid, 100.0, 50));
+        let result = lob.process_message(&create_test_message(
+            999,
+            Action::Trade,
+            Side::Bid,
+            100.0,
+            50,
+        ));
 
         assert!(result.is_ok());
         assert_eq!(lob.stats().trade_order_not_found, 1);
@@ -1452,10 +1539,22 @@ mod tests {
         let mut lob = LobReconstructor::with_config(config);
 
         // Multiple unknown order operations
-        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 50))
-            .unwrap();
-        lob.process_message(&create_test_message(2, Action::Cancel, Side::Bid, 100.0, 50))
-            .unwrap();
+        lob.process_message(&create_test_message(
+            1,
+            Action::Cancel,
+            Side::Bid,
+            100.0,
+            50,
+        ))
+        .unwrap();
+        lob.process_message(&create_test_message(
+            2,
+            Action::Cancel,
+            Side::Bid,
+            100.0,
+            50,
+        ))
+        .unwrap();
         lob.process_message(&create_test_message(3, Action::Trade, Side::Bid, 100.0, 50))
             .unwrap();
 

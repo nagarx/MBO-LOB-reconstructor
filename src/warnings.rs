@@ -47,34 +47,34 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub enum WarningCategory {
     /// Order not found when expected (cancel/modify/trade for unknown order)
     OrderNotFound,
-    
+
     /// Price level not found when expected
     PriceLevelNotFound,
-    
+
     /// Order not at expected price level
     OrderPriceMismatch,
-    
+
     /// Book state is inconsistent (crossed/locked quotes)
     InconsistentState,
-    
+
     /// Data quality issue (invalid price, size, etc.)
     DataQuality,
-    
+
     /// Timestamp anomaly (out of order, gap, etc.)
     TimestampAnomaly,
-    
+
     /// Message validation failure
     ValidationFailure,
-    
+
     /// Book was cleared/reset
     BookCleared,
-    
+
     /// Unknown or unexpected action
     UnknownAction,
-    
+
     /// Performance warning (slow processing, memory, etc.)
     Performance,
-    
+
     /// Other/uncategorized warning
     Other,
 }
@@ -96,7 +96,7 @@ impl WarningCategory {
             WarningCategory::Other => "OTHER",
         }
     }
-    
+
     /// Get severity level (1=low, 2=medium, 3=high).
     pub fn severity(&self) -> u8 {
         match self {
@@ -120,32 +120,32 @@ impl WarningCategory {
 pub struct Warning {
     /// Unique warning ID (auto-incremented)
     pub id: u64,
-    
+
     /// Warning category
     pub category: WarningCategory,
-    
+
     /// Human-readable message
     pub message: String,
-    
+
     /// Timestamp when the warning occurred (nanoseconds since epoch)
     /// This is the data timestamp, not the wall clock time
     pub data_timestamp: Option<i64>,
-    
+
     /// Wall clock time when warning was recorded (nanoseconds since epoch)
     pub recorded_at: u64,
-    
+
     /// Related order ID (if applicable)
     pub order_id: Option<u64>,
-    
+
     /// Related price (if applicable)
     pub price: Option<i64>,
-    
+
     /// Related size (if applicable)
     pub size: Option<u32>,
-    
+
     /// Message sequence number (if applicable)
     pub sequence: Option<u64>,
-    
+
     /// Additional context as key-value pairs
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub context: HashMap<String, String>,
@@ -170,37 +170,37 @@ impl Warning {
             context: HashMap::new(),
         }
     }
-    
+
     /// Set the data timestamp.
     pub fn with_data_timestamp(mut self, ts: i64) -> Self {
         self.data_timestamp = Some(ts);
         self
     }
-    
+
     /// Set the order ID.
     pub fn with_order_id(mut self, order_id: u64) -> Self {
         self.order_id = Some(order_id);
         self
     }
-    
+
     /// Set the price.
     pub fn with_price(mut self, price: i64) -> Self {
         self.price = Some(price);
         self
     }
-    
+
     /// Set the size.
     pub fn with_size(mut self, size: u32) -> Self {
         self.size = Some(size);
         self
     }
-    
+
     /// Set the sequence number.
     pub fn with_sequence(mut self, sequence: u64) -> Self {
         self.sequence = Some(sequence);
         self
     }
-    
+
     /// Add context key-value pair.
     pub fn with_context(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.context.insert(key.into(), value.into());
@@ -213,19 +213,19 @@ impl Warning {
 pub struct WarningSummary {
     /// Total number of warnings
     pub total: u64,
-    
+
     /// Count by category
     pub by_category: HashMap<String, u64>,
-    
+
     /// Count by severity
     pub by_severity: HashMap<u8, u64>,
-    
+
     /// First warning timestamp
     pub first_timestamp: Option<i64>,
-    
+
     /// Last warning timestamp
     pub last_timestamp: Option<i64>,
-    
+
     /// Number of unique order IDs involved
     pub unique_orders: u64,
 }
@@ -235,16 +235,16 @@ pub struct WarningSummary {
 pub struct WarningTrackerConfig {
     /// Maximum number of warnings to keep in memory
     pub max_warnings: usize,
-    
+
     /// Whether to log warnings to stderr
     pub log_to_stderr: bool,
-    
+
     /// Minimum severity to log (1=all, 2=medium+, 3=high only)
     pub min_log_severity: u8,
-    
+
     /// Whether to deduplicate similar warnings
     pub deduplicate: bool,
-    
+
     /// Time window for deduplication (nanoseconds)
     pub dedupe_window_ns: u64,
 }
@@ -265,19 +265,19 @@ impl Default for WarningTrackerConfig {
 pub struct WarningTracker {
     /// Configuration
     config: WarningTrackerConfig,
-    
+
     /// Stored warnings
     warnings: Vec<Warning>,
-    
+
     /// Counter for unique IDs
     next_id: AtomicU64,
-    
+
     /// Count by category (for fast summary)
     category_counts: HashMap<WarningCategory, u64>,
-    
+
     /// Recent warnings for deduplication (category -> (message_hash, timestamp))
     recent: HashMap<WarningCategory, Vec<(u64, u64)>>,
-    
+
     /// Unique order IDs seen in warnings
     unique_orders: std::collections::HashSet<u64>,
 }
@@ -287,7 +287,7 @@ impl WarningTracker {
     pub fn new() -> Self {
         Self::with_config(WarningTrackerConfig::default())
     }
-    
+
     /// Create a new warning tracker with custom configuration.
     pub fn with_config(config: WarningTrackerConfig) -> Self {
         Self {
@@ -299,7 +299,7 @@ impl WarningTracker {
             unique_orders: std::collections::HashSet::new(),
         }
     }
-    
+
     /// Record a warning.
     ///
     /// Returns the warning ID if recorded, or None if deduplicated.
@@ -308,24 +308,25 @@ impl WarningTracker {
         if self.config.deduplicate {
             let msg_hash = self.hash_message(&warning.message);
             let now = warning.recorded_at;
-            
+
             if let Some(recent_list) = self.recent.get_mut(&warning.category) {
                 // Clean old entries
                 recent_list.retain(|(_, ts)| now - *ts < self.config.dedupe_window_ns);
-                
+
                 // Check if duplicate
                 if recent_list.iter().any(|(h, _)| *h == msg_hash) {
                     return None;
                 }
-                
+
                 recent_list.push((msg_hash, now));
             } else {
                 self.recent.insert(warning.category, vec![(msg_hash, now)]);
             }
         }
-        
+
         // Log to stderr if enabled
-        if self.config.log_to_stderr && warning.category.severity() >= self.config.min_log_severity {
+        if self.config.log_to_stderr && warning.category.severity() >= self.config.min_log_severity
+        {
             eprintln!(
                 "[WARNING] [{}] {}: {}",
                 warning.category.name(),
@@ -333,32 +334,36 @@ impl WarningTracker {
                 warning.message
             );
         }
-        
+
         // Track order ID
         if let Some(order_id) = warning.order_id {
             self.unique_orders.insert(order_id);
         }
-        
+
         // Update category count
         *self.category_counts.entry(warning.category).or_insert(0) += 1;
-        
+
         let id = warning.id;
-        
+
         // Store warning (with capacity limit)
         if self.warnings.len() < self.config.max_warnings {
             self.warnings.push(warning);
         }
-        
+
         Some(id)
     }
-    
+
     /// Record a simple warning with just category and message.
-    pub fn record_simple(&mut self, category: WarningCategory, message: impl Into<String>) -> Option<u64> {
+    pub fn record_simple(
+        &mut self,
+        category: WarningCategory,
+        message: impl Into<String>,
+    ) -> Option<u64> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let warning = Warning::new(id, category, message);
         self.record(warning)
     }
-    
+
     /// Record a warning with order context.
     pub fn record_order_warning(
         &mut self,
@@ -369,62 +374,64 @@ impl WarningTracker {
         timestamp: Option<i64>,
     ) -> Option<u64> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let mut warning = Warning::new(id, category, message)
-            .with_order_id(order_id);
-        
+        let mut warning = Warning::new(id, category, message).with_order_id(order_id);
+
         if let Some(p) = price {
             warning = warning.with_price(p);
         }
         if let Some(ts) = timestamp {
             warning = warning.with_data_timestamp(ts);
         }
-        
+
         self.record(warning)
     }
-    
+
     /// Get the number of warnings recorded.
     pub fn len(&self) -> usize {
         self.warnings.len()
     }
-    
+
     /// Check if no warnings have been recorded.
     pub fn is_empty(&self) -> bool {
         self.warnings.is_empty()
     }
-    
+
     /// Get total count including deduplicated.
     pub fn total_count(&self) -> u64 {
         self.category_counts.values().sum()
     }
-    
+
     /// Get count for a specific category.
     pub fn count_by_category(&self, category: WarningCategory) -> u64 {
         *self.category_counts.get(&category).unwrap_or(&0)
     }
-    
+
     /// Get all warnings.
     pub fn warnings(&self) -> &[Warning] {
         &self.warnings
     }
-    
+
     /// Get warnings by category.
     pub fn warnings_by_category(&self, category: WarningCategory) -> Vec<&Warning> {
-        self.warnings.iter().filter(|w| w.category == category).collect()
+        self.warnings
+            .iter()
+            .filter(|w| w.category == category)
+            .collect()
     }
-    
+
     /// Get summary statistics.
     pub fn summary(&self) -> WarningSummary {
         let mut by_category = HashMap::new();
         let mut by_severity = HashMap::new();
-        
+
         for (cat, count) in &self.category_counts {
             by_category.insert(cat.name().to_string(), *count);
             *by_severity.entry(cat.severity()).or_insert(0) += *count;
         }
-        
+
         let first_timestamp = self.warnings.first().and_then(|w| w.data_timestamp);
         let last_timestamp = self.warnings.last().and_then(|w| w.data_timestamp);
-        
+
         WarningSummary {
             total: self.total_count(),
             by_category,
@@ -434,22 +441,26 @@ impl WarningTracker {
             unique_orders: self.unique_orders.len() as u64,
         }
     }
-    
+
     /// Export warnings to a JSON file.
     pub fn export_to_file(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
-        
+
         // Write header
         writeln!(writer, "{{")?;
-        
+
         // Write summary
         let summary = self.summary();
-        writeln!(writer, "  \"summary\": {},"  , serde_json::to_string(&summary).unwrap_or_default())?;
-        
+        writeln!(
+            writer,
+            "  \"summary\": {},",
+            serde_json::to_string(&summary).unwrap_or_default()
+        )?;
+
         // Write warnings array
         writeln!(writer, "  \"warnings\": [")?;
-        
+
         for (i, warning) in self.warnings.iter().enumerate() {
             let json = serde_json::to_string(warning).unwrap_or_default();
             if i < self.warnings.len() - 1 {
@@ -458,22 +469,25 @@ impl WarningTracker {
                 writeln!(writer, "    {json}")?;
             }
         }
-        
+
         writeln!(writer, "  ]")?;
         writeln!(writer, "}}")?;
-        
+
         writer.flush()?;
         Ok(())
     }
-    
+
     /// Export warnings to a CSV file (for spreadsheet analysis).
     pub fn export_to_csv(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
-        
+
         // Header
-        writeln!(writer, "id,category,severity,message,data_timestamp,recorded_at,order_id,price,size,sequence")?;
-        
+        writeln!(
+            writer,
+            "id,category,severity,message,data_timestamp,recorded_at,order_id,price,size,sequence"
+        )?;
+
         for warning in &self.warnings {
             writeln!(
                 writer,
@@ -482,7 +496,10 @@ impl WarningTracker {
                 warning.category.name(),
                 warning.category.severity(),
                 warning.message,
-                warning.data_timestamp.map(|t| t.to_string()).unwrap_or_default(),
+                warning
+                    .data_timestamp
+                    .map(|t| t.to_string())
+                    .unwrap_or_default(),
                 warning.recorded_at,
                 warning.order_id.map(|o| o.to_string()).unwrap_or_default(),
                 warning.price.map(|p| p.to_string()).unwrap_or_default(),
@@ -490,11 +507,11 @@ impl WarningTracker {
                 warning.sequence.map(|s| s.to_string()).unwrap_or_default(),
             )?;
         }
-        
+
         writer.flush()?;
         Ok(())
     }
-    
+
     /// Clear all warnings.
     pub fn clear(&mut self) {
         self.warnings.clear();
@@ -502,7 +519,7 @@ impl WarningTracker {
         self.recent.clear();
         self.unique_orders.clear();
     }
-    
+
     /// Simple hash for deduplication.
     fn hash_message(&self, message: &str) -> u64 {
         use std::hash::{Hash, Hasher};
@@ -521,26 +538,29 @@ impl Default for WarningTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_warning_category_names() {
         assert_eq!(WarningCategory::OrderNotFound.name(), "ORDER_NOT_FOUND");
-        assert_eq!(WarningCategory::InconsistentState.name(), "INCONSISTENT_STATE");
+        assert_eq!(
+            WarningCategory::InconsistentState.name(),
+            "INCONSISTENT_STATE"
+        );
     }
-    
+
     #[test]
     fn test_warning_category_severity() {
         assert_eq!(WarningCategory::OrderNotFound.severity(), 1);
         assert_eq!(WarningCategory::InconsistentState.severity(), 3);
     }
-    
+
     #[test]
     fn test_warning_creation() {
         let warning = Warning::new(1, WarningCategory::OrderNotFound, "Test message")
             .with_order_id(12345)
             .with_price(100_000_000_000)
             .with_data_timestamp(1234567890_000_000_000);
-        
+
         assert_eq!(warning.id, 1);
         assert_eq!(warning.category, WarningCategory::OrderNotFound);
         assert_eq!(warning.message, "Test message");
@@ -548,45 +568,48 @@ mod tests {
         assert_eq!(warning.price, Some(100_000_000_000));
         assert_eq!(warning.data_timestamp, Some(1234567890_000_000_000));
     }
-    
+
     #[test]
     fn test_warning_tracker_basic() {
         let mut tracker = WarningTracker::new();
-        
+
         tracker.record_simple(WarningCategory::OrderNotFound, "Order 123 not found");
         tracker.record_simple(WarningCategory::OrderNotFound, "Order 456 not found");
         tracker.record_simple(WarningCategory::InconsistentState, "Book crossed");
-        
+
         assert_eq!(tracker.len(), 3);
         assert_eq!(tracker.count_by_category(WarningCategory::OrderNotFound), 2);
-        assert_eq!(tracker.count_by_category(WarningCategory::InconsistentState), 1);
+        assert_eq!(
+            tracker.count_by_category(WarningCategory::InconsistentState),
+            1
+        );
     }
-    
+
     #[test]
     fn test_warning_tracker_deduplication() {
         let mut config = WarningTrackerConfig::default();
         config.deduplicate = true;
         config.dedupe_window_ns = 1_000_000_000_000; // Very large window for test
         config.log_to_stderr = false;
-        
+
         let mut tracker = WarningTracker::with_config(config);
-        
+
         // Same message should be deduplicated
         let id1 = tracker.record_simple(WarningCategory::OrderNotFound, "Order 123 not found");
         let id2 = tracker.record_simple(WarningCategory::OrderNotFound, "Order 123 not found");
-        
+
         assert!(id1.is_some());
         assert!(id2.is_none()); // Deduplicated
         assert_eq!(tracker.len(), 1);
     }
-    
+
     #[test]
     fn test_warning_tracker_summary() {
         let mut config = WarningTrackerConfig::default();
         config.log_to_stderr = false;
-        
+
         let mut tracker = WarningTracker::with_config(config);
-        
+
         tracker.record_order_warning(
             WarningCategory::OrderNotFound,
             "Order not found",
@@ -594,7 +617,7 @@ mod tests {
             Some(100_000_000_000),
             Some(1234567890_000_000_000),
         );
-        
+
         tracker.record_order_warning(
             WarningCategory::OrderNotFound,
             "Another order not found",
@@ -602,21 +625,26 @@ mod tests {
             None,
             None,
         );
-        
+
         let summary = tracker.summary();
         assert_eq!(summary.total, 2);
         assert_eq!(summary.unique_orders, 2);
         assert_eq!(summary.by_category.get("ORDER_NOT_FOUND"), Some(&2));
     }
-    
+
     #[test]
     fn test_warning_with_context() {
         let warning = Warning::new(1, WarningCategory::DataQuality, "Invalid price")
             .with_context("expected_range", "0-1000000")
             .with_context("actual_value", "-100");
-        
-        assert_eq!(warning.context.get("expected_range"), Some(&"0-1000000".to_string()));
-        assert_eq!(warning.context.get("actual_value"), Some(&"-100".to_string()));
+
+        assert_eq!(
+            warning.context.get("expected_range"),
+            Some(&"0-1000000".to_string())
+        );
+        assert_eq!(
+            warning.context.get("actual_value"),
+            Some(&"-100".to_string())
+        );
     }
 }
-

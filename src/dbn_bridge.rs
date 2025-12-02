@@ -75,7 +75,7 @@ impl DbnBridge {
             b'M' => Ok(Action::Modify),
             b'C' => Ok(Action::Cancel),
             b'R' => Ok(Action::Clear),
-            b'T' | b'F' => Ok(Action::Trade),  // 'F' = fill, treat as trade
+            b'T' | b'F' => Ok(Action::Trade), // 'F' = fill, treat as trade
             b'N' => Ok(Action::None),
             _ => Err(TlobError::InvalidAction(action)),
         }
