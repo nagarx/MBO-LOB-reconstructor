@@ -1,7 +1,7 @@
 # MBO-LOB-Reconstructor
 
 [![Build Status](https://github.com/nagarx/MBO-LOB-reconstructor/workflows/CI/badge.svg)](https://github.com/nagarx/MBO-LOB-reconstructor/actions)
-[![Rust](https://img.shields.io/badge/rust-1.82%2B-blue.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.83%2B-blue.svg)](https://www.rust-lang.org/)
 
 High-performance MBO to LOB reconstruction and analytics for deep learning preprocessing.
 
@@ -77,7 +77,72 @@ let norm_params = NormalizationParams::from_day_stats(&day_stats, 10);
 norm_params.save_json("normalization.json")?;
 ```
 
-### Advanced Analytics
+## Using with Feature Extractor
+
+This library is designed to work with [feature-extractor-MBO-LOB](https://github.com/nagarx/feature-extractor-MBO-LOB) for complete ML preprocessing pipelines.
+
+### Combined Usage (Recommended)
+
+```rust
+use feature_extractor::prelude::*;
+
+fn main() -> Result<()> {
+    // Build pipeline with fluent API
+    let mut pipeline = PipelineBuilder::new()
+        .lob_levels(10)           // Uses MBO-LOB-reconstructor internally
+        .with_derived_features()  // +8 derived features
+        .window(100, 10)          // 100 snapshots per sequence
+        .event_sampling(1000)     // Sample every 1000 events
+        .build()?;
+
+    // Process MBO data through complete pipeline
+    let output = pipeline.process("data/SYMBOL.mbo.dbn.zst")?;
+
+    println!("Processed {} messages", output.messages_processed);
+    println!("Generated {} sequences", output.sequences_generated);
+
+    // Export to NumPy for Python/PyTorch
+    let exporter = NumpyExporter::new("output/");
+    exporter.export_day("2025-02-03", &output)?;
+
+    Ok(())
+}
+```
+
+### Manual Component Control
+
+For fine-grained control, use the components directly:
+
+```rust
+use mbo_lob_reconstructor::{DbnLoader, LobReconstructor, LobConfig, CrossedQuotePolicy};
+use feature_extractor::{FeatureExtractor, FeatureConfig, SequenceBuilder, SequenceConfig};
+
+// Configure LOB reconstruction
+let lob_config = LobConfig::new(10)
+    .with_crossed_quote_policy(CrossedQuotePolicy::UseLastValid);
+let mut reconstructor = LobReconstructor::with_config(lob_config);
+
+// Configure feature extraction
+let feature_config = FeatureConfig::default().with_derived(true);
+let extractor = FeatureExtractor::with_config(feature_config.clone());
+
+// Configure sequence building (feature count auto-computed)
+let seq_config = SequenceConfig::from_feature_config(100, 10, &feature_config);
+let mut sequence_builder = SequenceBuilder::with_config(seq_config);
+
+// Process messages
+let loader = DbnLoader::new("data/SYMBOL.mbo.dbn.zst")?;
+for msg in loader.iter_messages()? {
+    let lob_state = reconstructor.process_message(&msg)?;
+    let features = extractor.extract_lob_features(&lob_state)?;
+    sequence_builder.push(msg.timestamp.unwrap_or(0) as u64, features)?;
+}
+
+// Generate sequences
+let sequences = sequence_builder.generate_all_sequences();
+```
+
+## Advanced Analytics
 
 ```rust
 use mbo_lob_reconstructor::{DepthStats, MarketImpact, LiquidityMetrics, Side};
@@ -98,7 +163,7 @@ println!("Spread: {:.2} bps", metrics.spread_bps);
 println!("Book pressure: {:.4}", metrics.book_pressure());
 ```
 
-### Handling Crossed Quotes
+## Handling Crossed Quotes
 
 ```rust
 use mbo_lob_reconstructor::{LobReconstructor, LobConfig, CrossedQuotePolicy};
@@ -180,15 +245,15 @@ let denormalized = params.denormalize(normalized, feature_idx);
 
 ```
 mbo_lob_reconstructor/
-├── types.rs          # Core types: MboMessage, LobState, Action, Side
-├── error.rs          # Error types and Result alias
-├── lob/
-│   ├── reconstructor.rs  # Main LobReconstructor
-│   └── multi_symbol.rs   # Multi-symbol support
-├── dbn_bridge.rs     # Databento format conversion
-├── loader.rs         # DBN file streaming
-├── statistics.rs     # DayStats, RunningStats, NormalizationParams
-└── analytics.rs      # DepthStats, MarketImpact, LiquidityMetrics
+    types.rs          # Core types: MboMessage, LobState, Action, Side
+    error.rs          # Error types and Result alias
+    lob/
+        reconstructor.rs  # Main LobReconstructor
+        multi_symbol.rs   # Multi-symbol support
+    dbn_bridge.rs     # Databento format conversion
+    loader.rs         # DBN file streaming
+    statistics.rs     # DayStats, RunningStats, NormalizationParams
+    analytics.rs      # DepthStats, MarketImpact, LiquidityMetrics
 ```
 
 ## Performance
@@ -222,6 +287,10 @@ cargo bench
 - Data Validation: Detect and handle data quality issues
 - Normalization: Generate consistent normalization parameters across datasets
 - Research: Analyze order book dynamics and market microstructure
+
+## Related Libraries
+
+- [feature-extractor-MBO-LOB](https://github.com/nagarx/feature-extractor-MBO-LOB) - Feature extraction and ML pipeline
 
 ## Related Work
 
