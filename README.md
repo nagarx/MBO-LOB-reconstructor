@@ -1,47 +1,29 @@
 # MBO-LOB-Reconstructor
 
-[![Crates.io](https://img.shields.io/crates/v/mbo-lob-reconstructor.svg)](https://crates.io/crates/mbo-lob-reconstructor)
-[![Documentation](https://docs.rs/mbo-lob-reconstructor/badge.svg)](https://docs.rs/mbo-lob-reconstructor)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Build Status](https://github.com/nagarx/MBO-LOB-reconstructor/workflows/CI/badge.svg)](https://github.com/nagarx/MBO-LOB-reconstructor/actions)
+[![Rust](https://img.shields.io/badge/rust-1.82%2B-blue.svg)](https://www.rust-lang.org/)
 
-**High-performance MBO → LOB reconstruction and analytics for deep learning preprocessing.**
+High-performance MBO to LOB reconstruction and analytics for deep learning preprocessing.
 
 Convert Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshots with enriched analytics, designed specifically as a preprocessing step for deep learning models (DeepLOB, TLOB, Transformers, CNN-LSTM, etc.).
 
-## ✨ Features
+## Features
 
-- **🚀 High Performance**: Process ~1M messages/second on modern hardware
-- **📊 MBO → LOB Reconstruction**: Convert order-level events to aggregated price levels
-- **🔬 Enriched Analytics**: Microprice, VWAP, depth imbalance, spread metrics
-- **✅ Book Consistency Validation**: Detect and handle crossed/locked quotes
-- **📈 Statistics Tracking**: Per-day statistics with Welford's algorithm for normalization
-- **🎯 ML-Ready**: NormalizationParams, DayStats, and feature extraction utilities
-- **📦 Databento Support**: Native support for compressed DBN files (.dbn.zst)
+- **High Performance**: Process approximately 1M messages/second on modern hardware
+- **MBO to LOB Reconstruction**: Convert order-level events to aggregated price levels
+- **Enriched Analytics**: Microprice, VWAP, depth imbalance, spread metrics
+- **Book Consistency Validation**: Detect and handle crossed/locked quotes
+- **Statistics Tracking**: Per-day statistics with Welford's algorithm for normalization
+- **ML-Ready**: NormalizationParams, DayStats, and feature extraction utilities
+- **Databento Support**: Native support for compressed DBN files (.dbn.zst)
 
-## 📦 Installation
-
-Add to your `Cargo.toml`:
-
-```toml
-[dependencies]
-mbo-lob-reconstructor = "0.1"
-```
-
-### Feature Flags
+## Feature Flags
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `databento` | ✅ | Enable Databento DBN file support |
+| `databento` | Yes | Enable Databento DBN file support |
 
-To disable Databento support (smaller binary):
-
-```toml
-[dependencies]
-mbo-lob-reconstructor = { version = "0.1", default-features = false }
-```
-
-## 🚀 Quick Start
+## Quick Start
 
 ### Basic LOB Reconstruction
 
@@ -135,9 +117,9 @@ let mut lob = LobReconstructor::with_config(config);
 // - SkipUpdate: Skip updates that would cause crossing
 ```
 
-## 📊 LOB State Analytics
+## LOB State Analytics
 
-The `LobState` struct provides rich analytics out of the box:
+The `LobState` struct provides rich analytics:
 
 | Method | Description |
 |--------|-------------|
@@ -152,7 +134,7 @@ The `LobState` struct provides rich analytics out of the box:
 | `active_bid_levels()` / `active_ask_levels()` | Count of non-empty levels |
 | `check_consistency()` | Book state: Valid, Empty, Crossed, Locked |
 
-## 📈 Statistics for ML Normalization
+## Statistics for ML Normalization
 
 ### DayStats
 
@@ -194,7 +176,7 @@ let normalized = params.normalize(value, feature_idx);
 let denormalized = params.denormalize(normalized, feature_idx);
 ```
 
-## 🏗️ Architecture
+## Architecture
 
 ```
 mbo_lob_reconstructor/
@@ -209,18 +191,18 @@ mbo_lob_reconstructor/
 └── analytics.rs      # DepthStats, MarketImpact, LiquidityMetrics
 ```
 
-## ⚡ Performance
+## Performance
 
 Benchmarked on real NVIDIA MBO data (17.8M messages):
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | ~974,000 msg/s |
-| **Latency** | ~1 μs/message |
-| **Data Quality** | 100% valid snapshots |
-| **Memory** | Efficient streaming (no full load) |
+| Throughput | ~974,000 msg/s |
+| Latency | ~1 microsecond/message |
+| Data Quality | 100% valid snapshots |
+| Memory | Efficient streaming (no full load) |
 
-## 🧪 Testing
+## Testing
 
 ```bash
 # Run all tests
@@ -233,15 +215,15 @@ cargo test --release
 cargo bench
 ```
 
-## 🤝 Use Cases
+## Use Cases
 
-- **Deep Learning Preprocessing**: Prepare LOB data for DeepLOB, TLOB, Transformers
-- **Feature Engineering**: Extract market microstructure features
-- **Data Validation**: Detect and handle data quality issues
-- **Normalization**: Generate consistent normalization parameters across datasets
-- **Research**: Analyze order book dynamics and market microstructure
+- Deep Learning Preprocessing: Prepare LOB data for DeepLOB, TLOB, Transformers
+- Feature Engineering: Extract market microstructure features
+- Data Validation: Detect and handle data quality issues
+- Normalization: Generate consistent normalization parameters across datasets
+- Research: Analyze order book dynamics and market microstructure
 
-## 📚 Related Work
+## Related Work
 
 This library is designed to work with:
 
@@ -249,16 +231,8 @@ This library is designed to work with:
 - [TLOB](https://arxiv.org/abs/2211.10587) - Transformer-based LOB models
 - [Databento](https://databento.com/) - High-quality market data
 
-## 📄 License
+## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+Proprietary - All Rights Reserved. See [LICENSE](LICENSE) for details.
 
-## 🙏 Acknowledgments
-
-- Databento for the DBN format specification
-- The quantitative finance research community
-
----
-
-**Made with ❤️ for the quant ML community**
-
+No permission is granted to use, copy, modify, or distribute this software.
