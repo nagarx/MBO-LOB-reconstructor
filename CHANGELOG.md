@@ -5,7 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] - 2025-01-XX
+## [Unreleased]
+
+## [0.1.1] - 2025-12-04
+
+### Added
+
+- **System Message Filtering**
+  - `LobConfig::skip_system_messages` - Skip system messages (order_id=0, size=0, price<=0) by default
+  - `LobStats::system_messages_skipped` - Track count of skipped system messages
+  - `LobConfig::with_skip_system_messages(bool)` - Configure system message handling
+  
+- **Full Reset Method**
+  - `LobReconstructor::full_reset()` - Completely reset reconstructor including statistics
+  - Distinction: `reset()` preserves stats (for Action::Clear), `full_reset()` clears everything
+
+### Fixed
+
+- Collapsed nested if statement for system message check (clippy)
+
+### Changed
+
+- `reset()` now explicitly documents that it preserves statistics (for monitoring across Action::Clear)
+- System messages are now filtered at the `LobReconstructor` level, not at the loader level
+
+## [0.1.0] - 2025-12-01
 
 ### Added
 
@@ -18,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Core Types
 - `MboMessage` - Market-By-Order message representation
 - `LobState` - LOB snapshot with enriched analytics
-- `Action` - Order actions (Add, Modify, Cancel, Trade, Fill)
+- `Action` - Order actions (Add, Modify, Cancel, Trade, Fill, Clear, None)
 - `Side` - Order side (Bid, Ask, None)
 - `BookConsistency` - Book state validation (Valid, Empty, Crossed, Locked)
 
@@ -54,12 +78,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 - ~974,000 messages/second throughput
-- ~1 μs latency per message
+- ~1 microsecond latency per message
 - 100% data quality on real NVIDIA MBO data (17.8M messages)
 
 ### Testing
-- 89 unit tests
-- 19 integration tests with real market data
-- 8 edge case tests for robustness
-- 3 documentation tests
+- 89+ unit tests
+- 19+ integration tests with real market data
+- 8+ edge case tests for robustness
 
+[Unreleased]: https://github.com/nagarx/MBO-LOB-reconstructor/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/nagarx/MBO-LOB-reconstructor/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/nagarx/MBO-LOB-reconstructor/releases/tag/v0.1.0
