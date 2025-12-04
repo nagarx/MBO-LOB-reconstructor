@@ -915,11 +915,26 @@ impl LobReconstructor {
         state
     }
 
-    /// Reset the LOB to empty state.
-    /// Reset the order book state.
+    /// Reset the order book state (preserves statistics).
     ///
-    /// Clears all orders and price levels but preserves statistics.
-    /// This is called when an `Action::Clear` message is received.
+    /// Clears all orders and price levels but **preserves** `LobStats`.
+    /// This is called internally when an `Action::Clear` message is received.
+    ///
+    /// # When to Use
+    ///
+    /// - Responding to `Action::Clear` messages (done automatically)
+    /// - Mid-session reset without losing statistics
+    ///
+    /// # When NOT to Use
+    ///
+    /// - Starting a new trading day: use `full_reset()` instead
+    /// - Fresh test runs: use `full_reset()` instead
+    ///
+    /// # Statistics Behavior
+    ///
+    /// Statistics (`messages_processed`, `system_messages_skipped`, etc.)
+    /// are intentionally preserved so you can track cumulative metrics
+    /// across resets within a session.
     pub fn reset(&mut self) {
         self.bids.clear();
         self.asks.clear();
@@ -927,12 +942,36 @@ impl LobReconstructor {
         self.best_bid = None;
         self.best_ask = None;
         self.last_valid_state = None;
-        // Note: stats are preserved across resets for monitoring purposes
     }
 
     /// Fully reset the reconstructor including statistics.
     ///
-    /// Use this when starting a new day or completely fresh state.
+    /// Clears all orders, price levels, **and** resets `LobStats` to zero.
+    ///
+    /// # When to Use
+    ///
+    /// - Starting a new trading day
+    /// - Fresh test runs
+    /// - Switching to a different symbol
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Process day 1
+    /// for msg in day1_messages {
+    ///     lob.process_message(&msg)?;
+    /// }
+    /// let day1_stats = lob.stats().clone();
+    ///
+    /// // Reset for day 2
+    /// lob.full_reset();
+    /// assert_eq!(lob.stats().messages_processed, 0);
+    ///
+    /// // Process day 2
+    /// for msg in day2_messages {
+    ///     lob.process_message(&msg)?;
+    /// }
+    /// ```
     pub fn full_reset(&mut self) {
         self.reset();
         self.stats = LobStats::default();
