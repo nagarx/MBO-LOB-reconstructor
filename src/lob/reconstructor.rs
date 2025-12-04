@@ -383,12 +383,12 @@ impl LobReconstructor {
         // Skip system messages if configured (default: true)
         // System messages are identified by: order_id=0, size=0, or price<=0
         // These are NOT valid orders - they're heartbeats, status updates, etc.
-        if self.config.skip_system_messages {
-            if msg.order_id == 0 || msg.size == 0 || msg.price <= 0 {
-                self.stats.system_messages_skipped += 1;
-                // Return current state unchanged
-                return Ok(self.get_lob_state());
-            }
+        if self.config.skip_system_messages
+            && (msg.order_id == 0 || msg.size == 0 || msg.price <= 0)
+        {
+            self.stats.system_messages_skipped += 1;
+            // Return current state unchanged
+            return Ok(self.get_lob_state());
         }
 
         // Validate message (if enabled)
