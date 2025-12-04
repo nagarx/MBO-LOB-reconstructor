@@ -13,21 +13,30 @@
 //! use mbo_lob_reconstructor::{DbnLoader, LobReconstructor};
 //!
 //! // Create loader
-//! let mut loader = DbnLoader::new("path/to/file.dbn.zst")?;
+//! let loader = DbnLoader::new("path/to/file.dbn.zst")?;
 //!
-//! // Create LOB reconstructor
+//! // Create LOB reconstructor (skip_system_messages=true by default)
 //! let mut lob = LobReconstructor::new(10);
 //!
-//! // Process all messages
+//! // Process all messages - system messages are automatically skipped
 //! for mbo_msg in loader.iter_messages()? {
 //!     let state = lob.process_message(&mbo_msg)?;
 //!     // ... use state ...
 //! }
 //!
-//! // Get statistics
-//! let stats = loader.stats();
-//! println!("Processed {} messages", stats.messages_read);
+//! // Check statistics
+//! println!("Processed: {}", lob.stats().messages_processed);
+//! println!("System messages skipped: {}", lob.stats().system_messages_skipped);
 //! ```
+//!
+//! # System Messages
+//!
+//! DBN/MBO data contains system messages (order_id=0, heartbeats, status updates)
+//! that are NOT valid orders. These are handled by `LobReconstructor` with the
+//! `skip_system_messages` config option (default: true).
+//!
+//! This loader focuses on I/O and decode errors only. Use `skip_invalid(true)`
+//! to skip messages that fail to decode from the DBN format.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -49,7 +58,7 @@ pub struct LoaderStats {
     /// Total messages successfully read
     pub messages_read: u64,
 
-    /// Messages skipped due to conversion errors
+    /// Messages skipped due to decode/conversion errors
     pub messages_skipped: u64,
 
     /// Total bytes read from file
@@ -62,6 +71,30 @@ pub struct LoaderStats {
 /// DBN file loader.
 ///
 /// Efficiently streams MBO messages from compressed DBN files.
+///
+/// # Responsibilities
+///
+/// This loader handles:
+/// - File I/O (opening, streaming, buffering)
+/// - DBN format decoding
+/// - Conversion to `MboMessage`
+/// - Error recovery for decode failures
+///
+/// It does NOT handle:
+/// - System message filtering (that's `LobReconstructor`'s job)
+/// - Order validation (that's `LobReconstructor`'s job)
+///
+/// # Example
+///
+/// ```ignore
+/// let loader = DbnLoader::new("data.dbn.zst")?
+///     .skip_invalid(true);  // Skip decode errors
+///
+/// for msg in loader.iter_messages()? {
+///     // Pass to LobReconstructor - it handles system messages
+///     lob.process_message(&msg)?;
+/// }
+/// ```
 pub struct DbnLoader {
     /// Path to the DBN file
     path: PathBuf,
@@ -69,7 +102,7 @@ pub struct DbnLoader {
     /// Statistics
     stats: LoaderStats,
 
-    /// Skip invalid messages instead of erroring
+    /// Skip messages that fail to decode (instead of erroring)
     skip_invalid: bool,
 }
 
@@ -110,10 +143,13 @@ impl DbnLoader {
         })
     }
 
-    /// Enable skipping invalid messages instead of returning errors.
+    /// Enable skipping messages that fail to decode.
     ///
-    /// When enabled, invalid messages will be logged and skipped,
-    /// and processing will continue.
+    /// When enabled, messages that fail DBN decoding or conversion
+    /// will be logged and skipped, and processing will continue.
+    ///
+    /// This handles DECODE errors only. System messages (order_id=0)
+    /// are handled by `LobReconstructor` with `skip_system_messages`.
     pub fn skip_invalid(mut self, skip: bool) -> Self {
         self.skip_invalid = skip;
         self
@@ -280,9 +316,39 @@ impl<D: DecodeRecord> MessageIterator<D> {
     }
 }
 
+/// Check if an MBO message represents a valid order (not a system message).
+///
+/// Returns `false` for:
+/// - System messages (`order_id = 0`)
+/// - Invalid size (`size = 0`)
+/// - Invalid price (`price <= 0`)
+///
+/// This is a utility function for cases where you want to filter
+/// messages before passing to `LobReconstructor`, or when
+/// `skip_system_messages` is disabled in `LobConfig`.
+///
+/// Note: With the default `LobConfig` (skip_system_messages=true),
+/// you don't need to use this function - the reconstructor handles it.
+///
+/// # Example
+///
+/// ```ignore
+/// // Only needed if skip_system_messages=false in LobConfig
+/// for msg in loader.iter_messages()? {
+///     if is_valid_order(&msg) {
+///         lob.process_message(&msg)?;
+///     }
+/// }
+/// ```
+#[inline]
+pub fn is_valid_order(msg: &MboMessage) -> bool {
+    msg.order_id != 0 && msg.size != 0 && msg.price > 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Action, Side};
 
     #[test]
     fn test_loader_new_nonexistent() {
@@ -308,5 +374,27 @@ mod tests {
             let loader = loader.skip_invalid(true);
             assert!(loader.skip_invalid);
         }
+    }
+
+    #[test]
+    fn test_is_valid_order() {
+        // Valid order
+        let valid = MboMessage::new(123, Action::Add, Side::Bid, 100_000_000_000, 100);
+        assert!(is_valid_order(&valid));
+
+        // Invalid: order_id = 0 (system message)
+        let invalid = MboMessage::new(0, Action::Add, Side::Bid, 100_000_000_000, 100);
+        assert!(!is_valid_order(&invalid));
+
+        // Invalid: size = 0
+        let invalid = MboMessage::new(123, Action::Add, Side::Bid, 100_000_000_000, 0);
+        assert!(!is_valid_order(&invalid));
+
+        // Invalid: price <= 0
+        let invalid = MboMessage::new(123, Action::Add, Side::Bid, 0, 100);
+        assert!(!is_valid_order(&invalid));
+
+        let invalid = MboMessage::new(123, Action::Add, Side::Bid, -100, 100);
+        assert!(!is_valid_order(&invalid));
     }
 }

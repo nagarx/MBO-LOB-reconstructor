@@ -43,6 +43,18 @@ pub struct LobConfig {
 
     /// Whether to log warnings for consistency issues
     pub log_warnings: bool,
+
+    /// Skip system messages (order_id=0, size=0, price<=0) instead of erroring.
+    ///
+    /// DBN/MBO data often contains system messages (heartbeats, status updates)
+    /// that have order_id=0. These are NOT valid orders and cannot be processed
+    /// by the LOB reconstructor.
+    ///
+    /// When true (default): silently skip these messages and track count in stats.
+    /// When false: attempt to process (will fail validation if validate_messages=true).
+    ///
+    /// This is the recommended setting for LOB reconstruction from real market data.
+    pub skip_system_messages: bool,
 }
 
 impl Default for LobConfig {
@@ -52,6 +64,7 @@ impl Default for LobConfig {
             crossed_quote_policy: CrossedQuotePolicy::Allow,
             validate_messages: true,
             log_warnings: true,
+            skip_system_messages: true, // Safe default for real market data
         }
     }
 }
@@ -80,6 +93,20 @@ impl LobConfig {
     /// Enable/disable warning logs.
     pub fn with_logging(mut self, log: bool) -> Self {
         self.log_warnings = log;
+        self
+    }
+
+    /// Enable/disable skipping of system messages.
+    ///
+    /// System messages are identified by:
+    /// - order_id = 0 (heartbeats, status updates, metadata)
+    /// - size = 0 (invalid order size)
+    /// - price <= 0 (invalid price)
+    ///
+    /// When true (default): these messages are silently skipped.
+    /// When false: these messages will be processed (and likely fail validation).
+    pub fn with_skip_system_messages(mut self, skip: bool) -> Self {
+        self.skip_system_messages = skip;
         self
     }
 }
@@ -125,8 +152,11 @@ pub struct LobReconstructor {
 /// Statistics for monitoring LOB health.
 #[derive(Debug, Clone, Default)]
 pub struct LobStats {
-    /// Total messages processed
+    /// Total messages processed (excludes system messages if skip_system_messages=true)
     pub messages_processed: u64,
+
+    /// System messages skipped (order_id=0, size=0, price<=0)
+    pub system_messages_skipped: u64,
 
     /// Number of active orders
     pub active_orders: usize,
@@ -319,24 +349,48 @@ impl LobReconstructor {
     /// Process a single MBO message and update LOB state.
     ///
     /// This is the main entry point for LOB updates. It:
-    /// 1. Validates the message (if enabled in config)
-    /// 2. Updates internal state based on action
-    /// 3. Updates cached best prices
-    /// 4. Checks for book consistency (crossed/locked quotes)
-    /// 5. Applies crossed quote policy
-    /// 6. Returns current LOB snapshot
+    /// 1. Skips system messages (if skip_system_messages=true in config)
+    /// 2. Validates the message (if validate_messages=true in config)
+    /// 3. Updates internal state based on action
+    /// 4. Updates cached best prices
+    /// 5. Checks for book consistency (crossed/locked quotes)
+    /// 6. Applies crossed quote policy
+    /// 7. Returns current LOB snapshot
     ///
     /// # Arguments
     /// * `msg` - The MBO message to process
     ///
     /// # Returns
-    /// Current LOB state after processing the message
+    /// Current LOB state after processing the message.
+    /// For system messages (when skip_system_messages=true), returns current state unchanged.
     ///
     /// # Errors
     /// Returns error if message is invalid or causes inconsistent state
     /// (depending on configuration)
+    ///
+    /// # System Messages
+    ///
+    /// DBN/MBO data often contains system messages (heartbeats, status updates)
+    /// identified by:
+    /// - order_id = 0
+    /// - size = 0
+    /// - price <= 0
+    ///
+    /// By default (skip_system_messages=true), these are silently skipped.
+    /// The count is tracked in `stats.system_messages_skipped`.
     #[inline]
     pub fn process_message(&mut self, msg: &MboMessage) -> Result<LobState> {
+        // Skip system messages if configured (default: true)
+        // System messages are identified by: order_id=0, size=0, or price<=0
+        // These are NOT valid orders - they're heartbeats, status updates, etc.
+        if self.config.skip_system_messages {
+            if msg.order_id == 0 || msg.size == 0 || msg.price <= 0 {
+                self.stats.system_messages_skipped += 1;
+                // Return current state unchanged
+                return Ok(self.get_lob_state());
+            }
+        }
+
         // Validate message (if enabled)
         if self.config.validate_messages {
             msg.validate()?;
@@ -1429,10 +1483,11 @@ mod tests {
 
     #[test]
     fn test_clear_resets_book() {
-        // Disable validation since Clear messages may have dummy values
+        // Disable validation and system message skipping since Clear uses dummy values
         let config = LobConfig::new(10)
             .with_logging(false)
-            .with_validation(false);
+            .with_validation(false)
+            .with_skip_system_messages(false); // Allow order_id=0, price=0 for Clear
         let mut lob = LobReconstructor::with_config(config);
 
         // Build up some state
@@ -1468,10 +1523,11 @@ mod tests {
 
     #[test]
     fn test_none_action_is_noop() {
-        // Disable validation since None messages may have dummy values
+        // Disable validation and system message skipping since None uses dummy values
         let config = LobConfig::new(10)
             .with_logging(false)
-            .with_validation(false);
+            .with_validation(false)
+            .with_skip_system_messages(false); // Allow price=0 for None
         let mut lob = LobReconstructor::with_config(config);
 
         // Add an order
@@ -1491,6 +1547,63 @@ mod tests {
 
         // Stats should track the noop
         assert_eq!(lob.stats().noop_messages, 1);
+    }
+
+    // =========================================================================
+    // System Message Skipping Tests
+    // =========================================================================
+
+    #[test]
+    fn test_system_messages_skipped_by_default() {
+        // Default config has skip_system_messages=true
+        let mut lob = LobReconstructor::new(10);
+
+        // Add a valid order first
+        lob.process_message(&create_test_message(1, Action::Add, Side::Bid, 100.0, 100))
+            .unwrap();
+        assert_eq!(lob.order_count(), 1);
+        assert_eq!(lob.stats().messages_processed, 1);
+        assert_eq!(lob.stats().system_messages_skipped, 0);
+
+        // System message: order_id = 0
+        let msg = MboMessage::new(0, Action::Add, Side::Bid, 100_000_000_000, 100);
+        let state_before = lob.get_lob_state();
+        lob.process_message(&msg).unwrap(); // Should NOT error
+        assert_eq!(lob.get_lob_state().best_bid, state_before.best_bid); // State unchanged
+        assert_eq!(lob.stats().system_messages_skipped, 1);
+        assert_eq!(lob.stats().messages_processed, 1); // Not incremented
+
+        // System message: size = 0
+        let msg = MboMessage::new(123, Action::Add, Side::Bid, 100_000_000_000, 0);
+        lob.process_message(&msg).unwrap(); // Should NOT error
+        assert_eq!(lob.stats().system_messages_skipped, 2);
+
+        // System message: price <= 0
+        let msg = MboMessage::new(123, Action::Add, Side::Bid, 0, 100);
+        lob.process_message(&msg).unwrap(); // Should NOT error
+        assert_eq!(lob.stats().system_messages_skipped, 3);
+
+        let msg = MboMessage::new(123, Action::Add, Side::Bid, -100, 100);
+        lob.process_message(&msg).unwrap(); // Should NOT error
+        assert_eq!(lob.stats().system_messages_skipped, 4);
+
+        // Order count should still be 1
+        assert_eq!(lob.order_count(), 1);
+    }
+
+    #[test]
+    fn test_system_messages_not_skipped_when_disabled() {
+        // Disable system message skipping
+        let config = LobConfig::new(10)
+            .with_skip_system_messages(false)
+            .with_validation(true); // Keep validation enabled
+
+        let mut lob = LobReconstructor::with_config(config);
+
+        // System message should now fail validation
+        let msg = MboMessage::new(0, Action::Add, Side::Bid, 100_000_000_000, 100);
+        let result = lob.process_message(&msg);
+        assert!(result.is_err()); // Should error because order_id=0 is invalid
     }
 
     // =========================================================================

@@ -150,4 +150,4 @@ pub use warnings::{
 pub use dbn_bridge::DbnBridge;
 
 #[cfg(feature = "databento")]
-pub use loader::{DbnLoader, LoaderStats};
+pub use loader::{is_valid_order, DbnLoader, LoaderStats};
