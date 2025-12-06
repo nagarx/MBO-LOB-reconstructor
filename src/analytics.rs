@@ -520,11 +520,21 @@ mod tests {
 
     fn create_test_state() -> LobState {
         let mut state = LobState::new(5);
-        state.bid_prices = vec![100_000_000_000, 99_990_000_000, 99_980_000_000, 0, 0];
-        state.bid_sizes = vec![100, 200, 150, 0, 0];
+        // Bid side: highest to lowest
+        state.bid_prices[0] = 100_000_000_000;
+        state.bid_prices[1] = 99_990_000_000;
+        state.bid_prices[2] = 99_980_000_000;
+        state.bid_sizes[0] = 100;
+        state.bid_sizes[1] = 200;
+        state.bid_sizes[2] = 150;
         state.best_bid = Some(100_000_000_000);
-        state.ask_prices = vec![100_010_000_000, 100_020_000_000, 100_030_000_000, 0, 0];
-        state.ask_sizes = vec![150, 100, 200, 0, 0];
+        // Ask side: lowest to highest
+        state.ask_prices[0] = 100_010_000_000;
+        state.ask_prices[1] = 100_020_000_000;
+        state.ask_prices[2] = 100_030_000_000;
+        state.ask_sizes[0] = 150;
+        state.ask_sizes[1] = 100;
+        state.ask_sizes[2] = 200;
         state.best_ask = Some(100_010_000_000);
         state
     }
