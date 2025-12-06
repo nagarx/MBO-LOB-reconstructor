@@ -891,6 +891,48 @@ impl LobReconstructor {
     pub fn get_lob_state_with_metadata(&self, timestamp: Option<i64>) -> LobState {
         let levels = self.config.levels;
         let mut state = LobState::new(levels);
+        self.fill_lob_state(&mut state, timestamp);
+        state
+    }
+
+    /// Fill an existing LOB state with current book data (zero-allocation).
+    ///
+    /// This is the high-performance path for hot loops. Instead of allocating
+    /// a new `LobState` on every call, you can reuse a pre-allocated one.
+    ///
+    /// # Arguments
+    /// * `state` - Pre-allocated LobState to fill (will be cleared and populated)
+    /// * `timestamp` - Optional timestamp from the message that triggered this snapshot
+    ///
+    /// # Performance
+    ///
+    /// This method performs **zero heap allocations** when used with the
+    /// stack-allocated `LobState`. For processing millions of messages,
+    /// this provides significant throughput improvements.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut lob = LobReconstructor::new(10);
+    /// let mut state = LobState::new(10);  // Reused across calls
+    ///
+    /// for msg in messages {
+    ///     lob.process_message_into(&msg, &mut state)?;
+    ///     // Use state without allocation overhead
+    ///     println!("Mid: {:?}", state.mid_price());
+    /// }
+    /// ```
+    #[inline]
+    pub fn fill_lob_state(&self, state: &mut LobState, timestamp: Option<i64>) {
+        let levels = self.config.levels.min(crate::types::MAX_LOB_LEVELS);
+
+        // Clear previous data (only clear used portion for efficiency)
+        for i in 0..levels {
+            state.bid_prices[i] = 0;
+            state.bid_sizes[i] = 0;
+            state.ask_prices[i] = 0;
+            state.ask_sizes[i] = 0;
+        }
 
         // Best prices
         state.best_bid = self.best_bid;
@@ -899,6 +941,7 @@ impl LobReconstructor {
         // Metadata
         state.timestamp = timestamp.or(self.stats.last_timestamp);
         state.sequence = self.stats.messages_processed;
+        state.levels = levels;
 
         // Bid side (top N, highest to lowest)
         for (i, (&price, orders)) in self.bids.iter().rev().take(levels).enumerate() {
@@ -911,8 +954,147 @@ impl LobReconstructor {
             state.ask_prices[i] = price;
             state.ask_sizes[i] = orders.values().sum();
         }
+    }
 
-        state
+    /// Process a message and write the resulting state into a pre-allocated buffer.
+    ///
+    /// This is the **high-performance zero-allocation** API for processing MBO messages.
+    /// Instead of returning a new `LobState`, it fills the provided buffer in-place.
+    ///
+    /// # Arguments
+    /// * `msg` - The MBO message to process
+    /// * `state` - Pre-allocated LobState buffer to fill with the result
+    ///
+    /// # Returns
+    /// * `Ok(())` if successful
+    /// * `Err(TlobError)` if validation fails or crossed quote policy rejects
+    ///
+    /// # Performance
+    ///
+    /// Combined with stack-allocated `LobState`, this eliminates ALL heap allocations
+    /// in the hot path, providing maximum throughput for real-time processing.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut lob = LobReconstructor::new(10);
+    /// let mut state = LobState::new(10);
+    ///
+    /// for msg in messages {
+    ///     lob.process_message_into(&msg, &mut state)?;
+    ///     if let Some(mid) = state.mid_price() {
+    ///         println!("Mid-price: ${:.4}", mid);
+    ///     }
+    /// }
+    /// ```
+    #[inline]
+    pub fn process_message_into(&mut self, msg: &MboMessage, state: &mut LobState) -> Result<()> {
+        // Skip system messages if configured
+        if self.config.skip_system_messages
+            && (msg.order_id == 0 || msg.size == 0 || msg.price <= 0)
+        {
+            self.stats.system_messages_skipped += 1;
+            self.fill_lob_state(state, None);
+            return Ok(());
+        }
+
+        // Validate message (if enabled)
+        if self.config.validate_messages {
+            msg.validate()?;
+        }
+
+        // Process based on action
+        match msg.action {
+            Action::Add => self.add_order(msg)?,
+            Action::Modify => self.modify_order(msg)?,
+            Action::Cancel => self.cancel_order(msg)?,
+            Action::Trade | Action::Fill => self.process_trade(msg)?,
+            Action::Clear => {
+                self.stats.book_clears += 1;
+                if self.config.log_warnings {
+                    log::info!(
+                        "Book clear received (msg #{}, ts={:?}, orders_before={})",
+                        self.stats.messages_processed,
+                        msg.timestamp,
+                        self.orders.len()
+                    );
+                }
+                self.reset();
+            }
+            Action::None => {
+                self.stats.noop_messages += 1;
+            }
+        }
+
+        // Update statistics
+        self.stats.messages_processed += 1;
+        self.stats.active_orders = self.orders.len();
+        self.stats.bid_levels = self.bids.len();
+        self.stats.ask_levels = self.asks.len();
+
+        // Track timestamp
+        if let Some(ts) = msg.timestamp {
+            self.stats.last_timestamp = Some(ts);
+        }
+
+        // Update best prices
+        self.update_best_prices();
+
+        // Check for book consistency
+        let consistency = self.check_consistency();
+        self.track_consistency(consistency);
+
+        // Apply crossed quote policy and fill state
+        self.apply_crossed_quote_policy_into(consistency, msg.timestamp, state)
+    }
+
+    /// Apply crossed quote policy and fill state in-place (zero-allocation).
+    #[inline]
+    fn apply_crossed_quote_policy_into(
+        &self,
+        consistency: BookConsistency,
+        timestamp: Option<i64>,
+        state: &mut LobState,
+    ) -> Result<()> {
+        // For valid or empty states, always return current state
+        if consistency == BookConsistency::Valid || consistency == BookConsistency::Empty {
+            self.fill_lob_state(state, timestamp);
+            return Ok(());
+        }
+
+        // For crossed or locked states, apply policy
+        match self.config.crossed_quote_policy {
+            CrossedQuotePolicy::Allow => {
+                self.fill_lob_state(state, timestamp);
+                Ok(())
+            }
+            CrossedQuotePolicy::UseLastValid => {
+                // Copy from last valid state if available
+                if let Some(ref last_valid) = self.last_valid_state {
+                    *state = last_valid.clone();
+                } else {
+                    self.fill_lob_state(state, timestamp);
+                }
+                Ok(())
+            }
+            CrossedQuotePolicy::Error => {
+                if let (Some(bid), Some(ask)) = (self.best_bid, self.best_ask) {
+                    Err(TlobError::CrossedQuote(bid, ask))
+                } else {
+                    self.fill_lob_state(state, timestamp);
+                    Ok(())
+                }
+            }
+            CrossedQuotePolicy::SkipUpdate => {
+                // Return last valid state (same behavior as UseLastValid)
+                if let Some(ref last_valid) = self.last_valid_state {
+                    *state = last_valid.clone();
+                } else {
+                    self.fill_lob_state(state, timestamp);
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Reset the order book state (preserves statistics).
@@ -1712,5 +1894,137 @@ mod tests {
 
         assert_eq!(lob.stats().cancel_order_not_found, 2);
         assert_eq!(lob.stats().trade_order_not_found, 1);
+    }
+
+    // =========================================================================
+    // Zero-allocation API Tests
+    // =========================================================================
+
+    #[test]
+    fn test_process_message_into_matches_process_message() {
+        use crate::types::LobState;
+
+        // Create two identical LOBs
+        let mut lob1 = LobReconstructor::new(10);
+        let mut lob2 = LobReconstructor::new(10);
+        let mut reused_state = LobState::new(10);
+
+        // Define test messages
+        let messages = vec![
+            create_test_message(1, Action::Add, Side::Bid, 100.0, 100),
+            create_test_message(2, Action::Add, Side::Ask, 100.05, 150),
+            create_test_message(3, Action::Add, Side::Bid, 99.95, 200),
+            create_test_message(4, Action::Add, Side::Ask, 100.10, 50),
+            create_test_message(1, Action::Modify, Side::Bid, 100.0, 80),
+            create_test_message(5, Action::Add, Side::Bid, 100.02, 300),
+            create_test_message(2, Action::Cancel, Side::Ask, 100.05, 50),
+            create_test_message(6, Action::Trade, Side::Bid, 100.0, 30),
+        ];
+
+        // Process with both APIs
+        for msg in &messages {
+            let state1 = lob1.process_message(msg).unwrap();
+            lob2.process_message_into(msg, &mut reused_state).unwrap();
+
+            // Verify states are identical
+            assert_eq!(
+                state1.best_bid, reused_state.best_bid,
+                "best_bid mismatch at msg {:?}",
+                msg.order_id
+            );
+            assert_eq!(
+                state1.best_ask, reused_state.best_ask,
+                "best_ask mismatch at msg {:?}",
+                msg.order_id
+            );
+            assert_eq!(
+                state1.sequence, reused_state.sequence,
+                "sequence mismatch at msg {:?}",
+                msg.order_id
+            );
+
+            // Compare price levels
+            for i in 0..10 {
+                assert_eq!(
+                    state1.bid_prices[i], reused_state.bid_prices[i],
+                    "bid_prices[{}] mismatch at msg {:?}",
+                    i,
+                    msg.order_id
+                );
+                assert_eq!(
+                    state1.bid_sizes[i], reused_state.bid_sizes[i],
+                    "bid_sizes[{}] mismatch at msg {:?}",
+                    i,
+                    msg.order_id
+                );
+                assert_eq!(
+                    state1.ask_prices[i], reused_state.ask_prices[i],
+                    "ask_prices[{}] mismatch at msg {:?}",
+                    i,
+                    msg.order_id
+                );
+                assert_eq!(
+                    state1.ask_sizes[i], reused_state.ask_sizes[i],
+                    "ask_sizes[{}] mismatch at msg {:?}",
+                    i,
+                    msg.order_id
+                );
+            }
+
+            // Verify analytics match
+            assert_eq!(
+                state1.mid_price(),
+                reused_state.mid_price(),
+                "mid_price mismatch at msg {:?}",
+                msg.order_id
+            );
+            assert_eq!(
+                state1.spread(),
+                reused_state.spread(),
+                "spread mismatch at msg {:?}",
+                msg.order_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_fill_lob_state_clears_previous_data() {
+        use crate::types::LobState;
+
+        let mut lob = LobReconstructor::new(5);
+        let mut state = LobState::new(5);
+
+        // First: Build up some state
+        lob.process_message(&create_test_message(1, Action::Add, Side::Bid, 100.0, 100))
+            .unwrap();
+        lob.process_message(&create_test_message(2, Action::Add, Side::Ask, 100.05, 150))
+            .unwrap();
+        lob.process_message(&create_test_message(3, Action::Add, Side::Bid, 99.95, 200))
+            .unwrap();
+        lob.process_message_into(
+            &create_test_message(4, Action::Add, Side::Ask, 100.10, 50),
+            &mut state,
+        )
+        .unwrap();
+
+        // Verify state has data
+        assert!(state.bid_prices[0] > 0);
+        assert!(state.bid_prices[1] > 0);
+        assert!(state.ask_prices[0] > 0);
+        assert!(state.ask_prices[1] > 0);
+
+        // Now clear the LOB (simulating book clear)
+        lob.reset();
+        lob.fill_lob_state(&mut state, None);
+
+        // Verify state is cleared
+        assert_eq!(state.best_bid, None);
+        assert_eq!(state.best_ask, None);
+        for i in 0..5 {
+            assert_eq!(state.bid_prices[i], 0, "bid_prices[{}] not cleared", i);
+            assert_eq!(state.bid_sizes[i], 0, "bid_sizes[{}] not cleared", i);
+            assert_eq!(state.ask_prices[i], 0, "ask_prices[{}] not cleared", i);
+            assert_eq!(state.ask_sizes[i], 0, "ask_sizes[{}] not cleared", i);
+        }
     }
 }
