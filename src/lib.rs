@@ -129,7 +129,7 @@ pub mod loader;
 
 // Re-exports - Core types
 pub use error::{Result, TlobError};
-pub use types::{Action, BookConsistency, LobState, MboMessage, Order, Side};
+pub use types::{Action, BookConsistency, LobState, MboMessage, Order, Side, MAX_LOB_LEVELS};
 
 // Re-exports - LOB reconstruction
 pub use lob::{CrossedQuotePolicy, LobConfig, LobReconstructor, LobStats, MultiSymbolLob};
