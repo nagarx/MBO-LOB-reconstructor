@@ -261,10 +261,12 @@ impl<D: DecodeRecord> Iterator for MessageIterator<D> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             // Decode next record
-            // decode_record returns a reference, we clone it
-            let dbn_msg: dbn::MboMsg = match self.decoder.decode_record::<dbn::MboMsg>() {
-                Ok(Some(msg)) => msg.clone(), // Clone the returned reference
-                Ok(None) => return None,      // End of file
+            // decode_record returns a reference to the decoder's internal buffer.
+            // We convert immediately, so no clone is needed - the reference is valid
+            // until the next decode_record call.
+            let dbn_msg_ref = match self.decoder.decode_record::<dbn::MboMsg>() {
+                Ok(Some(msg)) => msg, // Use reference directly (no clone!)
+                Ok(None) => return None, // End of file
                 Err(e) => {
                     if self.skip_invalid {
                         log::warn!("Failed to decode DBN record: {e}");
@@ -277,8 +279,10 @@ impl<D: DecodeRecord> Iterator for MessageIterator<D> {
                 }
             };
 
-            // Convert to MboMessage
-            match DbnBridge::convert(&dbn_msg) {
+            // Convert to MboMessage immediately (extracts values from reference)
+            // This is zero-copy: we only copy the ~40 bytes of MboMessage fields,
+            // not the entire dbn::MboMsg struct
+            match DbnBridge::convert(dbn_msg_ref) {
                 Ok(mbo_msg) => {
                     self.stats.messages_read += 1;
                     return Some(mbo_msg);
