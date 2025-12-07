@@ -59,7 +59,9 @@
 //! `LobStats::system_messages_skipped`.
 
 mod multi_symbol;
+pub mod price_level;
 pub mod reconstructor;
 
 pub use multi_symbol::MultiSymbolLob;
+pub use price_level::PriceLevel;
 pub use reconstructor::{CrossedQuotePolicy, LobConfig, LobReconstructor, LobStats};
