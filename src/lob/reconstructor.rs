@@ -2,6 +2,7 @@
 //!
 //! High-performance implementation using:
 //! - BTreeMap for sorted price levels
+//! - PriceLevel with cached total_size for O(1) aggregate queries
 //! - ahash HashMap for fast order lookups
 //! - Cached best bid/ask to avoid recomputation
 //! - Minimal allocations on hot path
@@ -10,6 +11,7 @@ use ahash::AHashMap;
 use std::collections::BTreeMap;
 
 use crate::error::{Result, TlobError};
+use crate::lob::price_level::PriceLevel;
 use crate::types::{Action, BookConsistency, LobState, MboMessage, Order, Side};
 
 /// How to handle crossed quotes (bid >= ask) when they occur.
@@ -124,13 +126,13 @@ pub struct LobReconstructor {
     /// Configuration
     config: LobConfig,
 
-    /// Bid orders: price -> (order_id -> size)
+    /// Bid orders: price -> PriceLevel (with cached total_size)
     /// BTreeMap keeps prices sorted (highest first for bids)
-    bids: BTreeMap<i64, AHashMap<u64, u32>>,
+    bids: BTreeMap<i64, PriceLevel>,
 
-    /// Ask orders: price -> (order_id -> size)
+    /// Ask orders: price -> PriceLevel (with cached total_size)
     /// BTreeMap keeps prices sorted (lowest first for asks)
-    asks: BTreeMap<i64, AHashMap<u64, u32>>,
+    asks: BTreeMap<i64, PriceLevel>,
 
     /// Order tracking: order_id -> Order
     /// Fast lookup for modify/cancel/trade operations
@@ -585,8 +587,8 @@ impl LobReconstructor {
             }
         };
 
-        // Insert order at price level
-        price_level.insert(msg.order_id, msg.size);
+        // Insert order at price level (PriceLevel handles total_size update)
+        price_level.add_order(msg.order_id, msg.size);
 
         // Track order
         self.orders.insert(
@@ -673,9 +675,9 @@ impl LobReconstructor {
             }
         };
 
-        // Get order at price level
-        let order_size = match price_level.get_mut(&msg.order_id) {
-            Some(size) => size,
+        // Get current order size at price level
+        let current_size = match price_level.get(&msg.order_id) {
+            Some(&size) => size,
             None => {
                 // Order not at price level - data anomaly, but recoverable
                 // Clean up the orphaned order tracking and continue
@@ -694,9 +696,9 @@ impl LobReconstructor {
         };
 
         // Check if partial or full cancel
-        if msg.size >= *order_size {
-            // Full cancel - remove order entirely
-            price_level.remove(&msg.order_id);
+        if msg.size >= current_size {
+            // Full cancel - remove order entirely (updates total_size)
+            price_level.remove_order(msg.order_id);
 
             // Remove empty price level
             if price_level.is_empty() {
@@ -714,8 +716,8 @@ impl LobReconstructor {
             // Remove from order tracking
             self.orders.remove(&msg.order_id);
         } else {
-            // Partial cancel - reduce size
-            *order_size -= msg.size;
+            // Partial cancel - reduce size (updates total_size via reduce_order)
+            price_level.reduce_order(msg.order_id, msg.size);
             order.size -= msg.size;
             self.orders.insert(msg.order_id, order);
         }
@@ -774,9 +776,9 @@ impl LobReconstructor {
             }
         };
 
-        // Get order at price level
-        let order_size = match price_level.get_mut(&msg.order_id) {
-            Some(size) => size,
+        // Get current order size at price level
+        let current_size = match price_level.get(&msg.order_id) {
+            Some(&size) => size,
             None => {
                 // Order not at price level - data anomaly, but recoverable
                 // Clean up the orphaned order tracking and continue
@@ -795,9 +797,9 @@ impl LobReconstructor {
         };
 
         // Reduce order size
-        if msg.size >= *order_size {
-            // Full fill - remove order
-            price_level.remove(&msg.order_id);
+        if msg.size >= current_size {
+            // Full fill - remove order (updates total_size)
+            price_level.remove_order(msg.order_id);
 
             // Remove empty price level
             if price_level.is_empty() {
@@ -815,8 +817,8 @@ impl LobReconstructor {
             // Remove from order tracking
             self.orders.remove(&msg.order_id);
         } else {
-            // Partial fill - reduce size
-            *order_size -= msg.size;
+            // Partial fill - reduce size (updates total_size via reduce_order)
+            price_level.reduce_order(msg.order_id, msg.size);
             order.size -= msg.size;
             self.orders.insert(msg.order_id, order);
         }
@@ -835,8 +837,8 @@ impl LobReconstructor {
         };
 
         if let Some(price_level) = price_level {
-            // Remove order from price level
-            price_level.remove(&order_id);
+            // Remove order from price level (updates total_size)
+            price_level.remove_order(order_id);
 
             // Remove empty price level
             if price_level.is_empty() {
@@ -944,15 +946,39 @@ impl LobReconstructor {
         state.levels = levels;
 
         // Bid side (top N, highest to lowest)
-        for (i, (&price, orders)) in self.bids.iter().rev().take(levels).enumerate() {
+        // Uses O(1) cached total_size() instead of O(n) values().sum()
+        for (i, (&price, price_level)) in self.bids.iter().rev().take(levels).enumerate() {
             state.bid_prices[i] = price;
-            state.bid_sizes[i] = orders.values().sum();
+            state.bid_sizes[i] = price_level.total_size();
+            
+            // Parallel validation: verify cached total matches actual sum
+            #[cfg(debug_assertions)]
+            {
+                let actual = price_level.compute_actual_total();
+                debug_assert_eq!(
+                    price_level.total_size(), actual,
+                    "Bid level {} cached size {} != actual {}",
+                    price, price_level.total_size(), actual
+                );
+            }
         }
 
         // Ask side (top N, lowest to highest)
-        for (i, (&price, orders)) in self.asks.iter().take(levels).enumerate() {
+        // Uses O(1) cached total_size() instead of O(n) values().sum()
+        for (i, (&price, price_level)) in self.asks.iter().take(levels).enumerate() {
             state.ask_prices[i] = price;
-            state.ask_sizes[i] = orders.values().sum();
+            state.ask_sizes[i] = price_level.total_size();
+            
+            // Parallel validation: verify cached total matches actual sum
+            #[cfg(debug_assertions)]
+            {
+                let actual = price_level.compute_actual_total();
+                debug_assert_eq!(
+                    price_level.total_size(), actual,
+                    "Ask level {} cached size {} != actual {}",
+                    price, price_level.total_size(), actual
+                );
+            }
         }
     }
 
