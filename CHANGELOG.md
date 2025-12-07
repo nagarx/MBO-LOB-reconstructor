@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **PriceLevel with Cached Size** (`src/lob/price_level.rs`)
+  - `PriceLevel` struct with O(1) `total_size()` queries (was O(n))
+  - Encapsulated mutation methods: `add_order()`, `remove_order()`, `reduce_order()`
+  - Debug assertions verify cache consistency
+  - 16 comprehensive unit tests
+
+- **Zero-Allocation API**
+  - `LobReconstructor::process_message_into()` - Fill pre-allocated `LobState`
+  - Eliminates heap allocation per message in hot loop
+  - `fill_lob_state()` helper for reusable state
+
+- **Stack-Allocated LobState**
+  - `LobState` fields changed from `Vec` to `[T; MAX_LOB_LEVELS]`
+  - `MAX_LOB_LEVELS = 20` constant for fixed-size arrays
+  - ~520 bytes per snapshot (fits in cache)
+
+### Changed
+
+- `LobReconstructor` now uses `BTreeMap<i64, PriceLevel>` instead of `BTreeMap<i64, AHashMap<u64, u32>>`
+- Size aggregation in `fill_lob_state()` now O(1) per level (was O(n))
+
+### Performance
+
+- **10.2 million messages/sec** throughput (release mode)
+- **0.10 µs** per-message latency
+- Validated against 37M+ real NVIDIA messages with 0 mismatches
+
 ## [0.1.1] - 2025-12-04
 
 ### Added

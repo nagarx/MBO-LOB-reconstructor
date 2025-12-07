@@ -45,11 +45,12 @@ Converts Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshot
 ```
 src/
 ├── lib.rs              # Public API, re-exports
-├── types.rs            # MboMessage, LobState, Action, Side
+├── types.rs            # MboMessage, LobState, Action, Side, MAX_LOB_LEVELS
 ├── error.rs            # TlobError, Result type
 ├── lob/
 │   ├── mod.rs          # Module overview
 │   ├── reconstructor.rs # LobReconstructor core logic
+│   ├── price_level.rs  # PriceLevel with cached total_size (O(1) queries)
 │   └── multi_symbol.rs # MultiSymbolLob manager
 ├── loader.rs           # DbnLoader for file I/O
 ├── dbn_bridge.rs       # Databento format conversion
