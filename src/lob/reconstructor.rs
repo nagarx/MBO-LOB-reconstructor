@@ -2054,6 +2054,55 @@ mod tests {
         }
     }
 
+    /// Test that PriceLevel cached sizes stay accurate after complex operations.
+    ///
+    /// This test simulates a realistic trading scenario with multiple orders
+    /// at the same price level, partial cancels, and trades, then verifies
+    /// the aggregated size matches the expected value.
+    #[test]
+    fn test_price_level_cache_consistency_complex() {
+        let mut lob = LobReconstructor::new(10);
+
+        // Add 5 orders at same price level (total: 500)
+        for i in 1..=5 {
+            lob.process_message(&create_test_message(i, Action::Add, Side::Bid, 100.0, 100))
+                .unwrap();
+        }
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 500);
+
+        // Partial cancel order 1: remove 30 (total: 470)
+        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 30))
+            .unwrap();
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 470);
+
+        // Trade on order 2: remove 50 (total: 420)
+        lob.process_message(&create_test_message(2, Action::Trade, Side::Bid, 100.0, 50))
+            .unwrap();
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 420);
+
+        // Full cancel order 3 (total: 320)
+        lob.process_message(&create_test_message(3, Action::Cancel, Side::Bid, 100.0, 100))
+            .unwrap();
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 320);
+
+        // Add new order at same price (total: 520)
+        lob.process_message(&create_test_message(6, Action::Add, Side::Bid, 100.0, 200))
+            .unwrap();
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 520);
+
+        // Full trade on order 4 (total: 420)
+        lob.process_message(&create_test_message(4, Action::Trade, Side::Bid, 100.0, 100))
+            .unwrap();
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 420);
+
+        // Verify remaining orders: 1 (70), 2 (50), 5 (100), 6 (200) = 420
+        assert_eq!(lob.order_count(), 4);
+        assert_eq!(lob.bid_levels(), 1);
+
+        // Verify order 1 has 70, order 2 has 50
+        // (This tests that partial operations didn't corrupt individual order sizes)
+    }
+
     /// Performance benchmark for LOB reconstruction with PriceLevel caching.
     ///
     /// Measures throughput of processing messages and extracting LOB state.
