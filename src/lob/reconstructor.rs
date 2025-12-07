@@ -2053,4 +2053,106 @@ mod tests {
             assert_eq!(state.ask_sizes[i], 0, "ask_sizes[{}] not cleared", i);
         }
     }
+
+    /// Performance benchmark for LOB reconstruction with PriceLevel caching.
+    ///
+    /// Measures throughput of processing messages and extracting LOB state.
+    #[test]
+    fn test_lob_reconstruction_performance() {
+        use crate::types::LobState;
+        use std::time::Instant;
+
+        let num_messages = 100_000;
+        let num_levels = 10;
+        let orders_per_level = 50; // Simulate liquid market
+
+        // Create messages that build up a realistic order book
+        let mut messages = Vec::with_capacity(num_messages);
+        let base_bid = 100.0;
+        let base_ask = 100.01;
+        let mut order_id = 1u64;
+
+        // Build initial book with many orders per level
+        for level in 0..num_levels {
+            for _ in 0..orders_per_level {
+                // Bid orders
+                messages.push(create_test_message(
+                    order_id,
+                    Action::Add,
+                    Side::Bid,
+                    base_bid - (level as f64 * 0.01),
+                    100,
+                ));
+                order_id += 1;
+
+                // Ask orders
+                messages.push(create_test_message(
+                    order_id,
+                    Action::Add,
+                    Side::Ask,
+                    base_ask + (level as f64 * 0.01),
+                    100,
+                ));
+                order_id += 1;
+            }
+        }
+
+        // Add cancels and trades to simulate activity
+        let initial_orders = order_id;
+        for i in 0..(num_messages - messages.len()) {
+            let target_order = (i as u64 % initial_orders) + 1;
+            if i % 3 == 0 {
+                // Cancel
+                messages.push(create_test_message(
+                    target_order,
+                    Action::Cancel,
+                    Side::Bid,
+                    base_bid,
+                    50,
+                ));
+            } else if i % 3 == 1 {
+                // Trade
+                messages.push(create_test_message(
+                    target_order,
+                    Action::Trade,
+                    Side::Bid,
+                    base_bid,
+                    25,
+                ));
+            } else {
+                // New order
+                messages.push(create_test_message(
+                    order_id,
+                    Action::Add,
+                    Side::Bid,
+                    base_bid - ((i % 10) as f64 * 0.01),
+                    100,
+                ));
+                order_id += 1;
+            }
+        }
+
+        // Benchmark with zero-allocation API
+        let mut lob = LobReconstructor::new(num_levels);
+        let mut state = LobState::new(num_levels);
+
+        let start = Instant::now();
+        for msg in &messages {
+            let _ = lob.process_message_into(msg, &mut state);
+        }
+        let duration = start.elapsed();
+
+        let msgs_per_sec = messages.len() as f64 / duration.as_secs_f64();
+        
+        println!("\n=== LOB Reconstruction Performance ===");
+        println!("Messages processed: {}", messages.len());
+        println!("Levels: {}", num_levels);
+        println!("Orders per level: ~{}", orders_per_level);
+        println!("Time: {:?}", duration);
+        println!("Throughput: {:.0} msg/sec", msgs_per_sec);
+        println!("Per-message: {:.2} µs", duration.as_micros() as f64 / messages.len() as f64);
+
+        // Verify correctness
+        assert!(state.best_bid.is_some() || state.best_ask.is_some());
+    }
 }
