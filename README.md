@@ -114,8 +114,9 @@ fn main() -> Result<()> {
 For fine-grained control, use the components directly:
 
 ```rust
-use mbo_lob_reconstructor::{DbnLoader, LobReconstructor, LobConfig, CrossedQuotePolicy};
+use mbo_lob_reconstructor::{DbnLoader, LobReconstructor, LobConfig, LobState, CrossedQuotePolicy};
 use feature_extractor::{FeatureExtractor, FeatureConfig, SequenceBuilder, SequenceConfig};
+use std::sync::Arc;
 
 // Configure LOB reconstruction
 let lob_config = LobConfig::new(10)
@@ -124,23 +125,47 @@ let mut reconstructor = LobReconstructor::with_config(lob_config);
 
 // Configure feature extraction
 let feature_config = FeatureConfig::default().with_derived(true);
-let extractor = FeatureExtractor::with_config(feature_config.clone());
+let mut extractor = FeatureExtractor::with_config(feature_config.clone());
 
 // Configure sequence building (feature count auto-computed)
 let seq_config = SequenceConfig::from_feature_config(100, 10, &feature_config);
 let mut sequence_builder = SequenceBuilder::with_config(seq_config);
 
+// Reusable buffers for zero-allocation processing
+let mut lob_state = LobState::new(10);
+let mut feature_buffer = Vec::with_capacity(feature_config.feature_count());
+
+// Collect sequences during streaming (IMPORTANT: avoids buffer eviction)
+let mut sequences = Vec::new();
+
 // Process messages
 let loader = DbnLoader::new("data/SYMBOL.mbo.dbn.zst")?;
 for msg in loader.iter_messages()? {
-    let lob_state = reconstructor.process_message(&msg)?;
-    let features = extractor.extract_lob_features(&lob_state)?;
-    sequence_builder.push(msg.timestamp.unwrap_or(0) as u64, features)?;
+    // Zero-allocation LOB update
+    reconstructor.process_message_into(&msg, &mut lob_state)?;
+    
+    // Zero-allocation feature extraction
+    extractor.extract_into(&lob_state, &mut feature_buffer)?;
+    
+    // Wrap in Arc for zero-copy sharing
+    let features = Arc::new(std::mem::take(&mut feature_buffer));
+    feature_buffer = Vec::with_capacity(feature_config.feature_count());
+    
+    // Push with Arc (8-byte clone instead of 672-byte clone)
+    sequence_builder.push_arc(msg.timestamp.unwrap_or(0) as u64, features)?;
+    
+    // IMPORTANT: Build sequences during streaming to avoid buffer eviction
+    if let Some(seq) = sequence_builder.try_build_sequence() {
+        sequences.push(seq);
+    }
 }
 
-// Generate sequences
-let sequences = sequence_builder.generate_all_sequences();
+println!("Generated {} sequences", sequences.len());
 ```
+
+> **Note**: Using `try_build_sequence()` during streaming is critical. The deprecated
+> `generate_all_sequences()` method only returns sequences from the buffer's current
+> contents (default 1000 snapshots), potentially losing earlier data.
 
 ## Advanced Analytics
 
@@ -245,16 +270,26 @@ let denormalized = params.denormalize(normalized, feature_idx);
 
 ```
 mbo_lob_reconstructor/
-    types.rs          # Core types: MboMessage, LobState, Action, Side
+    types.rs          # Core types: MboMessage, LobState, Action, Side, MAX_LOB_LEVELS
     error.rs          # Error types and Result alias
     lob/
-        reconstructor.rs  # Main LobReconstructor
+        reconstructor.rs  # LobReconstructor, process_message_into()
+        price_level.rs    # PriceLevel with O(1) size caching
         multi_symbol.rs   # Multi-symbol support
     dbn_bridge.rs     # Databento format conversion
-    loader.rs         # DBN file streaming
+    loader.rs         # DBN file streaming (zero-copy message iteration)
     statistics.rs     # DayStats, RunningStats, NormalizationParams
     analytics.rs      # DepthStats, MarketImpact, LiquidityMetrics
 ```
+
+### Key Optimizations
+
+| Optimization | Description |
+|-------------|-------------|
+| `LobState` fixed arrays | Stack-allocated arrays instead of `Vec` (no heap per snapshot) |
+| `process_message_into()` | Zero-allocation LOB update into existing buffer |
+| `PriceLevel` O(1) cache | Cached total_size eliminates O(n) sum per level |
+| Zero-copy message iteration | `DbnLoader` avoids cloning `MboMsg` |
 
 ## Performance
 
