@@ -6,6 +6,13 @@
 //! - Memory-efficient streaming (doesn't load entire file into RAM)
 //! - Progress tracking and statistics
 //! - Error recovery options
+//! - Zero-copy message extraction (only ~40 bytes copied per message)
+//!
+//! # Performance Note
+//!
+//! The bottleneck in DBN processing is **zstd decompression**, which is single-threaded
+//! per file stream. The `MessageIterator` uses zero-copy extraction from the decoder's
+//! internal buffer, minimizing CPU overhead after decompression.
 //!
 //! # Example
 //!

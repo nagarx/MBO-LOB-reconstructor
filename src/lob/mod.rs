@@ -13,8 +13,11 @@
 //! | [`LobConfig`] | Configuration options |
 //! | [`LobStats`] | Processing statistics |
 //! | [`CrossedQuotePolicy`] | How to handle crossed quotes |
+//! | [`PriceLevel`] | Orders at a price with cached aggregate size (O(1) queries) |
 //!
 //! # Usage Pattern
+//!
+//! ## Standard Usage
 //!
 //! ```ignore
 //! use mbo_lob_reconstructor::{LobReconstructor, LobConfig};
@@ -31,6 +34,22 @@
 //! // Check statistics
 //! println!("Processed: {}", lob.stats().messages_processed);
 //! println!("System messages skipped: {}", lob.stats().system_messages_skipped);
+//! ```
+//!
+//! ## High-Performance Zero-Allocation Pattern
+//!
+//! For maximum throughput, reuse a single `LobState` buffer:
+//!
+//! ```ignore
+//! use mbo_lob_reconstructor::{LobReconstructor, LobState};
+//!
+//! let mut lob = LobReconstructor::new(10);
+//! let mut state = LobState::new(10);  // Reused across all iterations
+//!
+//! for msg in messages {
+//!     lob.process_message_into(&msg, &mut state)?;  // Zero heap allocations
+//!     // Use state.mid_price(), state.spread(), etc.
+//! }
 //! ```
 //!
 //! # Multi-Day Processing

@@ -302,6 +302,11 @@ Benchmarked on real NVIDIA MBO data (17.8M messages):
 | Data Quality | 100% valid snapshots |
 | Memory | Efficient streaming (no full load) |
 
+> **Note**: The primary bottleneck is **zstd decompression** (single-threaded per file stream),
+> not LOB reconstruction. For multi-day batch processing, consider the `BatchProcessor` in
+> `feature-extractor-MBO-LOB` which parallelizes across files, or pre-decompress files to
+> uncompressed `.dbn` format for ~5-10× throughput improvement.
+
 ## Testing
 
 ```bash
