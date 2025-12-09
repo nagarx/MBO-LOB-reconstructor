@@ -39,9 +39,9 @@ thiserror = "1.0"
 
 # Logging
 log = "0.4"
+env_logger = "0.10"
 
 [dev-dependencies]
-env_logger = "0.10"
 criterion = "0.5"
 
 [[bench]]
@@ -51,6 +51,12 @@ harness = false
 # Example that requires databento feature
 [[example]]
 name = "process_nvda_single_day"
+required-features = ["databento"]
+
+# CLI tool for decompressing to hot store
+[[bin]]
+name = "decompress_to_hot_store"
+path = "src/bin/decompress_to_hot_store.rs"
 required-features = ["databento"]
 
 [profile.release]
