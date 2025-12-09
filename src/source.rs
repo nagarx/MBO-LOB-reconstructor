@@ -420,11 +420,9 @@ impl DbnSource {
     }
 }
 
-/// Type alias for the DBN message iterator.
+/// Type alias for the DBN message iterator (auto-detects compression).
 #[cfg(feature = "databento")]
-type DbnMessageIterator = MessageIterator<
-    dbn::decode::dbn::Decoder<zstd::stream::read::Decoder<'static, BufReader<File>>>,
->;
+type DbnMessageIterator = MessageIterator<dbn::decode::DynDecoder<'static, BufReader<File>>>;
 
 #[cfg(feature = "databento")]
 impl MarketDataSource for DbnSource {

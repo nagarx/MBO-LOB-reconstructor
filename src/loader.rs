@@ -57,7 +57,8 @@ use crate::dbn_bridge::DbnBridge;
 use crate::error::{Result, TlobError};
 use crate::hotstore::HotStoreManager;
 use crate::types::MboMessage;
-use dbn::decode::DecodeRecord; // Import trait for decode_record method
+use dbn::decode::{DecodeRecord, DynDecoder}; // Import trait for decode_record method
+use dbn::VersionUpgradePolicy;
 
 // ============================================================================
 // Performance Constants
@@ -82,8 +83,8 @@ pub const IO_BUFFER_SIZE: usize = 1024 * 1024; // 1 MB
 
 // Type alias for the decoder we use
 // We wrap the file reader in a BufReader for efficiency, then in a zstd decoder
-type DbnFileDecoder =
-    dbn::decode::dbn::Decoder<zstd::stream::read::Decoder<'static, BufReader<File>>>;
+/// Decoder type that auto-detects compression (compressed or uncompressed DBN files).
+type DbnFileDecoder = DynDecoder<'static, BufReader<File>>;
 
 /// Statistics for DBN file loading.
 #[derive(Debug, Clone, Default)]
@@ -271,9 +272,9 @@ impl DbnLoader {
         // Default BufReader uses 8KB; we use 1MB for 5-15% improvement
         let reader = BufReader::with_capacity(IO_BUFFER_SIZE, file);
 
-        // Use zstd decoder with buffering
-        // The zstd decoder can handle both compressed and uncompressed data
-        dbn::decode::dbn::Decoder::with_zstd_buffer(reader)
+        // Use DynDecoder to auto-detect compression
+        // Handles both .dbn (uncompressed) and .dbn.zst (compressed) files
+        DynDecoder::inferred_with_buffer(reader, VersionUpgradePolicy::AsIs)
             .map_err(|e| TlobError::generic(format!("Failed to create decoder: {e}")))
     }
 
