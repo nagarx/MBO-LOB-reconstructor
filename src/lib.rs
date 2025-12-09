@@ -153,6 +153,7 @@
 pub mod analytics;
 pub mod error;
 pub mod lob;
+pub mod source;
 pub mod statistics;
 pub mod types;
 pub mod warnings;
@@ -160,6 +161,10 @@ pub mod warnings;
 #[cfg(feature = "databento")]
 #[cfg_attr(docsrs, doc(cfg(feature = "databento")))]
 pub mod dbn_bridge;
+
+#[cfg(feature = "databento")]
+#[cfg_attr(docsrs, doc(cfg(feature = "databento")))]
+pub mod hotstore;
 
 #[cfg(feature = "databento")]
 #[cfg_attr(docsrs, doc(cfg(feature = "databento")))]
@@ -183,9 +188,18 @@ pub use warnings::{
     Warning, WarningCategory, WarningSummary, WarningTracker, WarningTrackerConfig,
 };
 
+// Re-exports - Source abstraction
+pub use source::{MarketDataSource, SourceMetadata, VecSource};
+
+#[cfg(feature = "databento")]
+pub use source::DbnSource;
+
 // Re-exports - Databento support (feature-gated)
 #[cfg(feature = "databento")]
 pub use dbn_bridge::DbnBridge;
 
 #[cfg(feature = "databento")]
-pub use loader::{is_valid_order, DbnLoader, LoaderStats};
+pub use hotstore::{HotStoreConfig, HotStoreManager};
+
+#[cfg(feature = "databento")]
+pub use loader::{is_valid_order, DbnLoader, LoaderStats, IO_BUFFER_SIZE};
