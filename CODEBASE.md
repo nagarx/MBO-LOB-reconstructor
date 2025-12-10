@@ -52,11 +52,15 @@ src/
 │   ├── reconstructor.rs # LobReconstructor core logic
 │   ├── price_level.rs  # PriceLevel with cached total_size (O(1) queries)
 │   └── multi_symbol.rs # MultiSymbolLob manager
-├── loader.rs           # DbnLoader for file I/O
+├── source.rs           # MarketDataSource trait, DbnSource, VecSource
+├── hotstore.rs         # HotStoreConfig, HotStoreManager
+├── loader.rs           # DbnLoader for file I/O (auto-detects compression)
 ├── dbn_bridge.rs       # Databento format conversion
 ├── statistics.rs       # RunningStats, DayStats, NormalizationParams
 ├── analytics.rs        # DepthStats, MarketImpact, LiquidityMetrics
-└── warnings.rs         # WarningTracker, WarningCategory
+├── warnings.rs         # WarningTracker, WarningCategory
+└── bin/
+    └── decompress_to_hot_store.rs  # CLI tool for hot store population
 ```
 
 ---
@@ -97,7 +101,9 @@ src/
 | `error` | Error definitions | `TlobError`, `Result<T>` |
 | `lob/reconstructor` | Core LOB reconstruction | `LobReconstructor`, `LobConfig`, `LobStats` |
 | `lob/multi_symbol` | Multi-stock management | `MultiSymbolLob`, `MultiSymbolStats` |
-| `loader` | DBN file streaming | `DbnLoader`, `MessageIterator` |
+| `source` | Provider abstraction | `MarketDataSource`, `DbnSource`, `VecSource` |
+| `hotstore` | Decompressed data caching | `HotStoreConfig`, `HotStoreManager` |
+| `loader` | DBN file streaming | `DbnLoader`, `MessageIterator`, `DynDecoder` |
 | `dbn_bridge` | DBN → internal conversion | `DbnBridge` |
 | `statistics` | ML statistics | `RunningStats`, `DayStats`, `NormalizationParams` |
 | `analytics` | Market microstructure | `DepthStats`, `MarketImpact`, `LiquidityMetrics` |

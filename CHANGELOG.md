@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hot Store Infrastructure** (`src/hotstore.rs`)
+  - `HotStoreConfig` - Configuration for hot store directory and preferences
+  - `HotStoreManager` - Manages decompressed data cache
+    - `resolve()` - Auto-prefer decompressed files when available
+    - `decompress()` - Decompress single file to hot store
+    - `list_hot_files()` - Enumerate cached files
+    - `hot_store_size()` - Calculate total cache size
+    - `clear()` - Remove all cached files
+  - Enables ~30% faster processing by skipping zstd decompression
+
+- **MarketDataSource Abstraction** (`src/source.rs`)
+  - `MarketDataSource` trait - Provider-agnostic data source interface
+  - `SourceMetadata` - Metadata about the data source (symbol, date, etc.)
+  - `VecSource` - In-memory source for testing
+  - `DbnSource` - DBN file source with hot store integration
+    - `with_hot_store()` - Enable hot store path resolution
+
+- **Auto-Detect DBN Compression**
+  - `DbnLoader` now uses `DynDecoder` to auto-detect file format
+  - Supports both compressed (`.dbn.zst`) and uncompressed (`.dbn`) files
+  - No configuration needed - just provide the file path
+
+- **CLI: decompress_to_hot_store** (`src/bin/decompress_to_hot_store.rs`)
+  - Standalone tool to populate hot store directory
+  - Parallel decompression using Rayon
+  - Supports single file, directory, or glob patterns
+  - `--dry-run` mode to preview operations
+  - `--force` to re-decompress existing files
+
 - **PriceLevel with Cached Size** (`src/lob/price_level.rs`)
   - `PriceLevel` struct with O(1) `total_size()` queries (was O(n))
   - Encapsulated mutation methods: `add_order()`, `remove_order()`, `reduce_order()`
@@ -27,6 +56,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `DbnLoader` now accepts both compressed and uncompressed DBN files
+- `DbnLoader` I/O buffer increased from 8KB to 1MB (`IO_BUFFER_SIZE`)
 - `LobReconstructor` now uses `BTreeMap<i64, PriceLevel>` instead of `BTreeMap<i64, AHashMap<u64, u32>>`
 - Size aggregation in `fill_lob_state()` now O(1) per level (was O(n))
 
@@ -34,6 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **10.2 million messages/sec** throughput (release mode)
 - **0.10 µs** per-message latency
+- **~30% faster** with pre-decompressed files via hot store
 - Validated against 37M+ real NVIDIA messages with 0 mismatches
 
 ## [0.1.1] - 2025-12-04
