@@ -177,6 +177,12 @@ pub use types::{Action, BookConsistency, LobState, MboMessage, Order, Side, MAX_
 // Re-exports - LOB reconstruction
 pub use lob::{CrossedQuotePolicy, LobConfig, LobReconstructor, LobStats, MultiSymbolLob};
 
+// Re-exports - Day Boundary Detection
+pub use lob::{DayBoundary, DayBoundaryConfig, DayBoundaryDetector, DayBoundaryStats};
+
+// Re-exports - Trade Aggregation
+pub use lob::{Fill, Trade, TradeAggregator, TradeAggregatorConfig};
+
 // Re-exports - Statistics for ML
 pub use statistics::{DayStats, NormalizationParams, RunningStats};
 

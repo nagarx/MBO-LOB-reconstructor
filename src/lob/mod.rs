@@ -77,10 +77,14 @@
 //! causes these to be silently skipped. The count is tracked in
 //! `LobStats::system_messages_skipped`.
 
+pub mod day_boundary;
 mod multi_symbol;
 pub mod price_level;
 pub mod reconstructor;
+pub mod trade_aggregator;
 
+pub use day_boundary::{DayBoundary, DayBoundaryConfig, DayBoundaryDetector, DayBoundaryStats};
 pub use multi_symbol::MultiSymbolLob;
 pub use price_level::PriceLevel;
 pub use reconstructor::{CrossedQuotePolicy, LobConfig, LobReconstructor, LobStats};
+pub use trade_aggregator::{Fill, Trade, TradeAggregator, TradeAggregatorConfig};
