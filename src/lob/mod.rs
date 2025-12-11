@@ -79,12 +79,17 @@
 
 pub mod day_boundary;
 mod multi_symbol;
+pub mod order_lifecycle;
 pub mod price_level;
 pub mod reconstructor;
 pub mod trade_aggregator;
 
 pub use day_boundary::{DayBoundary, DayBoundaryConfig, DayBoundaryDetector, DayBoundaryStats};
 pub use multi_symbol::MultiSymbolLob;
+pub use order_lifecycle::{
+    ActiveOrderFeatures, CompletionStats, LifecycleEvent, LifecycleStats, OrderLifecycle,
+    OrderLifecycleConfig, OrderLifecycleTracker, OrderModification, OrderOrigin, TerminalState,
+};
 pub use price_level::PriceLevel;
 pub use reconstructor::{CrossedQuotePolicy, LobConfig, LobReconstructor, LobStats};
 pub use trade_aggregator::{Fill, Trade, TradeAggregator, TradeAggregatorConfig};

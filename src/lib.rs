@@ -183,6 +183,12 @@ pub use lob::{DayBoundary, DayBoundaryConfig, DayBoundaryDetector, DayBoundarySt
 // Re-exports - Trade Aggregation
 pub use lob::{Fill, Trade, TradeAggregator, TradeAggregatorConfig};
 
+// Re-exports - Order Lifecycle Tracking
+pub use lob::{
+    ActiveOrderFeatures, CompletionStats, LifecycleEvent, LifecycleStats, OrderLifecycle,
+    OrderLifecycleConfig, OrderLifecycleTracker, OrderModification, OrderOrigin, TerminalState,
+};
+
 // Re-exports - Statistics for ML
 pub use statistics::{DayStats, NormalizationParams, RunningStats};
 
