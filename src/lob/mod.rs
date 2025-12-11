@@ -81,6 +81,7 @@ pub mod day_boundary;
 mod multi_symbol;
 pub mod order_lifecycle;
 pub mod price_level;
+pub mod queue_position;
 pub mod reconstructor;
 pub mod trade_aggregator;
 
@@ -91,5 +92,9 @@ pub use order_lifecycle::{
     OrderLifecycleConfig, OrderLifecycleTracker, OrderModification, OrderOrigin, TerminalState,
 };
 pub use price_level::PriceLevel;
+pub use queue_position::{
+    PositionChange, PositionChangeReason, QueuePositionConfig, QueuePositionInfo,
+    QueuePositionTracker, QueueStats,
+};
 pub use reconstructor::{CrossedQuotePolicy, LobConfig, LobReconstructor, LobStats};
 pub use trade_aggregator::{Fill, Trade, TradeAggregator, TradeAggregatorConfig};

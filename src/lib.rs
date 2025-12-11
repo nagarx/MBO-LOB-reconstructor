@@ -189,6 +189,12 @@ pub use lob::{
     OrderLifecycleConfig, OrderLifecycleTracker, OrderModification, OrderOrigin, TerminalState,
 };
 
+// Re-exports - Queue Position Tracking
+pub use lob::{
+    PositionChange, PositionChangeReason, QueuePositionConfig, QueuePositionInfo,
+    QueuePositionTracker, QueueStats,
+};
+
 // Re-exports - Statistics for ML
 pub use statistics::{DayStats, NormalizationParams, RunningStats};
 
