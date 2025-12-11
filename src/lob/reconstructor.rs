@@ -926,7 +926,41 @@ impl LobReconstructor {
     /// ```
     #[inline]
     pub fn fill_lob_state(&self, state: &mut LobState, timestamp: Option<i64>) {
+        self.fill_lob_state_with_temporal(state, timestamp, None, None);
+    }
+
+    /// Fill LOB state with full temporal information.
+    ///
+    /// This is the enhanced version that populates temporal fields for
+    /// time-sensitive feature extraction (FI-2010 u6-u9).
+    ///
+    /// # Arguments
+    /// * `state` - Pre-allocated LobState buffer to fill
+    /// * `timestamp` - Current message timestamp
+    /// * `action` - The action that triggered this state
+    /// * `side` - The side affected by the action
+    #[inline]
+    pub fn fill_lob_state_with_temporal(
+        &self,
+        state: &mut LobState,
+        timestamp: Option<i64>,
+        action: Option<Action>,
+        side: Option<Side>,
+    ) {
         let levels = self.config.levels.min(crate::types::MAX_LOB_LEVELS);
+
+        // =========================================================================
+        // Temporal Information (compute BEFORE clearing)
+        // =========================================================================
+
+        // Store previous timestamp for delta calculation
+        let previous_ts = state.timestamp;
+
+        // Calculate time delta
+        let delta_ns = match (timestamp, previous_ts) {
+            (Some(current), Some(prev)) if current > prev => (current - prev) as u64,
+            _ => 0,
+        };
 
         // Clear previous data (only clear used portion for efficiency)
         for i in 0..levels {
@@ -944,6 +978,12 @@ impl LobReconstructor {
         state.timestamp = timestamp.or(self.stats.last_timestamp);
         state.sequence = self.stats.messages_processed;
         state.levels = levels;
+
+        // Temporal fields
+        state.previous_timestamp = previous_ts;
+        state.delta_ns = delta_ns;
+        state.triggering_action = action;
+        state.triggering_side = side;
 
         // Bid side (top N, highest to lowest)
         // Uses O(1) cached total_size() instead of O(n) values().sum()
@@ -1020,7 +1060,8 @@ impl LobReconstructor {
             && (msg.order_id == 0 || msg.size == 0 || msg.price <= 0)
         {
             self.stats.system_messages_skipped += 1;
-            self.fill_lob_state(state, None);
+            // Still populate temporal info even for skipped messages
+            self.fill_lob_state_with_temporal(state, msg.timestamp, Some(msg.action), Some(msg.side));
             return Ok(());
         }
 
@@ -1070,8 +1111,14 @@ impl LobReconstructor {
         let consistency = self.check_consistency();
         self.track_consistency(consistency);
 
-        // Apply crossed quote policy and fill state
-        self.apply_crossed_quote_policy_into(consistency, msg.timestamp, state)
+        // Apply crossed quote policy and fill state with temporal info
+        self.apply_crossed_quote_policy_into_with_temporal(
+            consistency,
+            msg.timestamp,
+            Some(msg.action),
+            Some(msg.side),
+            state,
+        )
     }
 
     /// Apply crossed quote policy and fill state in-place (zero-allocation).
@@ -1082,24 +1129,46 @@ impl LobReconstructor {
         timestamp: Option<i64>,
         state: &mut LobState,
     ) -> Result<()> {
+        self.apply_crossed_quote_policy_into_with_temporal(
+            consistency,
+            timestamp,
+            None,
+            None,
+            state,
+        )
+    }
+
+    /// Apply crossed quote policy and fill state with temporal info.
+    #[inline]
+    fn apply_crossed_quote_policy_into_with_temporal(
+        &self,
+        consistency: BookConsistency,
+        timestamp: Option<i64>,
+        action: Option<Action>,
+        side: Option<Side>,
+        state: &mut LobState,
+    ) -> Result<()> {
         // For valid or empty states, always return current state
         if consistency == BookConsistency::Valid || consistency == BookConsistency::Empty {
-            self.fill_lob_state(state, timestamp);
+            self.fill_lob_state_with_temporal(state, timestamp, action, side);
             return Ok(());
         }
 
         // For crossed or locked states, apply policy
         match self.config.crossed_quote_policy {
             CrossedQuotePolicy::Allow => {
-                self.fill_lob_state(state, timestamp);
+                self.fill_lob_state_with_temporal(state, timestamp, action, side);
                 Ok(())
             }
             CrossedQuotePolicy::UseLastValid => {
                 // Copy from last valid state if available
                 if let Some(ref last_valid) = self.last_valid_state {
                     *state = last_valid.clone();
+                    // Update temporal info even for cached state
+                    state.triggering_action = action;
+                    state.triggering_side = side;
                 } else {
-                    self.fill_lob_state(state, timestamp);
+                    self.fill_lob_state_with_temporal(state, timestamp, action, side);
                 }
                 Ok(())
             }
@@ -1107,7 +1176,7 @@ impl LobReconstructor {
                 if let (Some(bid), Some(ask)) = (self.best_bid, self.best_ask) {
                     Err(TlobError::CrossedQuote(bid, ask))
                 } else {
-                    self.fill_lob_state(state, timestamp);
+                    self.fill_lob_state_with_temporal(state, timestamp, action, side);
                     Ok(())
                 }
             }
@@ -1115,8 +1184,11 @@ impl LobReconstructor {
                 // Return last valid state (same behavior as UseLastValid)
                 if let Some(ref last_valid) = self.last_valid_state {
                     *state = last_valid.clone();
+                    // Update temporal info even for cached state
+                    state.triggering_action = action;
+                    state.triggering_side = side;
                 } else {
-                    self.fill_lob_state(state, timestamp);
+                    self.fill_lob_state_with_temporal(state, timestamp, action, side);
                 }
                 Ok(())
             }

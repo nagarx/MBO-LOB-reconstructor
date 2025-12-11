@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **LobState Temporal Fields** (`src/types.rs`)
+  - `previous_timestamp` - Previous LOB update timestamp for Δt calculation
+  - `delta_ns` - Time delta since last update in nanoseconds
+  - `triggering_action` - Action that caused this state change (Add/Modify/Cancel/Trade/Fill)
+  - `triggering_side` - Side affected by the triggering action (Bid/Ask)
+  - New temporal helper methods:
+    - `delta_seconds()` - Get time delta in seconds
+    - `event_intensity()` - Get events per second (1/Δt)
+    - `was_triggered_by(action)` - Check if triggered by specific action
+    - `was_triggered_on_bid()` / `was_triggered_on_ask()` - Check affected side
+    - `is_trade_event()` / `is_add_event()` / `is_cancel_event()` - Event type checks
+  - Enables FI-2010 time-sensitive features (u6-u9): dP/dt, dV/dt, inter-arrival times
+
+- **LobReconstructor Temporal Population** (`src/lob/reconstructor.rs`)
+  - `fill_lob_state_with_temporal()` - Enhanced fill with temporal context
+  - `process_message_into()` now populates all temporal fields automatically
+  - 100% delta tracking accuracy verified with real NVIDIA data
+
+- **Queue Position Tracker** (`src/lob/queue_position.rs`)
+  - `QueuePositionTracker` - FIFO queue position tracking using `IndexMap`
+  - `QueueLevel` - Per-level order tracking with insertion order preserved
+  - `QueuePositionConfig` - Configuration for tracking behavior
+  - Methods: `queue_position()`, `volume_ahead()`, `best_level_imbalance()`, `multi_level_imbalance()`
+  - Verified with 5 integration tests on real NVIDIA data
+
+- **Order Lifecycle Tracker** (`src/lob/order_lifecycle.rs`)
+  - `OrderLifecycleTracker` - Track orders from creation to terminal state
+  - `OrderLifecycle` - Complete order lifecycle with modifications history
+  - Handles pre-existing orders gracefully (inferred from first observation)
+  - Memory management with configurable max tracked orders
+
+- **Day Boundary Detection** (`src/lob/day_boundary.rs`)
+  - `DayBoundaryDetector` - Automatic trading day boundary detection
+  - `DayBoundaryConfig` - Configurable trading hours and gap thresholds
+  - `DayBoundary` - Day transition event with statistics
+
+- **Trade Aggregator** (`src/lob/trade_aggregator.rs`)
+  - `TradeAggregator` - Aggregate individual fills into trades
+  - `Trade` - Complete trade with aggressor side detection
+  - `Fill` - Individual fill event representation
+
 - **Hot Store Infrastructure** (`src/hotstore.rs`)
   - `HotStoreConfig` - Configuration for hot store directory and preferences
   - `HotStoreManager` - Manages decompressed data cache

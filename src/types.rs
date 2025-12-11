@@ -243,8 +243,9 @@ impl BookConsistency {
 /// - `bid_sizes`: 20 × 4 bytes = 80 bytes
 /// - `ask_prices`: 20 × 8 bytes = 160 bytes
 /// - `ask_sizes`: 20 × 4 bytes = 80 bytes
-/// - metadata: ~40 bytes
-/// - **Total**: ~520 bytes (stack-allocated, fits in ~8 cache lines)
+/// - temporal fields: ~32 bytes
+/// - metadata: ~48 bytes
+/// - **Total**: ~560 bytes (stack-allocated, fits in ~9 cache lines)
 ///
 /// # Invariants
 ///
@@ -252,6 +253,13 @@ impl BookConsistency {
 /// - Prices are in **nanodollars** (i64, divide by 1e9 for dollars)
 /// - Index 0 = best level (highest bid, lowest ask)
 /// - Unused levels contain zeros
+///
+/// # Temporal Information
+///
+/// The temporal fields enable time-sensitive feature extraction (FI-2010 u6-u9):
+/// - `delta_ns`: Time since last LOB update (for dP/dt, dV/dt)
+/// - `triggering_action`: What caused this state change
+/// - `triggering_side`: Which side was affected
 #[derive(Debug, Clone, PartialEq)]
 pub struct LobState {
     /// Bid prices in nanodollars (highest to lowest).
@@ -285,6 +293,44 @@ pub struct LobState {
 
     /// Message sequence number that produced this state.
     pub sequence: u64,
+
+    // =========================================================================
+    // Temporal Information (FI-2010 time-sensitive features u6-u9)
+    // =========================================================================
+
+    /// Previous timestamp for Δt calculation (nanoseconds since epoch).
+    ///
+    /// This is the timestamp of the previous LOB update, enabling:
+    /// - Inter-arrival time analysis
+    /// - Rate-of-change calculations (dP/dt, dV/dt)
+    pub previous_timestamp: Option<i64>,
+
+    /// Time delta since last LOB update (nanoseconds).
+    ///
+    /// Computed as: `timestamp - previous_timestamp`
+    ///
+    /// Use cases:
+    /// - Intensity features: events_per_second = 1e9 / delta_ns
+    /// - Velocity features: dP/dt = Δprice / (delta_ns / 1e9)
+    /// - Volatility scaling by time
+    pub delta_ns: u64,
+
+    /// The action that triggered this LOB state change.
+    ///
+    /// Enables action-specific feature extraction:
+    /// - Add events: new liquidity arriving
+    /// - Cancel events: liquidity withdrawing
+    /// - Trade events: aggressive order execution
+    /// - Modify events: order repricing/resizing
+    pub triggering_action: Option<Action>,
+
+    /// The side affected by the triggering action.
+    ///
+    /// Combined with `triggering_action`, enables asymmetric analysis:
+    /// - Bid-side adds vs ask-side adds
+    /// - Which side is experiencing more cancellations
+    /// - Trade direction (aggressor side)
+    pub triggering_side: Option<Side>,
 }
 
 impl LobState {
@@ -310,7 +356,87 @@ impl LobState {
             levels: levels.min(MAX_LOB_LEVELS), // Clamp to max
             timestamp: None,
             sequence: 0,
+            // Temporal fields
+            previous_timestamp: None,
+            delta_ns: 0,
+            triggering_action: None,
+            triggering_side: None,
         }
+    }
+
+    // =========================================================================
+    // Temporal Analytics
+    // =========================================================================
+
+    /// Get time delta in seconds (as f64).
+    ///
+    /// Useful for rate calculations like dP/dt.
+    ///
+    /// # Returns
+    /// - `Some(seconds)` if delta_ns > 0
+    /// - `None` if no previous timestamp
+    #[inline]
+    pub fn delta_seconds(&self) -> Option<f64> {
+        if self.delta_ns > 0 {
+            Some(self.delta_ns as f64 / 1e9)
+        } else {
+            None
+        }
+    }
+
+    /// Get event intensity (events per second).
+    ///
+    /// Calculated as: 1 / delta_seconds
+    ///
+    /// # Returns
+    /// - `Some(intensity)` if delta_ns > 0
+    /// - `None` if no previous timestamp or delta is 0
+    #[inline]
+    pub fn event_intensity(&self) -> Option<f64> {
+        if self.delta_ns > 0 {
+            Some(1e9 / self.delta_ns as f64)
+        } else {
+            None
+        }
+    }
+
+    /// Check if this state was triggered by a specific action.
+    #[inline]
+    pub fn was_triggered_by(&self, action: Action) -> bool {
+        self.triggering_action == Some(action)
+    }
+
+    /// Check if this state was triggered on the bid side.
+    #[inline]
+    pub fn was_triggered_on_bid(&self) -> bool {
+        self.triggering_side == Some(Side::Bid)
+    }
+
+    /// Check if this state was triggered on the ask side.
+    #[inline]
+    pub fn was_triggered_on_ask(&self) -> bool {
+        self.triggering_side == Some(Side::Ask)
+    }
+
+    /// Check if this is a trade/fill event.
+    #[inline]
+    pub fn is_trade_event(&self) -> bool {
+        matches!(
+            self.triggering_action,
+            Some(Action::Trade) | Some(Action::Fill)
+        )
+    }
+
+    /// Check if this is an add event (new liquidity).
+    #[inline]
+    pub fn is_add_event(&self) -> bool {
+        self.triggering_action == Some(Action::Add)
+    }
+
+    /// Check if this is a cancel event (liquidity withdrawal).
+    #[inline]
+    pub fn is_cancel_event(&self) -> bool {
+        self.triggering_action == Some(Action::Cancel)
     }
 
     // =========================================================================
@@ -1041,5 +1167,180 @@ mod tests {
 
         assert_eq!(state.timestamp, Some(1234567890_000_000_000));
         assert_eq!(state.sequence, 42);
+    }
+
+    // =========================================================================
+    // LobState Temporal Fields tests
+    // =========================================================================
+
+    #[test]
+    fn test_lob_state_temporal_fields_initialized() {
+        let state = LobState::new(10);
+
+        // All temporal fields should be initialized to None/0
+        assert!(state.previous_timestamp.is_none());
+        assert_eq!(state.delta_ns, 0);
+        assert!(state.triggering_action.is_none());
+        assert!(state.triggering_side.is_none());
+    }
+
+    #[test]
+    fn test_lob_state_delta_seconds() {
+        let mut state = LobState::new(10);
+
+        // No delta: should return None
+        assert!(state.delta_seconds().is_none());
+
+        // Set delta to 1 second (1e9 nanoseconds)
+        state.delta_ns = 1_000_000_000;
+        let delta = state.delta_seconds().unwrap();
+        assert!((delta - 1.0).abs() < 1e-6);
+
+        // Set delta to 100 milliseconds
+        state.delta_ns = 100_000_000;
+        let delta = state.delta_seconds().unwrap();
+        assert!((delta - 0.1).abs() < 1e-6);
+
+        // Set delta to 1 microsecond
+        state.delta_ns = 1_000;
+        let delta = state.delta_seconds().unwrap();
+        assert!((delta - 1e-6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_lob_state_event_intensity() {
+        let mut state = LobState::new(10);
+
+        // No delta: should return None
+        assert!(state.event_intensity().is_none());
+
+        // 1 second delta = 1 event/second
+        state.delta_ns = 1_000_000_000;
+        let intensity = state.event_intensity().unwrap();
+        assert!((intensity - 1.0).abs() < 1e-6);
+
+        // 100ms delta = 10 events/second
+        state.delta_ns = 100_000_000;
+        let intensity = state.event_intensity().unwrap();
+        assert!((intensity - 10.0).abs() < 1e-6);
+
+        // 1ms delta = 1000 events/second
+        state.delta_ns = 1_000_000;
+        let intensity = state.event_intensity().unwrap();
+        assert!((intensity - 1000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_lob_state_was_triggered_by() {
+        let mut state = LobState::new(10);
+
+        // No action set
+        assert!(!state.was_triggered_by(Action::Add));
+        assert!(!state.was_triggered_by(Action::Trade));
+
+        // Set to Add
+        state.triggering_action = Some(Action::Add);
+        assert!(state.was_triggered_by(Action::Add));
+        assert!(!state.was_triggered_by(Action::Trade));
+        assert!(!state.was_triggered_by(Action::Cancel));
+
+        // Set to Trade
+        state.triggering_action = Some(Action::Trade);
+        assert!(!state.was_triggered_by(Action::Add));
+        assert!(state.was_triggered_by(Action::Trade));
+    }
+
+    #[test]
+    fn test_lob_state_was_triggered_on_side() {
+        let mut state = LobState::new(10);
+
+        // No side set
+        assert!(!state.was_triggered_on_bid());
+        assert!(!state.was_triggered_on_ask());
+
+        // Set to Bid
+        state.triggering_side = Some(Side::Bid);
+        assert!(state.was_triggered_on_bid());
+        assert!(!state.was_triggered_on_ask());
+
+        // Set to Ask
+        state.triggering_side = Some(Side::Ask);
+        assert!(!state.was_triggered_on_bid());
+        assert!(state.was_triggered_on_ask());
+    }
+
+    #[test]
+    fn test_lob_state_event_type_checks() {
+        let mut state = LobState::new(10);
+
+        // No action
+        assert!(!state.is_trade_event());
+        assert!(!state.is_add_event());
+        assert!(!state.is_cancel_event());
+
+        // Trade event
+        state.triggering_action = Some(Action::Trade);
+        assert!(state.is_trade_event());
+        assert!(!state.is_add_event());
+        assert!(!state.is_cancel_event());
+
+        // Fill event (also a trade)
+        state.triggering_action = Some(Action::Fill);
+        assert!(state.is_trade_event());
+        assert!(!state.is_add_event());
+        assert!(!state.is_cancel_event());
+
+        // Add event
+        state.triggering_action = Some(Action::Add);
+        assert!(!state.is_trade_event());
+        assert!(state.is_add_event());
+        assert!(!state.is_cancel_event());
+
+        // Cancel event
+        state.triggering_action = Some(Action::Cancel);
+        assert!(!state.is_trade_event());
+        assert!(!state.is_add_event());
+        assert!(state.is_cancel_event());
+    }
+
+    #[test]
+    fn test_lob_state_temporal_combined() {
+        let mut state = LobState::new(10);
+
+        // Simulate a sequence of updates
+        state.timestamp = Some(1_000_000_000);
+        state.previous_timestamp = None;
+        state.delta_ns = 0;
+        state.triggering_action = Some(Action::Add);
+        state.triggering_side = Some(Side::Bid);
+
+        // First update: no previous, so delta is 0
+        assert_eq!(state.delta_ns, 0);
+        assert!(state.delta_seconds().is_none()); // delta_ns is 0
+        assert!(state.is_add_event());
+        assert!(state.was_triggered_on_bid());
+
+        // Simulate second update
+        state.previous_timestamp = Some(1_000_000_000);
+        state.timestamp = Some(1_001_000_000); // 1ms later
+        state.delta_ns = 1_000_000; // 1ms
+        state.triggering_action = Some(Action::Trade);
+        state.triggering_side = Some(Side::Ask);
+
+        assert!((state.delta_seconds().unwrap() - 0.001).abs() < 1e-9);
+        assert!((state.event_intensity().unwrap() - 1000.0).abs() < 1e-6);
+        assert!(state.is_trade_event());
+        assert!(state.was_triggered_on_ask());
+    }
+
+    #[test]
+    fn test_lob_state_size_unchanged() {
+        // Verify that LobState size is reasonable after adding temporal fields
+        let state = LobState::new(10);
+        let size = std::mem::size_of_val(&state);
+
+        // Should be around 560-600 bytes (increased from ~520)
+        assert!(size > 500, "LobState too small: {} bytes", size);
+        assert!(size < 700, "LobState too large: {} bytes", size);
     }
 }

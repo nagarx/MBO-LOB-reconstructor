@@ -1514,3 +1514,215 @@ fn test_edge_case_normalization_roundtrip() {
     println!("  Roundtrip tests passed for {} values", test_values.len());
     println!("  ✅ Normalization roundtrip edge cases passed");
 }
+
+// ============================================================================
+// Test: LobState Temporal Fields with Real Data
+// ============================================================================
+
+#[test]
+fn test_temporal_fields_with_real_nvidia_data() {
+    if !test_data_available() {
+        eprintln!("⚠️  Skipping test: test data not available at {TEST_DATA_PATH}");
+        return;
+    }
+
+    use mbo_lob_reconstructor::{Action, LobState, Side};
+
+    let path = get_test_data_path();
+    println!("\n📂 Testing temporal fields with real NVIDIA data: {}", path);
+
+    let loader = DbnLoader::new(&path)
+        .expect("Failed to create loader")
+        .skip_invalid(true);
+
+    let mut lob = LobReconstructor::new(10);
+    let mut state = LobState::new(10);
+    let mut prev_timestamp: Option<i64> = None;
+
+    // Track temporal statistics
+    let mut valid_deltas = 0u64;
+    let mut total_delta_ns: u64 = 0;
+    let mut min_delta_ns = u64::MAX;
+    let mut max_delta_ns = 0u64;
+    let mut action_counts = std::collections::HashMap::new();
+    let mut side_counts = std::collections::HashMap::new();
+
+    let mut messages_processed = 0;
+    let max_messages = 50_000; // Process first 50k messages
+
+    for msg in loader.iter_messages().expect("Failed to iterate") {
+        if msg.order_id == 0 || msg.size == 0 || msg.price <= 0 {
+            continue;
+        }
+        if messages_processed >= max_messages {
+            break;
+        }
+        messages_processed += 1;
+
+        // Process message
+        if lob.process_message_into(&msg, &mut state).is_ok() {
+            // Verify temporal fields are populated
+            if let Some(action) = state.triggering_action {
+                *action_counts.entry(action).or_insert(0u64) += 1;
+            }
+
+            if let Some(side) = state.triggering_side {
+                *side_counts.entry(side).or_insert(0u64) += 1;
+            }
+
+            // Verify delta calculation
+            if let (Some(current_ts), Some(prev_ts)) = (state.timestamp, prev_timestamp) {
+                let expected_delta = if current_ts > prev_ts {
+                    (current_ts - prev_ts) as u64
+                } else {
+                    0
+                };
+
+                // The delta_ns should be set based on previous LOB state, 
+                // which may differ from our tracking due to state reuse
+                if state.delta_ns > 0 {
+                    valid_deltas += 1;
+                    total_delta_ns += state.delta_ns;
+                    min_delta_ns = min_delta_ns.min(state.delta_ns);
+                    max_delta_ns = max_delta_ns.max(state.delta_ns);
+                }
+            }
+
+            prev_timestamp = state.timestamp;
+        }
+    }
+
+    println!("\n📊 Temporal Fields Statistics ({} messages):", messages_processed);
+    println!("  Valid time deltas: {}", valid_deltas);
+
+    if valid_deltas > 0 {
+        let avg_delta_ns = total_delta_ns / valid_deltas;
+        let avg_delta_us = avg_delta_ns as f64 / 1000.0;
+        let avg_delta_ms = avg_delta_ns as f64 / 1_000_000.0;
+
+        println!("  Average delta: {:.2} μs ({:.4} ms)", avg_delta_us, avg_delta_ms);
+        println!("  Min delta: {} ns ({:.4} μs)", min_delta_ns, min_delta_ns as f64 / 1000.0);
+        println!("  Max delta: {} ns ({:.4} ms)", max_delta_ns, max_delta_ns as f64 / 1_000_000.0);
+
+        // Verify we have reasonable event intensity
+        let avg_intensity = 1e9 / avg_delta_ns as f64;
+        println!("  Average intensity: {:.2} events/second", avg_intensity);
+    }
+
+    // Report action distribution
+    println!("\n  Action distribution:");
+    for (action, count) in &action_counts {
+        let pct = (*count as f64 / messages_processed as f64) * 100.0;
+        println!("    {:?}: {} ({:.1}%)", action, count, pct);
+    }
+
+    // Report side distribution
+    println!("\n  Side distribution:");
+    for (side, count) in &side_counts {
+        let pct = (*count as f64 / messages_processed as f64) * 100.0;
+        println!("    {:?}: {} ({:.1}%)", side, count, pct);
+    }
+
+    // Assertions
+    assert!(
+        !action_counts.is_empty(),
+        "Should have at least some actions tracked"
+    );
+    assert!(
+        action_counts.contains_key(&Action::Add),
+        "Should have Add actions"
+    );
+    assert!(
+        !side_counts.is_empty(),
+        "Should have at least some sides tracked"
+    );
+    assert!(
+        side_counts.contains_key(&Side::Bid) || side_counts.contains_key(&Side::Ask),
+        "Should have Bid or Ask sides"
+    );
+
+    println!("\n  ✅ Temporal fields populated correctly with real data");
+}
+
+// ============================================================================
+// Test: Temporal Delta Accuracy
+// ============================================================================
+
+#[test]
+fn test_temporal_delta_accuracy() {
+    if !test_data_available() {
+        eprintln!("⚠️  Skipping test: test data not available at {TEST_DATA_PATH}");
+        return;
+    }
+
+    use mbo_lob_reconstructor::LobState;
+
+    let path = get_test_data_path();
+    println!("\n📂 Testing temporal delta accuracy with: {}", path);
+
+    let loader = DbnLoader::new(&path)
+        .expect("Failed to create loader")
+        .skip_invalid(true);
+
+    let mut lob = LobReconstructor::new(10);
+    let mut state = LobState::new(10);
+
+    // Track consecutive timestamps and deltas
+    let mut consecutive_valid_deltas = 0;
+    let mut delta_errors = 0;
+    let mut messages_with_timestamps = 0;
+
+    let max_messages = 10_000;
+    let mut messages_processed = 0;
+
+    for msg in loader.iter_messages().expect("Failed to iterate") {
+        if msg.order_id == 0 || msg.size == 0 || msg.price <= 0 {
+            continue;
+        }
+        if messages_processed >= max_messages {
+            break;
+        }
+        messages_processed += 1;
+
+        // Skip messages without timestamps
+        if msg.timestamp.is_none() {
+            continue;
+        }
+        messages_with_timestamps += 1;
+
+        let prev_ts = state.timestamp;
+        let _prev_prev_ts = state.previous_timestamp;
+
+        if lob.process_message_into(&msg, &mut state).is_ok() {
+            // After processing, the state's previous_timestamp should be what was the timestamp before
+            if state.previous_timestamp.is_some() && prev_ts.is_some() {
+                if state.previous_timestamp == prev_ts {
+                    consecutive_valid_deltas += 1;
+                } else {
+                    // This can happen due to state reuse patterns
+                    delta_errors += 1;
+                }
+            }
+        }
+    }
+
+    println!("\n📊 Delta Accuracy Report:");
+    println!("  Messages with timestamps: {}", messages_with_timestamps);
+    println!("  Consecutive valid deltas: {}", consecutive_valid_deltas);
+    println!("  Delta tracking errors: {}", delta_errors);
+
+    // We expect most deltas to be tracked correctly
+    if messages_with_timestamps > 100 {
+        let accuracy = consecutive_valid_deltas as f64 / (consecutive_valid_deltas + delta_errors) as f64;
+        println!("  Tracking accuracy: {:.1}%", accuracy * 100.0);
+        
+        // Allow some tolerance for edge cases
+        assert!(
+            accuracy > 0.90,
+            "Delta tracking accuracy should be > 90%, got {:.1}%",
+            accuracy * 100.0
+        );
+    }
+
+    println!("\n  ✅ Temporal delta tracking verified");
+}

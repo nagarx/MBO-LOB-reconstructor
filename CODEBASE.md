@@ -45,13 +45,17 @@ Converts Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshot
 ```
 src/
 ├── lib.rs              # Public API, re-exports
-├── types.rs            # MboMessage, LobState, Action, Side, MAX_LOB_LEVELS
+├── types.rs            # MboMessage, LobState (with temporal fields), Action, Side, MAX_LOB_LEVELS
 ├── error.rs            # TlobError, Result type
 ├── lob/
 │   ├── mod.rs          # Module overview
-│   ├── reconstructor.rs # LobReconstructor core logic
+│   ├── reconstructor.rs # LobReconstructor core logic (with temporal population)
 │   ├── price_level.rs  # PriceLevel with cached total_size (O(1) queries)
-│   └── multi_symbol.rs # MultiSymbolLob manager
+│   ├── multi_symbol.rs # MultiSymbolLob manager
+│   ├── day_boundary.rs # DayBoundaryDetector, DayBoundaryConfig
+│   ├── trade_aggregator.rs # TradeAggregator, Trade, Fill
+│   ├── order_lifecycle.rs # OrderLifecycleTracker, OrderLifecycle
+│   └── queue_position.rs # QueuePositionTracker (FIFO with IndexMap)
 ├── source.rs           # MarketDataSource trait, DbnSource, VecSource
 ├── hotstore.rs         # HotStoreConfig, HotStoreManager
 ├── loader.rs           # DbnLoader for file I/O (auto-detects compression)
@@ -156,21 +160,34 @@ pub enum Side {
 
 ### LobState (src/types.rs)
 
-Output snapshot of the order book at N price levels.
+Output snapshot of the order book at N price levels. Uses fixed-size stack-allocated arrays.
 
 ```rust
 pub struct LobState {
-    pub bid_prices: Vec<i64>,  // Highest to lowest
-    pub bid_sizes: Vec<u32>,   // Aggregated at each price
-    pub ask_prices: Vec<i64>,  // Lowest to highest
-    pub ask_sizes: Vec<u32>,   // Aggregated at each price
-    pub best_bid: Option<i64>, // Cached best prices
+    // Core LOB data (stack-allocated, MAX_LOB_LEVELS = 20)
+    pub bid_prices: [i64; MAX_LOB_LEVELS],  // Highest to lowest
+    pub bid_sizes: [u32; MAX_LOB_LEVELS],   // Aggregated at each price
+    pub ask_prices: [i64; MAX_LOB_LEVELS],  // Lowest to highest
+    pub ask_sizes: [u32; MAX_LOB_LEVELS],   // Aggregated at each price
+    pub best_bid: Option<i64>,              // Cached best prices
     pub best_ask: Option<i64>,
-    pub levels: usize,         // Number of levels tracked
+    pub levels: usize,                      // Number of levels tracked
     pub timestamp: Option<i64>,
-    pub sequence: u64,         // Message sequence number
+    pub sequence: u64,                      // Message sequence number
+    
+    // Temporal fields (for time-sensitive features FI-2010 u6-u9)
+    pub previous_timestamp: Option<i64>,    // For Δt calculation
+    pub delta_ns: u64,                      // Time since last update
+    pub triggering_action: Option<Action>,  // What caused this state
+    pub triggering_side: Option<Side>,      // Which side was affected
 }
 ```
+
+**Temporal Helper Methods**:
+- `delta_seconds()` - Time delta in seconds
+- `event_intensity()` - Events per second (1/Δt)
+- `was_triggered_by(action)` - Check triggering action
+- `is_trade_event()`, `is_add_event()`, `is_cancel_event()` - Event type checks
 
 ### LobReconstructor Internal State (src/lob/reconstructor.rs)
 
