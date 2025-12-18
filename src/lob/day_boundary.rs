@@ -24,8 +24,8 @@
 //! for msg in messages {
 //!     if let Some(ts) = msg.timestamp {
 //!         if let Some(boundary) = detector.check_boundary(ts) {
-//!             println!("Day {} ended, day {} started", 
-//!                      boundary.previous_day_index, 
+//!             println!("Day {} ended, day {} started",
+//!                      boundary.previous_day_index,
 //!                      boundary.new_day_index);
 //!             // Reset your state here
 //!         }
@@ -135,7 +135,7 @@ impl DayBoundaryConfig {
             // Using midnight UTC as reference for simplicity
             market_open_ns: 0,
             market_close_ns: NS_PER_DAY - 1,
-            gap_threshold_ns: 1 * NS_PER_HOUR,
+            gap_threshold_ns: NS_PER_HOUR,
             timezone_offset_hours: -6, // CT
             use_gap_detection: true,
         }
@@ -592,4 +592,3 @@ mod tests {
         assert!(!config2.use_gap_detection);
     }
 }
-

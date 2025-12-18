@@ -232,8 +232,8 @@ impl TradeAggregator {
         // If a bid order was filled, an aggressive seller took liquidity
         // If an ask order was filled, an aggressive buyer took liquidity
         let aggressor_side = match msg.side {
-            Side::Bid => Side::Ask,  // Bid was hit → seller aggressed
-            Side::Ask => Side::Bid,  // Ask was hit → buyer aggressed
+            Side::Bid => Side::Ask, // Bid was hit → seller aggressed
+            Side::Ask => Side::Bid, // Ask was hit → buyer aggressed
             Side::None => return self.check_finalize_pending(msg.timestamp), // Skip unknown side
         };
 
@@ -509,8 +509,7 @@ mod tests {
 
     #[test]
     fn test_trade_aggregation() {
-        let config = TradeAggregatorConfig::default()
-            .with_aggregation_window_ns(10_000_000); // 10ms window
+        let config = TradeAggregatorConfig::default().with_aggregation_window_ns(10_000_000); // 10ms window
         let mut agg = TradeAggregator::new(config);
 
         // Three fills at same price within window
@@ -525,8 +524,7 @@ mod tests {
 
     #[test]
     fn test_no_aggregation_different_price() {
-        let config = TradeAggregatorConfig::default()
-            .with_aggregation_window_ns(10_000_000);
+        let config = TradeAggregatorConfig::default().with_aggregation_window_ns(10_000_000);
         let mut agg = TradeAggregator::new(config);
 
         // First fill
@@ -570,8 +568,7 @@ mod tests {
 
     #[test]
     fn test_trade_imbalance_balanced() {
-        let config = TradeAggregatorConfig::default()
-            .with_aggregation_window_ns(0); // No aggregation
+        let config = TradeAggregatorConfig::default().with_aggregation_window_ns(0); // No aggregation
         let mut agg = TradeAggregator::new(config);
 
         // Equal buy and sell volume
@@ -584,8 +581,7 @@ mod tests {
 
     #[test]
     fn test_tick_direction() {
-        let config = TradeAggregatorConfig::default()
-            .with_aggregation_window_ns(0);
+        let config = TradeAggregatorConfig::default().with_aggregation_window_ns(0);
         let mut agg = TradeAggregator::new(config);
 
         // First trade
@@ -618,7 +614,13 @@ mod tests {
 
         // Add 5 trades
         for i in 0..5 {
-            agg.process_message(&make_trade_msg(i as u64, Side::Ask, 100_000_000_000, 100, i * 1000));
+            agg.process_message(&make_trade_msg(
+                i as u64,
+                Side::Ask,
+                100_000_000_000,
+                100,
+                i * 1000,
+            ));
         }
         agg.flush();
 
@@ -679,16 +681,27 @@ mod tests {
 
     #[test]
     fn test_recent_trade_imbalance() {
-        let config = TradeAggregatorConfig::default()
-            .with_aggregation_window_ns(0);
+        let config = TradeAggregatorConfig::default().with_aggregation_window_ns(0);
         let mut agg = TradeAggregator::new(config);
 
         // 3 buys, then 2 sells
         for i in 0..3u64 {
-            agg.process_message(&make_trade_msg(i, Side::Ask, 100_000_000_000, 100, (i * 1000) as i64));
+            agg.process_message(&make_trade_msg(
+                i,
+                Side::Ask,
+                100_000_000_000,
+                100,
+                (i * 1000) as i64,
+            ));
         }
         for i in 3..5u64 {
-            agg.process_message(&make_trade_msg(i, Side::Bid, 100_000_000_000, 100, (i * 1000) as i64));
+            agg.process_message(&make_trade_msg(
+                i,
+                Side::Bid,
+                100_000_000_000,
+                100,
+                (i * 1000) as i64,
+            ));
         }
         agg.flush();
 
@@ -705,4 +718,3 @@ mod tests {
         assert!((recent_3 - (-1.0 / 3.0)).abs() < 0.001);
     }
 }
-

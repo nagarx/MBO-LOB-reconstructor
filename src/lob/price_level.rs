@@ -50,7 +50,7 @@ impl PriceLevel {
     #[inline]
     pub fn add_order(&mut self, order_id: u64, size: u32) -> Option<u32> {
         let old = self.orders.insert(order_id, size);
-        
+
         if let Some(old_size) = old {
             if size >= old_size {
                 self.total_size = self.total_size.saturating_add(size - old_size);
@@ -60,10 +60,10 @@ impl PriceLevel {
         } else {
             self.total_size = self.total_size.saturating_add(size);
         }
-        
+
         #[cfg(debug_assertions)]
         self.verify_invariant();
-        
+
         old
     }
 
@@ -72,10 +72,10 @@ impl PriceLevel {
     pub fn remove_order(&mut self, order_id: u64) -> Option<u32> {
         if let Some(size) = self.orders.remove(&order_id) {
             self.total_size = self.total_size.saturating_sub(size);
-            
+
             #[cfg(debug_assertions)]
             self.verify_invariant();
-            
+
             Some(size)
         } else {
             None
@@ -90,10 +90,10 @@ impl PriceLevel {
             *size = size.saturating_sub(delta);
             self.total_size = self.total_size.saturating_sub(actual_reduction);
             let new_size = *size;
-            
+
             #[cfg(debug_assertions)]
             self.verify_invariant();
-            
+
             Some(new_size)
         } else {
             None
@@ -148,7 +148,9 @@ impl PriceLevel {
     /// Uses saturating arithmetic to match cached total behavior.
     #[inline]
     pub fn compute_actual_total(&self) -> u32 {
-        self.orders.values().fold(0u32, |acc, &v| acc.saturating_add(v))
+        self.orders
+            .values()
+            .fold(0u32, |acc, &v| acc.saturating_add(v))
     }
 
     /// Verify the size invariant holds.
@@ -350,4 +352,3 @@ mod tests {
         level.verify_invariant();
     }
 }
-

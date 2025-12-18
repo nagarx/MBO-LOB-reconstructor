@@ -1,7 +1,7 @@
 //! Order Lifecycle Tracking for MBO Data
 //!
 //! This module tracks individual orders through their complete lifecycle:
-//! Add → [Modify]* → Cancel|Fill
+//! Add → \[Modify\]* → Cancel|Fill
 //!
 //! # Research Reference
 //!
@@ -46,8 +46,8 @@
 //!             LifecycleEvent::Created(lifecycle) => println!("New order: {}", lifecycle.order_id),
 //!             LifecycleEvent::Modified { .. } => println!("Order modified"),
 //!             LifecycleEvent::Completed(lifecycle) => {
-//!                 println!("Order {} completed after {:?}", 
-//!                          lifecycle.order_id, 
+//!                 println!("Order {} completed after {:?}",
+//!                          lifecycle.order_id,
 //!                          lifecycle.time_alive_ns());
 //!             }
 //!         }
@@ -342,7 +342,9 @@ impl OrderLifecycle {
 
     /// Time the order was alive (creation to completion or last activity).
     pub fn time_alive_ns(&self) -> i64 {
-        let end_ts = self.completion_timestamp.unwrap_or(self.last_activity_timestamp);
+        let end_ts = self
+            .completion_timestamp
+            .unwrap_or(self.last_activity_timestamp);
         end_ts.saturating_sub(self.creation_timestamp)
     }
 
@@ -965,7 +967,14 @@ impl CompletionStats {
 mod tests {
     use super::*;
 
-    fn make_msg(order_id: u64, action: Action, side: Side, price: i64, size: u32, ts: i64) -> MboMessage {
+    fn make_msg(
+        order_id: u64,
+        action: Action,
+        side: Side,
+        price: i64,
+        size: u32,
+        ts: i64,
+    ) -> MboMessage {
         MboMessage {
             order_id,
             action,
@@ -1098,15 +1107,36 @@ mod tests {
         tracker.process_message(&add_msg);
 
         // Three partial fills
-        tracker.process_message(&make_msg(1, Action::Fill, Side::Ask, 100_000_000_000, 30, 2000));
-        tracker.process_message(&make_msg(1, Action::Fill, Side::Ask, 100_000_000_000, 30, 3000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Fill,
+            Side::Ask,
+            100_000_000_000,
+            30,
+            2000,
+        ));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Fill,
+            Side::Ask,
+            100_000_000_000,
+            30,
+            3000,
+        ));
 
         let lc = tracker.get_active(1).unwrap();
         assert_eq!(lc.current_size, 40);
         assert_eq!(lc.fill_count, 2);
 
         // Final fill
-        let event = tracker.process_message(&make_msg(1, Action::Fill, Side::Ask, 100_000_000_000, 40, 4000));
+        let event = tracker.process_message(&make_msg(
+            1,
+            Action::Fill,
+            Side::Ask,
+            100_000_000_000,
+            40,
+            4000,
+        ));
 
         if let Some(LifecycleEvent::Completed(lc)) = event {
             assert_eq!(lc.terminal_state, TerminalState::Filled);
@@ -1146,15 +1176,21 @@ mod tests {
 
     #[test]
     fn test_modification_limit() {
-        let config = OrderLifecycleConfig::default()
-            .with_modification_tracking(true);
+        let config = OrderLifecycleConfig::default().with_modification_tracking(true);
         let mut config = config;
         config.max_modifications_per_order = 3;
 
         let mut tracker = OrderLifecycleTracker::new(config);
 
         // Add order
-        tracker.process_message(&make_msg(1, Action::Add, Side::Bid, 100_000_000_000, 100, 1000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            1000,
+        ));
 
         // 5 modifications
         for i in 1..=5 {
@@ -1284,8 +1320,22 @@ mod tests {
 
         // Add and cancel 5 orders
         for i in 1..=5u64 {
-            tracker.process_message(&make_msg(i, Action::Add, Side::Bid, 100_000_000_000, 100, i as i64 * 1000));
-            tracker.process_message(&make_msg(i, Action::Cancel, Side::Bid, 100_000_000_000, 100, i as i64 * 1000 + 500));
+            tracker.process_message(&make_msg(
+                i,
+                Action::Add,
+                Side::Bid,
+                100_000_000_000,
+                100,
+                i as i64 * 1000,
+            ));
+            tracker.process_message(&make_msg(
+                i,
+                Action::Cancel,
+                Side::Bid,
+                100_000_000_000,
+                100,
+                i as i64 * 1000 + 500,
+            ));
         }
 
         // Should only retain 3
@@ -1309,8 +1359,22 @@ mod tests {
         let mut tracker = OrderLifecycleTracker::new(config);
 
         // Add and cancel
-        tracker.process_message(&make_msg(1, Action::Add, Side::Bid, 100_000_000_000, 100, 1000));
-        tracker.process_message(&make_msg(1, Action::Cancel, Side::Bid, 100_000_000_000, 100, 2000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            1000,
+        ));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Cancel,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            2000,
+        ));
 
         let (_, completed) = tracker.memory_usage();
         assert_eq!(completed, 0);
@@ -1325,12 +1389,40 @@ mod tests {
         let mut tracker = OrderLifecycleTracker::new(OrderLifecycleConfig::default());
 
         // Add some orders
-        tracker.process_message(&make_msg(1, Action::Add, Side::Bid, 100_000_000_000, 100, 1000));
-        tracker.process_message(&make_msg(2, Action::Add, Side::Ask, 101_000_000_000, 50, 2000));
-        tracker.process_message(&make_msg(3, Action::Add, Side::Bid, 99_000_000_000, 75, 3000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            1000,
+        ));
+        tracker.process_message(&make_msg(
+            2,
+            Action::Add,
+            Side::Ask,
+            101_000_000_000,
+            50,
+            2000,
+        ));
+        tracker.process_message(&make_msg(
+            3,
+            Action::Add,
+            Side::Bid,
+            99_000_000_000,
+            75,
+            3000,
+        ));
 
         // Modify one
-        tracker.process_message(&make_msg(1, Action::Modify, Side::Bid, 100_500_000_000, 100, 4000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Modify,
+            Side::Bid,
+            100_500_000_000,
+            100,
+            4000,
+        ));
 
         let features = tracker.active_order_features();
 
@@ -1350,14 +1442,35 @@ mod tests {
 
         // Add and complete some orders
         for i in 1..=5u64 {
-            tracker.process_message(&make_msg(i, Action::Add, Side::Bid, 100_000_000_000, 100, i as i64 * 1000));
+            tracker.process_message(&make_msg(
+                i,
+                Action::Add,
+                Side::Bid,
+                100_000_000_000,
+                100,
+                i as i64 * 1000,
+            ));
 
             if i % 2 == 0 {
                 // Fill
-                tracker.process_message(&make_msg(i, Action::Fill, Side::Bid, 100_000_000_000, 100, i as i64 * 1000 + 500));
+                tracker.process_message(&make_msg(
+                    i,
+                    Action::Fill,
+                    Side::Bid,
+                    100_000_000_000,
+                    100,
+                    i as i64 * 1000 + 500,
+                ));
             } else {
                 // Cancel
-                tracker.process_message(&make_msg(i, Action::Cancel, Side::Bid, 100_000_000_000, 100, i as i64 * 1000 + 500));
+                tracker.process_message(&make_msg(
+                    i,
+                    Action::Cancel,
+                    Side::Bid,
+                    100_000_000_000,
+                    100,
+                    i as i64 * 1000 + 500,
+                ));
             }
         }
 
@@ -1377,8 +1490,22 @@ mod tests {
     fn test_reset() {
         let mut tracker = OrderLifecycleTracker::new(OrderLifecycleConfig::default());
 
-        tracker.process_message(&make_msg(1, Action::Add, Side::Bid, 100_000_000_000, 100, 1000));
-        tracker.process_message(&make_msg(1, Action::Cancel, Side::Bid, 100_000_000_000, 100, 2000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            1000,
+        ));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Cancel,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            2000,
+        ));
 
         assert!(tracker.stats().total_orders() > 0);
 
@@ -1388,4 +1515,3 @@ mod tests {
         assert_eq!(tracker.memory_usage(), (0, 0));
     }
 }
-

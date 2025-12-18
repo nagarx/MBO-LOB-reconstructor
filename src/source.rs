@@ -505,10 +505,19 @@ mod tests {
 
     #[test]
     fn test_vec_source_with_metadata() {
-        let messages = vec![MboMessage::new(1, Action::Add, Side::Bid, 100_000_000_000, 100)];
+        let messages = vec![MboMessage::new(
+            1,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            100,
+        )];
 
-        let source = VecSource::new(messages)
-            .with_metadata(SourceMetadata::new().with_symbol("TEST").with_date("2025-01-01"));
+        let source = VecSource::new(messages).with_metadata(
+            SourceMetadata::new()
+                .with_symbol("TEST")
+                .with_date("2025-01-01"),
+        );
 
         assert_eq!(source.metadata().symbol, Some("TEST".to_string()));
         assert_eq!(source.metadata().date, Some("2025-01-01".to_string()));
@@ -549,20 +558,19 @@ mod tests {
         #[test]
         fn test_dbn_source_with_real_file() {
             // Only run if test file exists
-            let test_file = std::env::var("TEST_DBN_FILE")
-                .unwrap_or_else(|_| {
-                    // Try common test file locations
-                    let candidates = [
-                        "../data/NVDA_2025-02-01_to_2025-09-30/NVDA_2025-02-03.mbo.dbn.zst",
-                        "../../data/NVDA_2025-02-01_to_2025-09-30/NVDA_2025-02-03.mbo.dbn.zst",
-                    ];
-                    for path in candidates {
-                        if std::path::Path::new(path).exists() {
-                            return path.to_string();
-                        }
+            let test_file = std::env::var("TEST_DBN_FILE").unwrap_or_else(|_| {
+                // Try common test file locations
+                let candidates = [
+                    "../data/NVDA_2025-02-01_to_2025-09-30/NVDA_2025-02-03.mbo.dbn.zst",
+                    "../../data/NVDA_2025-02-01_to_2025-09-30/NVDA_2025-02-03.mbo.dbn.zst",
+                ];
+                for path in candidates {
+                    if std::path::Path::new(path).exists() {
+                        return path.to_string();
                     }
-                    String::new()
-                });
+                }
+                String::new()
+            });
 
             if test_file.is_empty() || !std::path::Path::new(&test_file).exists() {
                 eprintln!("Skipping test_dbn_source_with_real_file: no test file available");
@@ -587,4 +595,3 @@ mod tests {
         }
     }
 }
-

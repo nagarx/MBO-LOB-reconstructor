@@ -2,6 +2,12 @@
 //!
 //! These tests validate the queue position tracking using actual MBO data
 //! to ensure correctness in real-world scenarios.
+//!
+//! **Note**: This test module requires the `databento` feature to be enabled
+//! since it uses `DbnLoader` for reading MBO data files.
+
+// This entire test module requires the databento feature for DbnLoader
+#![cfg(feature = "databento")]
 
 use mbo_lob_reconstructor::{
     DbnLoader, LobReconstructor, QueuePositionConfig, QueuePositionTracker,
@@ -303,7 +309,10 @@ fn test_queue_position_imbalance_predictor() {
             0.0
         };
 
-        println!("   📈 Imbalance-Price Analysis ({} samples):", samples.len());
+        println!(
+            "   📈 Imbalance-Price Analysis ({} samples):",
+            samples.len()
+        );
         println!(
             "      Positive imbalance ({}) → avg mid change: {:.6e}",
             positive_imb.len(),
@@ -365,4 +374,3 @@ fn test_queue_position_multi_level_imbalance() {
         }
     }
 }
-

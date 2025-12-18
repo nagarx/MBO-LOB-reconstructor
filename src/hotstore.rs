@@ -401,10 +401,7 @@ impl HotStoreManager {
                     TlobError::generic(format!("Failed to rename temp file: {}", e))
                 })?;
 
-                log::info!(
-                    "Decompression complete: {} bytes written",
-                    bytes
-                );
+                log::info!("Decompression complete: {} bytes written", bytes);
                 Ok(decompressed_path)
             }
             Err(e) => {
@@ -420,8 +417,9 @@ impl HotStoreManager {
         let input_file = File::open(src)
             .map_err(|e| TlobError::generic(format!("Failed to open {}: {}", src.display(), e)))?;
 
-        let output_file = File::create(dst)
-            .map_err(|e| TlobError::generic(format!("Failed to create {}: {}", dst.display(), e)))?;
+        let output_file = File::create(dst).map_err(|e| {
+            TlobError::generic(format!("Failed to create {}: {}", dst.display(), e))
+        })?;
 
         // Use large buffers for better throughput
         let reader = BufReader::with_capacity(IO_BUFFER_SIZE, input_file);
@@ -444,16 +442,16 @@ impl HotStoreManager {
                 break;
             }
 
-            writer.write_all(&buffer[..bytes_read]).map_err(|e| {
-                TlobError::generic(format!("Decompression write error: {}", e))
-            })?;
+            writer
+                .write_all(&buffer[..bytes_read])
+                .map_err(|e| TlobError::generic(format!("Decompression write error: {}", e)))?;
 
             total_bytes += bytes_read as u64;
         }
 
-        writer.flush().map_err(|e| {
-            TlobError::generic(format!("Failed to flush output: {}", e))
-        })?;
+        writer
+            .flush()
+            .map_err(|e| TlobError::generic(format!("Failed to flush output: {}", e)))?;
 
         Ok(total_bytes)
     }
@@ -471,12 +469,9 @@ impl HotStoreManager {
 
         let mut files = Vec::new();
 
-        for entry in fs::read_dir(&self.config.hot_store_dir).map_err(|e| {
-            TlobError::generic(format!(
-                "Failed to read hot store directory: {}",
-                e
-            ))
-        })? {
+        for entry in fs::read_dir(&self.config.hot_store_dir)
+            .map_err(|e| TlobError::generic(format!("Failed to read hot store directory: {}", e)))?
+        {
             let entry = entry.map_err(|e| {
                 TlobError::generic(format!("Failed to read directory entry: {}", e))
             })?;
@@ -531,12 +526,11 @@ impl HotStoreManager {
             return Ok(());
         }
 
-        for entry in fs::read_dir(&self.config.hot_store_dir).map_err(|e| {
-            TlobError::generic(format!("Failed to read hot store: {}", e))
-        })? {
-            let entry = entry.map_err(|e| {
-                TlobError::generic(format!("Failed to read entry: {}", e))
-            })?;
+        for entry in fs::read_dir(&self.config.hot_store_dir)
+            .map_err(|e| TlobError::generic(format!("Failed to read hot store: {}", e)))?
+        {
+            let entry =
+                entry.map_err(|e| TlobError::generic(format!("Failed to read entry: {}", e)))?;
 
             let path = entry.path();
             if path.is_file() {
@@ -616,8 +610,7 @@ mod tests {
         };
         assert!(bad_config.validate().is_err());
 
-        let bad_config = HotStoreConfig::new("/data")
-            .with_compressed_ext("");
+        let bad_config = HotStoreConfig::new("/data").with_compressed_ext("");
         assert!(bad_config.validate().is_err());
     }
 
@@ -689,8 +682,7 @@ mod tests {
         fs::write(&decompressed, "test data").unwrap();
 
         // With preference disabled
-        let config = HotStoreConfig::dbn_defaults(&hot_dir)
-            .with_prefer_decompressed(false);
+        let config = HotStoreConfig::dbn_defaults(&hot_dir).with_prefer_decompressed(false);
         let manager = HotStoreManager::new(config);
 
         // Should return original even though decompressed exists
@@ -737,8 +729,18 @@ mod tests {
 
         // Should only include .dbn files
         assert_eq!(files.len(), 2);
-        assert!(files[0].file_name().unwrap().to_str().unwrap().contains("a.mbo.dbn"));
-        assert!(files[1].file_name().unwrap().to_str().unwrap().contains("b.mbo.dbn"));
+        assert!(files[0]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("a.mbo.dbn"));
+        assert!(files[1]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("b.mbo.dbn"));
 
         cleanup(&dir);
     }
@@ -802,10 +804,8 @@ mod tests {
         let test_data = b"Hello, hot store!";
 
         // Compress test data
-        let mut encoder = zstd::stream::write::Encoder::new(
-            File::create(&compressed_path).unwrap(),
-            0,
-        ).unwrap();
+        let mut encoder =
+            zstd::stream::write::Encoder::new(File::create(&compressed_path).unwrap(), 0).unwrap();
         encoder.write_all(test_data).unwrap();
         encoder.finish().unwrap();
 
@@ -836,10 +836,8 @@ mod tests {
         let compressed_path = compressed_dir.join("test.dbn.zst");
         let test_data = b"Test data for idempotency";
 
-        let mut encoder = zstd::stream::write::Encoder::new(
-            File::create(&compressed_path).unwrap(),
-            0,
-        ).unwrap();
+        let mut encoder =
+            zstd::stream::write::Encoder::new(File::create(&compressed_path).unwrap(), 0).unwrap();
         encoder.write_all(test_data).unwrap();
         encoder.finish().unwrap();
 
@@ -853,4 +851,3 @@ mod tests {
         cleanup(&dir);
     }
 }
-

@@ -267,25 +267,20 @@ impl QueueLevel {
     /// Get volume ahead of an order.
     fn volume_ahead(&self, order_id: u64) -> Option<u64> {
         let position = self.orders.get_index_of(&order_id)?;
-        let ahead: u64 = self
-            .orders
-            .values()
-            .take(position)
-            .map(|&s| s as u64)
-            .sum();
+        let ahead: u64 = self.orders.values().take(position).map(|&s| s as u64).sum();
         Some(ahead)
     }
 
     /// Get full position info for an order.
-    fn get_position_info(&self, order_id: u64, price: i64, side: Side) -> Option<QueuePositionInfo> {
+    fn get_position_info(
+        &self,
+        order_id: u64,
+        price: i64,
+        side: Side,
+    ) -> Option<QueuePositionInfo> {
         let position = self.orders.get_index_of(&order_id)?;
         let order_size = *self.orders.get(&order_id)?;
-        let volume_ahead: u64 = self
-            .orders
-            .values()
-            .take(position)
-            .map(|&s| s as u64)
-            .sum();
+        let volume_ahead: u64 = self.orders.values().take(position).map(|&s| s as u64).sum();
 
         Some(QueuePositionInfo {
             order_id,
@@ -474,8 +469,9 @@ impl QueuePositionTracker {
                         if msg.size > old_size {
                             level.total_volume += (msg.size - old_size) as u64;
                         } else {
-                            level.total_volume =
-                                level.total_volume.saturating_sub((old_size - msg.size) as u64);
+                            level.total_volume = level
+                                .total_volume
+                                .saturating_sub((old_size - msg.size) as u64);
                         }
                         *level.orders.get_mut(&msg.order_id).unwrap() = msg.size;
                     }
@@ -796,9 +792,30 @@ mod tests {
         let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
 
         // Add 3 orders at same price - FIFO order
-        tracker.process_message(&make_msg(1, Action::Add, Side::Bid, 100_000_000_000, 100, 1000));
-        tracker.process_message(&make_msg(2, Action::Add, Side::Bid, 100_000_000_000, 200, 2000));
-        tracker.process_message(&make_msg(3, Action::Add, Side::Bid, 100_000_000_000, 150, 3000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            1000,
+        ));
+        tracker.process_message(&make_msg(
+            2,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            200,
+            2000,
+        ));
+        tracker.process_message(&make_msg(
+            3,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            150,
+            3000,
+        ));
 
         // Order 1: position 0 (front)
         let pos1 = tracker.queue_position(1).unwrap();
@@ -821,12 +838,40 @@ mod tests {
         let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
 
         // Add 3 orders
-        tracker.process_message(&make_msg(1, Action::Add, Side::Bid, 100_000_000_000, 100, 1000));
-        tracker.process_message(&make_msg(2, Action::Add, Side::Bid, 100_000_000_000, 200, 2000));
-        tracker.process_message(&make_msg(3, Action::Add, Side::Bid, 100_000_000_000, 150, 3000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            1000,
+        ));
+        tracker.process_message(&make_msg(
+            2,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            200,
+            2000,
+        ));
+        tracker.process_message(&make_msg(
+            3,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            150,
+            3000,
+        ));
 
         // Remove order 1 (front)
-        tracker.process_message(&make_msg(1, Action::Cancel, Side::Bid, 100_000_000_000, 100, 4000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Cancel,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            4000,
+        ));
 
         // Order 2 should now be at front
         let pos2 = tracker.queue_position(2).unwrap();
@@ -843,11 +888,32 @@ mod tests {
     fn test_partial_fill_reduces_volume() {
         let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
 
-        tracker.process_message(&make_msg(1, Action::Add, Side::Ask, 100_000_000_000, 100, 1000));
-        tracker.process_message(&make_msg(2, Action::Add, Side::Ask, 100_000_000_000, 200, 2000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Ask,
+            100_000_000_000,
+            100,
+            1000,
+        ));
+        tracker.process_message(&make_msg(
+            2,
+            Action::Add,
+            Side::Ask,
+            100_000_000_000,
+            200,
+            2000,
+        ));
 
         // Partial fill of order 1
-        tracker.process_message(&make_msg(1, Action::Fill, Side::Ask, 100_000_000_000, 40, 3000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Fill,
+            Side::Ask,
+            100_000_000_000,
+            40,
+            3000,
+        ));
 
         let pos1 = tracker.queue_position(1).unwrap();
         assert_eq!(pos1.order_size, 60); // 100 - 40
@@ -861,11 +927,32 @@ mod tests {
     fn test_full_fill_removes_order() {
         let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
 
-        tracker.process_message(&make_msg(1, Action::Add, Side::Ask, 100_000_000_000, 100, 1000));
-        tracker.process_message(&make_msg(2, Action::Add, Side::Ask, 100_000_000_000, 200, 2000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Ask,
+            100_000_000_000,
+            100,
+            1000,
+        ));
+        tracker.process_message(&make_msg(
+            2,
+            Action::Add,
+            Side::Ask,
+            100_000_000_000,
+            200,
+            2000,
+        ));
 
         // Full fill of order 1
-        tracker.process_message(&make_msg(1, Action::Fill, Side::Ask, 100_000_000_000, 100, 3000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Fill,
+            Side::Ask,
+            100_000_000_000,
+            100,
+            3000,
+        ));
 
         assert!(tracker.queue_position(1).is_none());
 
@@ -879,12 +966,33 @@ mod tests {
         let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
 
         // Add 2 orders at same price
-        tracker.process_message(&make_msg(1, Action::Add, Side::Bid, 100_000_000_000, 100, 1000));
-        tracker.process_message(&make_msg(2, Action::Add, Side::Bid, 100_000_000_000, 200, 2000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            1000,
+        ));
+        tracker.process_message(&make_msg(
+            2,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            200,
+            2000,
+        ));
 
         // Modify order 1 to different price then back (simulates price improvement)
         // This should move it to back of queue at new price
-        tracker.process_message(&make_msg(1, Action::Modify, Side::Bid, 101_000_000_000, 100, 3000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Modify,
+            Side::Bid,
+            101_000_000_000,
+            100,
+            3000,
+        ));
 
         // Order 1 should be at new price, alone
         let pos1 = tracker.queue_position(1).unwrap();
@@ -906,9 +1014,23 @@ mod tests {
         let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
 
         // Bid: 100 @ 100
-        tracker.process_message(&make_msg(1, Action::Add, Side::Bid, 100_000_000_000, 100, 1000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            1000,
+        ));
         // Ask: 200 @ 101
-        tracker.process_message(&make_msg(2, Action::Add, Side::Ask, 101_000_000_000, 200, 2000));
+        tracker.process_message(&make_msg(
+            2,
+            Action::Add,
+            Side::Ask,
+            101_000_000_000,
+            200,
+            2000,
+        ));
 
         let (imbalance, bid_vol, ask_vol) = tracker.best_level_imbalance().unwrap();
         assert_eq!(bid_vol, 100);
@@ -922,17 +1044,45 @@ mod tests {
         let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
 
         // 2 bid levels
-        tracker.process_message(&make_msg(1, Action::Add, Side::Bid, 100_000_000_000, 100, 1000));
-        tracker.process_message(&make_msg(2, Action::Add, Side::Bid, 99_000_000_000, 150, 2000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            1000,
+        ));
+        tracker.process_message(&make_msg(
+            2,
+            Action::Add,
+            Side::Bid,
+            99_000_000_000,
+            150,
+            2000,
+        ));
 
         // 2 ask levels
-        tracker.process_message(&make_msg(3, Action::Add, Side::Ask, 101_000_000_000, 50, 3000));
-        tracker.process_message(&make_msg(4, Action::Add, Side::Ask, 102_000_000_000, 100, 4000));
+        tracker.process_message(&make_msg(
+            3,
+            Action::Add,
+            Side::Ask,
+            101_000_000_000,
+            50,
+            3000,
+        ));
+        tracker.process_message(&make_msg(
+            4,
+            Action::Add,
+            Side::Ask,
+            102_000_000_000,
+            100,
+            4000,
+        ));
 
         let (imbalance, bid_vol, ask_vol) = tracker.multi_level_imbalance(2).unwrap();
         assert_eq!(bid_vol, 250); // 100 + 150
         assert_eq!(ask_vol, 150); // 50 + 100
-        // (250 - 150) / 400 = 0.25
+                                  // (250 - 150) / 400 = 0.25
         assert!((imbalance - 0.25).abs() < 0.001);
     }
 
@@ -971,9 +1121,30 @@ mod tests {
         let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
 
         // Add orders with different sizes
-        tracker.process_message(&make_msg(1, Action::Add, Side::Bid, 100_000_000_000, 100, 1000));
-        tracker.process_message(&make_msg(2, Action::Add, Side::Bid, 100_000_000_000, 300, 2000));
-        tracker.process_message(&make_msg(3, Action::Add, Side::Bid, 100_000_000_000, 100, 3000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            1000,
+        ));
+        tracker.process_message(&make_msg(
+            2,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            300,
+            2000,
+        ));
+        tracker.process_message(&make_msg(
+            3,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            3000,
+        ));
 
         let pos3 = tracker.queue_position(3).unwrap();
         // Volume ahead: 400, total: 500
@@ -988,10 +1159,31 @@ mod tests {
     fn test_system_messages_skipped() {
         let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
 
-        tracker.process_message(&make_msg(0, Action::Add, Side::Bid, 100_000_000_000, 100, 1000));
-        tracker.process_message(&make_msg(1, Action::Add, Side::Bid, 100_000_000_000, 0, 2000));
+        tracker.process_message(&make_msg(
+            0,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            1000,
+        ));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            0,
+            2000,
+        ));
         tracker.process_message(&make_msg(1, Action::Add, Side::Bid, 0, 100, 3000));
-        tracker.process_message(&make_msg(1, Action::Add, Side::None, 100_000_000_000, 100, 4000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::None,
+            100_000_000_000,
+            100,
+            4000,
+        ));
 
         assert_eq!(tracker.stats().messages_skipped, 4);
         assert_eq!(tracker.active_orders(), 0);
@@ -1005,7 +1197,14 @@ mod tests {
     fn test_reset() {
         let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
 
-        tracker.process_message(&make_msg(1, Action::Add, Side::Bid, 100_000_000_000, 100, 1000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            1000,
+        ));
         assert_eq!(tracker.active_orders(), 1);
 
         tracker.reset();
@@ -1023,8 +1222,22 @@ mod tests {
         let config = QueuePositionConfig::default().with_change_tracking();
         let mut tracker = QueuePositionTracker::new(config);
 
-        tracker.process_message(&make_msg(1, Action::Add, Side::Bid, 100_000_000_000, 100, 1000));
-        tracker.process_message(&make_msg(1, Action::Cancel, Side::Bid, 100_000_000_000, 100, 2000));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            1000,
+        ));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Cancel,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            2000,
+        ));
 
         let changes = tracker.recent_position_changes();
         assert_eq!(changes.len(), 2);
@@ -1038,4 +1251,3 @@ mod tests {
         assert_eq!(changes[1].new_position, None);
     }
 }
-

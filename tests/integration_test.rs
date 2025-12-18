@@ -1529,7 +1529,10 @@ fn test_temporal_fields_with_real_nvidia_data() {
     use mbo_lob_reconstructor::{Action, LobState, Side};
 
     let path = get_test_data_path();
-    println!("\n📂 Testing temporal fields with real NVIDIA data: {}", path);
+    println!(
+        "\n📂 Testing temporal fields with real NVIDIA data: {}",
+        path
+    );
 
     let loader = DbnLoader::new(&path)
         .expect("Failed to create loader")
@@ -1578,7 +1581,7 @@ fn test_temporal_fields_with_real_nvidia_data() {
                     0
                 };
 
-                // The delta_ns should be set based on previous LOB state, 
+                // The delta_ns should be set based on previous LOB state,
                 // which may differ from our tracking due to state reuse
                 if state.delta_ns > 0 {
                     valid_deltas += 1;
@@ -1592,7 +1595,10 @@ fn test_temporal_fields_with_real_nvidia_data() {
         }
     }
 
-    println!("\n📊 Temporal Fields Statistics ({} messages):", messages_processed);
+    println!(
+        "\n📊 Temporal Fields Statistics ({} messages):",
+        messages_processed
+    );
     println!("  Valid time deltas: {}", valid_deltas);
 
     if valid_deltas > 0 {
@@ -1600,9 +1606,20 @@ fn test_temporal_fields_with_real_nvidia_data() {
         let avg_delta_us = avg_delta_ns as f64 / 1000.0;
         let avg_delta_ms = avg_delta_ns as f64 / 1_000_000.0;
 
-        println!("  Average delta: {:.2} μs ({:.4} ms)", avg_delta_us, avg_delta_ms);
-        println!("  Min delta: {} ns ({:.4} μs)", min_delta_ns, min_delta_ns as f64 / 1000.0);
-        println!("  Max delta: {} ns ({:.4} ms)", max_delta_ns, max_delta_ns as f64 / 1_000_000.0);
+        println!(
+            "  Average delta: {:.2} μs ({:.4} ms)",
+            avg_delta_us, avg_delta_ms
+        );
+        println!(
+            "  Min delta: {} ns ({:.4} μs)",
+            min_delta_ns,
+            min_delta_ns as f64 / 1000.0
+        );
+        println!(
+            "  Max delta: {} ns ({:.4} ms)",
+            max_delta_ns,
+            max_delta_ns as f64 / 1_000_000.0
+        );
 
         // Verify we have reasonable event intensity
         let avg_intensity = 1e9 / avg_delta_ns as f64;
@@ -1713,9 +1730,10 @@ fn test_temporal_delta_accuracy() {
 
     // We expect most deltas to be tracked correctly
     if messages_with_timestamps > 100 {
-        let accuracy = consecutive_valid_deltas as f64 / (consecutive_valid_deltas + delta_errors) as f64;
+        let accuracy =
+            consecutive_valid_deltas as f64 / (consecutive_valid_deltas + delta_errors) as f64;
         println!("  Tracking accuracy: {:.1}%", accuracy * 100.0);
-        
+
         // Allow some tolerance for edge cases
         assert!(
             accuracy > 0.90,

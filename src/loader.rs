@@ -222,7 +222,7 @@ impl DbnLoader {
     /// - Reduced CPU usage during processing
     pub fn with_hot_store<P: AsRef<Path>>(path: P, hot_store: &HotStoreManager) -> Result<Self> {
         let resolved_path = hot_store.resolve(path.as_ref());
-        
+
         log::debug!(
             "Hot store resolved: {} -> {}",
             path.as_ref().display(),
@@ -360,7 +360,7 @@ impl<D: DecodeRecord> Iterator for MessageIterator<D> {
             // We convert immediately, so no clone is needed - the reference is valid
             // until the next decode_record call.
             let dbn_msg_ref = match self.decoder.decode_record::<dbn::MboMsg>() {
-                Ok(Some(msg)) => msg, // Use reference directly (no clone!)
+                Ok(Some(msg)) => msg,    // Use reference directly (no clone!)
                 Ok(None) => return None, // End of file
                 Err(e) => {
                     if self.skip_invalid {
@@ -456,7 +456,12 @@ mod tests {
 
     fn unique_temp_dir(name: &str) -> PathBuf {
         let counter = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("loader_test_{}_{}_{}", std::process::id(), name, counter))
+        std::env::temp_dir().join(format!(
+            "loader_test_{}_{}_{}",
+            std::process::id(),
+            name,
+            counter
+        ))
     }
 
     #[test]
@@ -526,7 +531,7 @@ mod tests {
 
         // with_hot_store should resolve to the decompressed file
         let result = DbnLoader::with_hot_store("/raw/test.mbo.dbn.zst", &hot_store);
-        
+
         // Should succeed because decompressed file exists
         assert!(result.is_ok());
         let loader = result.unwrap();
@@ -557,7 +562,7 @@ mod tests {
 
         // with_hot_store should fallback to original since no decompressed exists
         let result = DbnLoader::with_hot_store(&original, &hot_store);
-        
+
         // Should succeed with original path
         assert!(result.is_ok());
         let loader = result.unwrap();

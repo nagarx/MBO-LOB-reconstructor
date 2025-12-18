@@ -297,7 +297,6 @@ pub struct LobState {
     // =========================================================================
     // Temporal Information (FI-2010 time-sensitive features u6-u9)
     // =========================================================================
-
     /// Previous timestamp for Δt calculation (nanoseconds since epoch).
     ///
     /// This is the timestamp of the previous LOB update, enabling:
@@ -595,13 +594,19 @@ impl LobState {
     /// Calculate total bid volume across active levels.
     #[inline]
     pub fn total_bid_volume(&self) -> u64 {
-        self.bid_sizes[..self.levels].iter().map(|&s| s as u64).sum()
+        self.bid_sizes[..self.levels]
+            .iter()
+            .map(|&s| s as u64)
+            .sum()
     }
 
     /// Calculate total ask volume across active levels.
     #[inline]
     pub fn total_ask_volume(&self) -> u64 {
-        self.ask_sizes[..self.levels].iter().map(|&s| s as u64).sum()
+        self.ask_sizes[..self.levels]
+            .iter()
+            .map(|&s| s as u64)
+            .sum()
     }
 
     /// Calculate depth imbalance (normalized difference between bid and ask volume).
@@ -714,13 +719,19 @@ impl LobState {
     /// Get number of active bid levels (with non-zero size).
     #[inline]
     pub fn active_bid_levels(&self) -> usize {
-        self.bid_sizes[..self.levels].iter().filter(|&&s| s > 0).count()
+        self.bid_sizes[..self.levels]
+            .iter()
+            .filter(|&&s| s > 0)
+            .count()
     }
 
     /// Get number of active ask levels (with non-zero size).
     #[inline]
     pub fn active_ask_levels(&self) -> usize {
-        self.ask_sizes[..self.levels].iter().filter(|&&s| s > 0).count()
+        self.ask_sizes[..self.levels]
+            .iter()
+            .filter(|&&s| s > 0)
+            .count()
     }
 }
 

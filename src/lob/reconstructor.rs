@@ -990,15 +990,18 @@ impl LobReconstructor {
         for (i, (&price, price_level)) in self.bids.iter().rev().take(levels).enumerate() {
             state.bid_prices[i] = price;
             state.bid_sizes[i] = price_level.total_size();
-            
+
             // Parallel validation: verify cached total matches actual sum
             #[cfg(debug_assertions)]
             {
                 let actual = price_level.compute_actual_total();
                 debug_assert_eq!(
-                    price_level.total_size(), actual,
+                    price_level.total_size(),
+                    actual,
                     "Bid level {} cached size {} != actual {}",
-                    price, price_level.total_size(), actual
+                    price,
+                    price_level.total_size(),
+                    actual
                 );
             }
         }
@@ -1008,15 +1011,18 @@ impl LobReconstructor {
         for (i, (&price, price_level)) in self.asks.iter().take(levels).enumerate() {
             state.ask_prices[i] = price;
             state.ask_sizes[i] = price_level.total_size();
-            
+
             // Parallel validation: verify cached total matches actual sum
             #[cfg(debug_assertions)]
             {
                 let actual = price_level.compute_actual_total();
                 debug_assert_eq!(
-                    price_level.total_size(), actual,
+                    price_level.total_size(),
+                    actual,
                     "Ask level {} cached size {} != actual {}",
-                    price, price_level.total_size(), actual
+                    price,
+                    price_level.total_size(),
+                    actual
                 );
             }
         }
@@ -1061,7 +1067,12 @@ impl LobReconstructor {
         {
             self.stats.system_messages_skipped += 1;
             // Still populate temporal info even for skipped messages
-            self.fill_lob_state_with_temporal(state, msg.timestamp, Some(msg.action), Some(msg.side));
+            self.fill_lob_state_with_temporal(
+                state,
+                msg.timestamp,
+                Some(msg.action),
+                Some(msg.side),
+            );
             return Ok(());
         }
 
@@ -1117,23 +1128,6 @@ impl LobReconstructor {
             msg.timestamp,
             Some(msg.action),
             Some(msg.side),
-            state,
-        )
-    }
-
-    /// Apply crossed quote policy and fill state in-place (zero-allocation).
-    #[inline]
-    fn apply_crossed_quote_policy_into(
-        &self,
-        consistency: BookConsistency,
-        timestamp: Option<i64>,
-        state: &mut LobState,
-    ) -> Result<()> {
-        self.apply_crossed_quote_policy_into_with_temporal(
-            consistency,
-            timestamp,
-            None,
-            None,
             state,
         )
     }
@@ -2046,26 +2040,22 @@ mod tests {
                 assert_eq!(
                     state1.bid_prices[i], reused_state.bid_prices[i],
                     "bid_prices[{}] mismatch at msg {:?}",
-                    i,
-                    msg.order_id
+                    i, msg.order_id
                 );
                 assert_eq!(
                     state1.bid_sizes[i], reused_state.bid_sizes[i],
                     "bid_sizes[{}] mismatch at msg {:?}",
-                    i,
-                    msg.order_id
+                    i, msg.order_id
                 );
                 assert_eq!(
                     state1.ask_prices[i], reused_state.ask_prices[i],
                     "ask_prices[{}] mismatch at msg {:?}",
-                    i,
-                    msg.order_id
+                    i, msg.order_id
                 );
                 assert_eq!(
                     state1.ask_sizes[i], reused_state.ask_sizes[i],
                     "ask_sizes[{}] mismatch at msg {:?}",
-                    i,
-                    msg.order_id
+                    i, msg.order_id
                 );
             }
 
@@ -2143,8 +2133,14 @@ mod tests {
         assert_eq!(lob.get_lob_state().bid_sizes[0], 500);
 
         // Partial cancel order 1: remove 30 (total: 470)
-        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 30))
-            .unwrap();
+        lob.process_message(&create_test_message(
+            1,
+            Action::Cancel,
+            Side::Bid,
+            100.0,
+            30,
+        ))
+        .unwrap();
         assert_eq!(lob.get_lob_state().bid_sizes[0], 470);
 
         // Trade on order 2: remove 50 (total: 420)
@@ -2153,8 +2149,14 @@ mod tests {
         assert_eq!(lob.get_lob_state().bid_sizes[0], 420);
 
         // Full cancel order 3 (total: 320)
-        lob.process_message(&create_test_message(3, Action::Cancel, Side::Bid, 100.0, 100))
-            .unwrap();
+        lob.process_message(&create_test_message(
+            3,
+            Action::Cancel,
+            Side::Bid,
+            100.0,
+            100,
+        ))
+        .unwrap();
         assert_eq!(lob.get_lob_state().bid_sizes[0], 320);
 
         // Add new order at same price (total: 520)
@@ -2163,8 +2165,14 @@ mod tests {
         assert_eq!(lob.get_lob_state().bid_sizes[0], 520);
 
         // Full trade on order 4 (total: 420)
-        lob.process_message(&create_test_message(4, Action::Trade, Side::Bid, 100.0, 100))
-            .unwrap();
+        lob.process_message(&create_test_message(
+            4,
+            Action::Trade,
+            Side::Bid,
+            100.0,
+            100,
+        ))
+        .unwrap();
         assert_eq!(lob.get_lob_state().bid_sizes[0], 420);
 
         // Verify remaining orders: 1 (70), 2 (50), 5 (100), 6 (200) = 420
@@ -2264,14 +2272,17 @@ mod tests {
         let duration = start.elapsed();
 
         let msgs_per_sec = messages.len() as f64 / duration.as_secs_f64();
-        
+
         println!("\n=== LOB Reconstruction Performance ===");
         println!("Messages processed: {}", messages.len());
         println!("Levels: {}", num_levels);
         println!("Orders per level: ~{}", orders_per_level);
         println!("Time: {:?}", duration);
         println!("Throughput: {:.0} msg/sec", msgs_per_sec);
-        println!("Per-message: {:.2} µs", duration.as_micros() as f64 / messages.len() as f64);
+        println!(
+            "Per-message: {:.2} µs",
+            duration.as_micros() as f64 / messages.len() as f64
+        );
 
         // Verify correctness
         assert!(state.best_bid.is_some() || state.best_ask.is_some());
