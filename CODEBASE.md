@@ -19,6 +19,7 @@
 11. [Common Patterns and Idioms](#11-common-patterns-and-idioms)
 12. [Integration with Feature Extractor](#12-integration-with-feature-extractor)
 13. [Known Limitations and Edge Cases](#13-known-limitations-and-edge-cases)
+14. [Composable Tracking Modules](#14-composable-tracking-modules)
 
 ---
 
@@ -35,10 +36,15 @@ Converts Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshot
 | LOB Reconstruction | MBO events → price-level aggregation |
 | System Message Filtering | Auto-skip heartbeats, status updates (order_id=0) |
 | Crossed Quote Handling | Configurable policies for bid ≥ ask |
+| Temporal Fields | Time delta, triggering action/side (FI-2010 u6-u9) |
 | Analytics | Microprice, VWAP, depth imbalance, market impact |
 | Statistics | Welford's algorithm for streaming mean/std |
 | Multi-Symbol | Manage multiple LOBs simultaneously |
-| DBN Support | Native Databento file loading |
+| Queue Position Tracking | FIFO position, volume ahead (composable module) |
+| Order Lifecycle Tracking | Add→Modify→Cancel/Fill lifecycle (composable module) |
+| Day Boundary Detection | Trading day boundaries for train/test splits |
+| Trade Aggregation | Fills→trades with aggressor side detection |
+| DBN Support | Native Databento file loading (feature-gated) |
 
 ### Directory Structure
 
@@ -101,10 +107,15 @@ src/
 
 | Module | Responsibility | Key Types |
 |--------|---------------|-----------|
-| `types` | Data structures, no logic | `MboMessage`, `LobState`, `Action`, `Side` |
+| `types` | Data structures, no logic | `MboMessage`, `LobState`, `Action`, `Side`, `MAX_LOB_LEVELS` |
 | `error` | Error definitions | `TlobError`, `Result<T>` |
 | `lob/reconstructor` | Core LOB reconstruction | `LobReconstructor`, `LobConfig`, `LobStats` |
+| `lob/price_level` | Price level with cached size | `PriceLevel` (O(1) aggregate size) |
 | `lob/multi_symbol` | Multi-stock management | `MultiSymbolLob`, `MultiSymbolStats` |
+| `lob/queue_position` | FIFO queue position tracking | `QueuePositionTracker`, `QueuePositionConfig`, `QueuePositionInfo` |
+| `lob/order_lifecycle` | Order lifecycle tracking | `OrderLifecycleTracker`, `OrderLifecycle`, `LifecycleEvent` |
+| `lob/day_boundary` | Trading day detection | `DayBoundaryDetector`, `DayBoundaryConfig`, `DayBoundary` |
+| `lob/trade_aggregator` | Trade aggregation | `TradeAggregator`, `Trade`, `Fill` |
 | `source` | Provider abstraction | `MarketDataSource`, `DbnSource`, `VecSource` |
 | `hotstore` | Decompressed data caching | `HotStoreConfig`, `HotStoreManager` |
 | `loader` | DBN file streaming | `DbnLoader`, `MessageIterator`, `DynDecoder` |
@@ -194,20 +205,41 @@ pub struct LobState {
 ```rust
 pub struct LobReconstructor {
     config: LobConfig,
-    bids: BTreeMap<i64, AHashMap<u64, u32>>,  // price → (order_id → size)
-    asks: BTreeMap<i64, AHashMap<u64, u32>>,
-    orders: AHashMap<u64, Order>,              // order_id → Order
-    best_bid: Option<i64>,                     // Cached
-    best_ask: Option<i64>,
-    stats: LobStats,
-    last_valid_state: Option<LobState>,        // For UseLastValid policy
+    bids: BTreeMap<i64, PriceLevel>,     // price → PriceLevel (with cached total_size)
+    asks: BTreeMap<i64, PriceLevel>,     // price → PriceLevel (with cached total_size)
+    orders: AHashMap<u64, Order>,        // order_id → Order (fast lookup)
+    best_bid: Option<i64>,               // Cached best bid price
+    best_ask: Option<i64>,               // Cached best ask price
+    stats: LobStats,                     // Processing statistics
+    last_valid_state: Option<LobState>,  // For UseLastValid crossed quote policy
+}
+```
+
+### PriceLevel (src/lob/price_level.rs)
+
+Each price level wraps a HashMap with a **cached aggregate size** for O(1) queries:
+
+```rust
+pub struct PriceLevel {
+    orders: AHashMap<u64, u32>,  // order_id → size
+    total_size: u32,             // Cached: always == orders.values().sum()
+}
+
+impl PriceLevel {
+    pub fn add_order(&mut self, order_id: u64, size: u32) -> Option<u32>;
+    pub fn remove_order(&mut self, order_id: u64) -> Option<u32>;
+    pub fn reduce_order(&mut self, order_id: u64, delta: u32) -> Option<u32>;
+    pub fn total_size(&self) -> u32;  // O(1) - uses cached value
+    pub fn is_empty(&self) -> bool;
+    pub fn order_count(&self) -> usize;
 }
 ```
 
 **Data Structure Rationale**:
-- `BTreeMap<i64, ...>`: Keeps prices sorted (O(log n) insert, O(1) min/max)
+- `BTreeMap<i64, PriceLevel>`: Keeps prices sorted (O(log n) insert, O(1) min/max)
+- `PriceLevel`: Encapsulates order tracking with O(1) aggregate size (no more `values().sum()`)
 - `AHashMap`: Fast hash map for order lookups (O(1) average)
-- Cached `best_bid`/`best_ask`: Avoid recomputation on every message
+- Cached `best_bid`/`best_ask`: Avoid BTreeMap traversal on every message
 
 ---
 
@@ -312,12 +344,14 @@ This is intentional: market data often has late cancels, already-filled orders, 
 ### Order Book Price Aggregation
 
 ```
-BTreeMap<price, HashMap<order_id, size>>
+BTreeMap<price, PriceLevel>
 
 Example bid side:
-  $100.00 → { order_1001: 50, order_1002: 100 }  → aggregated: 150
-  $99.99  → { order_1003: 200 }                  → aggregated: 200
+  $100.00 → PriceLevel { orders: {1001: 50, 1002: 100}, total_size: 150 }
+  $99.99  → PriceLevel { orders: {1003: 200}, total_size: 200 }
 ```
+
+The `PriceLevel` struct maintains a cached `total_size` that is updated on every mutation, enabling O(1) aggregate queries instead of O(n) sum operations.
 
 ### Best Price Update
 
@@ -393,6 +427,57 @@ let config = LobConfig::new(10)
     .with_skip_system_messages(true);
 
 let mut lob = LobReconstructor::with_config(config);
+```
+
+### QueuePositionConfig (src/lob/queue_position.rs)
+
+```rust
+pub struct QueuePositionConfig {
+    pub max_levels_per_side: usize,      // Default: 10
+    pub track_position_changes: bool,    // Default: false (saves memory)
+    pub max_position_changes: usize,     // Default: 1000
+}
+
+// Presets
+QueuePositionConfig::default()      // Standard tracking
+QueuePositionConfig::research()     // Full tracking (20 levels, changes enabled)
+```
+
+### OrderLifecycleConfig (src/lob/order_lifecycle.rs)
+
+```rust
+pub struct OrderLifecycleConfig {
+    pub max_completed_retention: usize,     // Default: 10_000
+    pub track_modifications: bool,          // Default: true
+    pub infer_pre_existing: bool,           // Default: true (handle mid-session starts)
+    pub max_modifications_per_order: usize, // Default: 100
+}
+```
+
+### DayBoundaryConfig (src/lob/day_boundary.rs)
+
+```rust
+pub struct DayBoundaryConfig {
+    pub market_open_ns: i64,       // Nanoseconds from midnight UTC
+    pub market_close_ns: i64,      // Nanoseconds from midnight UTC
+    pub gap_threshold_ns: i64,     // Default: 4 hours (overnight detection)
+    pub timezone_offset_hours: i32, // Default: -5 (EST)
+}
+
+// Presets
+DayBoundaryConfig::us_equity()  // 9:30 AM - 4:00 PM ET
+DayBoundaryConfig::us_futures() // Extended hours
+DayBoundaryConfig::crypto()     // 24/7, midnight UTC boundary
+```
+
+### TradeAggregatorConfig (src/lob/trade_aggregator.rs)
+
+```rust
+pub struct TradeAggregatorConfig {
+    pub max_recent_trades: usize,      // Default: 1000
+    pub aggregation_window_ns: i64,    // Default: 1_000_000 (1ms)
+    pub track_fills: bool,             // Default: false
+}
 ```
 
 ---
@@ -574,9 +659,11 @@ fn test_with_real_data() {
 
 1. **`#[inline]`**: Critical path functions
 2. **`ahash`**: Faster than std HashMap
-3. **`BTreeMap`**: O(1) best price access
-4. **Cached best prices**: Avoid recomputation
-5. **Pre-allocated vectors**: `LobState::new(levels)` pre-sizes
+3. **`BTreeMap`**: O(1) best price access via cached values
+4. **`PriceLevel` cached total**: O(1) aggregate size (no `values().sum()`)
+5. **Cached best prices**: Avoid BTreeMap traversal on every message
+6. **Stack-allocated `LobState`**: Fixed-size arrays, no heap allocation per snapshot
+7. **`process_message_into()`**: Zero-allocation API for hot paths
 
 ### Benchmark Example
 
@@ -593,7 +680,9 @@ fn bench_process_message(b: &mut Bencher) {
 
 - `MboMessage`: 32 bytes (packed)
 - `Order`: 16 bytes
-- `LobState` for 10 levels: ~400 bytes
+- `LobState`: ~560 bytes (stack-allocated, 20 levels max)
+  - Fixed arrays: 20×(8+4+8+4) = 480 bytes
+  - Temporal fields + metadata: ~80 bytes
 
 ---
 
@@ -658,46 +747,63 @@ if state.is_crossed() {
 
 ## 12. Integration with Feature Extractor
 
-### Typical Usage Pattern
+This library is designed to work with [feature-extractor-MBO-LOB](https://github.com/nagarx/feature-extractor-MBO-LOB). The feature extractor **uses this library internally** for LOB reconstruction.
+
+### Recommended: Use Feature Extractor Pipeline
+
+The feature extractor's `Pipeline` handles LOB reconstruction internally:
 
 ```rust
-use mbo_lob_reconstructor::{DbnLoader, LobReconstructor};
-use feature_extractor_mbo_lob::prelude::*;
+use feature_extractor::prelude::*;
 
-let loader = DbnLoader::new(path)?.skip_invalid(true);
-let mut lob = LobReconstructor::new(20);  // Match feature extractor levels
 let mut pipeline = PipelineBuilder::new()
-    .with_levels(20)
-    .with_preset(Preset::DeepLOB)
+    .with_levels(10)
+    .with_derived_features()
+    .window(100, 10)
     .build()?;
 
-for msg in loader.iter_messages()? {
-    let state = lob.process_message(&msg)?;
-    if state.is_valid() {
-        // Convert LobState to feature extractor's LobSnapshot
-        let snapshot = convert_state_to_snapshot(&state, msg.timestamp);
-        pipeline.process(snapshot)?;
-    }
-}
-
-let sequences = pipeline.finalize()?;
+// Pipeline internally uses LobReconstructor
+let output = pipeline.process("data/NVDA.mbo.dbn.zst")?;
 ```
 
-### State Conversion Helper
+### Advanced: Manual Integration with Zero-Copy API
+
+For custom processing or research, use the zero-allocation API:
 
 ```rust
-fn convert_state_to_snapshot(state: &LobState, timestamp: Option<i64>) -> LobSnapshot {
-    // Feature extractor expects same format
-    LobSnapshot {
-        bid_prices: state.bid_prices.clone(),
-        bid_sizes: state.bid_sizes.iter().map(|&s| s as u64).collect(),
-        ask_prices: state.ask_prices.clone(),
-        ask_sizes: state.ask_sizes.iter().map(|&s| s as u64).collect(),
-        timestamp: timestamp.unwrap_or(0) as u64,
-        levels: state.levels,
+use mbo_lob_reconstructor::{LobReconstructor, LobState, DbnLoader};
+
+// Create reconstructor and reusable state buffer
+let mut lob = LobReconstructor::new(10);
+let mut state = LobState::new(10);  // Stack-allocated, reused across all messages
+
+let loader = DbnLoader::new("data/NVDA.mbo.dbn.zst")?;
+
+for msg in loader.iter_messages()? {
+    // Zero-allocation: fills existing state buffer in-place
+    lob.process_message_into(&msg, &mut state)?;
+    
+    // Access temporal information
+    if let Some(delta_s) = state.delta_seconds() {
+        let intensity = state.event_intensity().unwrap_or(0.0);
+        // Use state.triggering_action, state.triggering_side, etc.
+    }
+    
+    // State is ready for feature extraction
+    if state.is_valid() {
+        // Extract features from state...
     }
 }
 ```
+
+### Key Integration Points
+
+| This Library Provides | Feature Extractor Consumes |
+|----------------------|---------------------------|
+| `LobState` with temporal fields | LOB features (prices, sizes, spread) |
+| `delta_ns`, `triggering_action` | Time-sensitive features (FI-2010 u6-u9) |
+| `is_trade_event()`, `is_add_event()` | Event type classification |
+| `microprice()`, `depth_imbalance()` | Derived microstructure features |
 
 ---
 
@@ -710,7 +816,7 @@ fn convert_state_to_snapshot(state: &LobState, timestamp: Option<i64>) -> LobSna
 | Single-threaded | `LobReconstructor` is not thread-safe |
 | No persistence | State is in-memory only |
 | Fixed precision | Prices are i64 fixed-point (9 decimal places) |
-| No order priority | Orders at same price have no queue priority |
+| Queue position separate | Use `QueuePositionTracker` for FIFO tracking (composable) |
 
 ### Edge Cases to Handle
 
@@ -732,18 +838,209 @@ fn convert_state_to_snapshot(state: &LobState, timestamp: Option<i64>) -> LobSna
 
 ---
 
+## 14. Composable Tracking Modules
+
+These modules are **standalone and composable** - they do NOT modify the core `LobReconstructor`. Each processes `MboMessage` independently and can be used alongside or without LOB reconstruction.
+
+### Design Philosophy
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        MboMessage Stream                             │
+└─────────────────────────────────────────────────────────────────────┘
+         │              │              │              │
+         ▼              ▼              ▼              ▼
+┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+│   LOB       │  │   Queue     │  │   Order     │  │   Trade     │
+│ Reconstruct │  │  Position   │  │  Lifecycle  │  │ Aggregator  │
+└─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘
+         │              │              │              │
+         ▼              ▼              ▼              ▼
+     LobState     QueuePosition    Lifecycle     Trade + Side
+```
+
+### QueuePositionTracker
+
+Tracks FIFO queue position of orders at each price level. Critical for execution probability models.
+
+```rust
+use mbo_lob_reconstructor::{QueuePositionTracker, QueuePositionConfig};
+
+let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
+
+for msg in messages {
+    tracker.process_message(&msg);
+    
+    // Query queue position for a specific order
+    if let Some(info) = tracker.queue_position(msg.order_id) {
+        println!("Order {} at position {} with {} volume ahead",
+                 msg.order_id, info.position, info.volume_ahead);
+    }
+}
+
+// Aggregate statistics
+let stats = tracker.stats();
+println!("Average queue depth: {:.2}", stats.avg_queue_depth());
+```
+
+**Key Methods:**
+- `queue_position(order_id) -> Option<QueuePositionInfo>`
+- `queue_at_price(price, side) -> Option<&IndexMap<u64, u32>>`
+- `recent_position_changes() -> &[PositionChange]` (if tracking enabled)
+
+### OrderLifecycleTracker
+
+Tracks orders through Add → Modify* → Cancel|Fill lifecycle.
+
+```rust
+use mbo_lob_reconstructor::{OrderLifecycleTracker, OrderLifecycleConfig, LifecycleEvent};
+
+let config = OrderLifecycleConfig::default();
+let mut tracker = OrderLifecycleTracker::new(config);
+
+for msg in messages {
+    if let Some(event) = tracker.process_message(&msg) {
+        match event {
+            LifecycleEvent::Created(lc) => {
+                println!("New order {} at ${:.2}", lc.order_id, lc.initial_price as f64 / 1e9);
+            }
+            LifecycleEvent::Modified { order_id, modification } => {
+                println!("Order {} modified: {:?}", order_id, modification);
+            }
+            LifecycleEvent::Completed(lc) => {
+                println!("Order {} completed in {:?}", lc.order_id, lc.time_alive_ns());
+            }
+        }
+    }
+}
+
+// Statistics
+let stats = tracker.stats();
+println!("Observed: {}, Inferred: {}", stats.observed_orders, stats.inferred_orders);
+
+// Active order features (for ML)
+let features = tracker.active_order_features();
+println!("Active orders: {}, Avg age: {:?}", features.count, features.avg_age_ns);
+```
+
+**Key Insight**: Handles mid-session data starts by inferring lifecycles for pre-existing orders (marked with `OrderOrigin::Inferred`).
+
+### DayBoundaryDetector
+
+Detects trading day boundaries for proper train/test splits and state resets.
+
+```rust
+use mbo_lob_reconstructor::{DayBoundaryDetector, DayBoundaryConfig};
+
+let config = DayBoundaryConfig::us_equity();  // 9:30 AM - 4:00 PM ET
+let mut detector = DayBoundaryDetector::new(config);
+
+for msg in messages {
+    if let Some(ts) = msg.timestamp {
+        if let Some(boundary) = detector.check_boundary(ts) {
+            println!("Day {} ended, day {} started",
+                     boundary.previous_day_index,
+                     boundary.new_day_index);
+            
+            // Reset your trackers here
+            lob.full_reset();
+            queue_tracker.reset();
+            lifecycle_tracker.reset();
+        }
+    }
+}
+
+// Query current day info
+let stats = detector.stats();
+println!("Day {}: {} messages", stats.current_day_index, stats.messages_in_current_day);
+```
+
+### TradeAggregator
+
+Aggregates fill events into trades with aggressor side detection.
+
+```rust
+use mbo_lob_reconstructor::{TradeAggregator, TradeAggregatorConfig};
+
+let mut aggregator = TradeAggregator::new(TradeAggregatorConfig::default());
+
+for msg in messages {
+    if let Some(trade) = aggregator.process_message(&msg) {
+        println!("Trade: {} shares @ ${:.2} (aggressor: {:?})",
+                 trade.size, trade.price as f64 / 1e9, trade.aggressor_side);
+    }
+}
+
+// Trade imbalance (buy pressure vs sell pressure)
+let imbalance = aggregator.trade_imbalance();  // Range: [-1.0, 1.0]
+println!("Buy pressure: {:.1}%", (imbalance + 1.0) / 2.0 * 100.0);
+
+// Recent trades for analysis
+for trade in aggregator.recent_trades() {
+    // ...
+}
+```
+
+**Aggressor Detection Logic:**
+- Trade against **bid** order → aggressor is **seller**
+- Trade against **ask** order → aggressor is **buyer**
+
+### Composing All Trackers
+
+```rust
+use mbo_lob_reconstructor::{
+    LobReconstructor, QueuePositionTracker, OrderLifecycleTracker,
+    DayBoundaryDetector, TradeAggregator,
+    QueuePositionConfig, OrderLifecycleConfig, DayBoundaryConfig, TradeAggregatorConfig,
+};
+
+// Initialize all trackers
+let mut lob = LobReconstructor::new(10);
+let mut queue_tracker = QueuePositionTracker::new(QueuePositionConfig::default());
+let mut lifecycle_tracker = OrderLifecycleTracker::new(OrderLifecycleConfig::default());
+let mut day_detector = DayBoundaryDetector::new(DayBoundaryConfig::us_equity());
+let mut trade_aggregator = TradeAggregator::new(TradeAggregatorConfig::default());
+
+// Process messages through all trackers
+for msg in messages {
+    // Check for day boundary first
+    if let Some(ts) = msg.timestamp {
+        if let Some(_boundary) = day_detector.check_boundary(ts) {
+            lob.full_reset();
+            queue_tracker.reset();
+            lifecycle_tracker.reset();
+            trade_aggregator.reset();
+        }
+    }
+    
+    // Process through each tracker
+    let state = lob.process_message(&msg)?;
+    queue_tracker.process_message(&msg);
+    lifecycle_tracker.process_message(&msg);
+    trade_aggregator.process_message(&msg);
+    
+    // Now you have:
+    // - state: LobState with temporal fields
+    // - queue_tracker.queue_position(order_id): Queue position info
+    // - lifecycle_tracker.get_lifecycle(order_id): Order lifecycle
+    // - trade_aggregator.trade_imbalance(): Buy/sell pressure
+}
+```
+
+---
+
 ## Quick Reference
 
 ### Imports for Common Tasks
 
 ```rust
 // Basic reconstruction
-use mbo_lob_reconstructor::{LobReconstructor, MboMessage, Action, Side};
+use mbo_lob_reconstructor::{LobReconstructor, MboMessage, LobState, Action, Side};
 
 // With configuration
 use mbo_lob_reconstructor::{LobReconstructor, LobConfig, CrossedQuotePolicy};
 
-// File loading
+// File loading (requires "databento" feature)
 use mbo_lob_reconstructor::{DbnLoader, is_valid_order};
 
 // Statistics
@@ -754,6 +1051,18 @@ use mbo_lob_reconstructor::{DepthStats, MarketImpact, LiquidityMetrics};
 
 // Warnings
 use mbo_lob_reconstructor::{WarningTracker, WarningCategory, Warning};
+
+// Queue Position Tracking
+use mbo_lob_reconstructor::{QueuePositionTracker, QueuePositionConfig, QueuePositionInfo};
+
+// Order Lifecycle Tracking
+use mbo_lob_reconstructor::{OrderLifecycleTracker, OrderLifecycleConfig, OrderLifecycle, LifecycleEvent};
+
+// Day Boundary Detection
+use mbo_lob_reconstructor::{DayBoundaryDetector, DayBoundaryConfig, DayBoundary};
+
+// Trade Aggregation
+use mbo_lob_reconstructor::{TradeAggregator, TradeAggregatorConfig, Trade, Fill};
 ```
 
 ### Price Conversion
@@ -784,6 +1093,6 @@ lob.stats().total_warnings()
 
 ---
 
-*Last updated: 2025-02-03*
+*Last updated: 2025-12-19*
 *Crate version: 0.1.0*
 

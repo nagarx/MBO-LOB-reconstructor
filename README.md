@@ -11,11 +11,21 @@ Convert Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshots
 
 - **High Performance**: Process approximately 1M messages/second on modern hardware
 - **MBO to LOB Reconstruction**: Convert order-level events to aggregated price levels
+- **Temporal Fields**: Time delta, triggering action/side for time-sensitive features (FI-2010 u6-u9)
 - **Enriched Analytics**: Microprice, VWAP, depth imbalance, spread metrics
 - **Book Consistency Validation**: Detect and handle crossed/locked quotes
 - **Statistics Tracking**: Per-day statistics with Welford's algorithm for normalization
 - **ML-Ready**: NormalizationParams, DayStats, and feature extraction utilities
 - **Databento Support**: Native support for compressed DBN files (.dbn.zst)
+
+### Composable Tracking Modules
+
+Additional standalone modules that can be used alongside LOB reconstruction:
+
+- **Queue Position Tracking**: FIFO queue position, volume ahead (for execution probability)
+- **Order Lifecycle Tracking**: Track orders through Add→Modify→Cancel/Fill lifecycle
+- **Day Boundary Detection**: Automatic trading day detection for train/test splits
+- **Trade Aggregation**: Aggregate fills into trades with aggressor side detection
 
 ## Feature Flags
 
@@ -188,6 +198,63 @@ println!("Spread: {:.2} bps", metrics.spread_bps);
 println!("Book pressure: {:.4}", metrics.book_pressure());
 ```
 
+## Composable Tracking Modules
+
+These modules are **standalone** - they process `MboMessage` independently and can be used alongside or without LOB reconstruction.
+
+### Queue Position Tracking
+
+```rust
+use mbo_lob_reconstructor::{QueuePositionTracker, QueuePositionConfig};
+
+let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
+
+for msg in messages {
+    tracker.process_message(&msg);
+    
+    if let Some(info) = tracker.queue_position(msg.order_id) {
+        println!("Order {} at position {} with {} volume ahead",
+                 msg.order_id, info.position, info.volume_ahead);
+    }
+}
+```
+
+### Order Lifecycle Tracking
+
+```rust
+use mbo_lob_reconstructor::{OrderLifecycleTracker, OrderLifecycleConfig, LifecycleEvent};
+
+let mut tracker = OrderLifecycleTracker::new(OrderLifecycleConfig::default());
+
+for msg in messages {
+    if let Some(event) = tracker.process_message(&msg) {
+        match event {
+            LifecycleEvent::Created(lc) => println!("New order: {}", lc.order_id),
+            LifecycleEvent::Completed(lc) => println!("Order {} done in {:?}", lc.order_id, lc.time_alive_ns()),
+            _ => {}
+        }
+    }
+}
+```
+
+### Trade Aggregation with Aggressor Detection
+
+```rust
+use mbo_lob_reconstructor::{TradeAggregator, TradeAggregatorConfig};
+
+let mut aggregator = TradeAggregator::new(TradeAggregatorConfig::default());
+
+for msg in messages {
+    if let Some(trade) = aggregator.process_message(&msg) {
+        println!("Trade: {} @ ${:.2} (aggressor: {:?})",
+                 trade.size, trade.price as f64 / 1e9, trade.aggressor_side);
+    }
+}
+
+// Buy vs sell pressure
+let imbalance = aggregator.trade_imbalance();  // [-1.0, 1.0]
+```
+
 ## Handling Crossed Quotes
 
 ```rust
@@ -223,6 +290,19 @@ The `LobState` struct provides rich analytics:
 | `total_bid_volume()` / `total_ask_volume()` | Total volume per side |
 | `active_bid_levels()` / `active_ask_levels()` | Count of non-empty levels |
 | `check_consistency()` | Book state: Valid, Empty, Crossed, Locked |
+
+### Temporal Fields (FI-2010 u6-u9)
+
+| Field/Method | Description |
+|--------------|-------------|
+| `delta_ns` | Time since last LOB update (nanoseconds) |
+| `delta_seconds()` | Time delta in seconds |
+| `event_intensity()` | Events per second (1/Δt) |
+| `triggering_action` | Action that caused this state (Add, Cancel, Trade, etc.) |
+| `triggering_side` | Side affected (Bid, Ask) |
+| `is_trade_event()` | Check if triggered by Trade/Fill |
+| `is_add_event()` | Check if triggered by Add |
+| `is_cancel_event()` | Check if triggered by Cancel |
 
 ## Statistics for ML Normalization
 
@@ -273,13 +353,19 @@ mbo_lob_reconstructor/
     types.rs          # Core types: MboMessage, LobState, Action, Side, MAX_LOB_LEVELS
     error.rs          # Error types and Result alias
     lob/
-        reconstructor.rs  # LobReconstructor, process_message_into()
-        price_level.rs    # PriceLevel with O(1) size caching
-        multi_symbol.rs   # Multi-symbol support
+        reconstructor.rs    # LobReconstructor, process_message_into()
+        price_level.rs      # PriceLevel with O(1) size caching
+        multi_symbol.rs     # Multi-symbol support
+        queue_position.rs   # QueuePositionTracker (FIFO tracking)
+        order_lifecycle.rs  # OrderLifecycleTracker (Add→Modify→Cancel/Fill)
+        day_boundary.rs     # DayBoundaryDetector (trading day detection)
+        trade_aggregator.rs # TradeAggregator (fills→trades, aggressor side)
+    source.rs         # MarketDataSource trait, DbnSource, VecSource
     dbn_bridge.rs     # Databento format conversion
     loader.rs         # DBN file streaming (zero-copy message iteration)
     statistics.rs     # DayStats, RunningStats, NormalizationParams
     analytics.rs      # DepthStats, MarketImpact, LiquidityMetrics
+    warnings.rs       # WarningTracker, WarningCategory
 ```
 
 ### Key Optimizations
