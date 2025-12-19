@@ -1575,7 +1575,7 @@ fn test_temporal_fields_with_real_nvidia_data() {
 
             // Verify delta calculation
             if let (Some(current_ts), Some(prev_ts)) = (state.timestamp, prev_timestamp) {
-                let expected_delta = if current_ts > prev_ts {
+                let _expected_delta = if current_ts > prev_ts {
                     (current_ts - prev_ts) as u64
                 } else {
                     0
