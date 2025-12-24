@@ -27,3 +27,10 @@ Thumbs.db
 *.profdata
 /coverage/
 
+# AI assistant working files
+CLAUDE.md
+RULE.md
+
+# Stale documentation copies (canonical version in feature-extractor docs/)
+full-data-pipeline.md
+
