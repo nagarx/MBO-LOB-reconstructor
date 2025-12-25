@@ -718,7 +718,7 @@ impl LobReconstructor {
         } else {
             // Partial cancel - reduce size (updates total_size via reduce_order)
             price_level.reduce_order(msg.order_id, msg.size);
-            order.size -= msg.size;
+            order.size = order.size.saturating_sub(msg.size);
             self.orders.insert(msg.order_id, order);
         }
 
@@ -819,7 +819,7 @@ impl LobReconstructor {
         } else {
             // Partial fill - reduce size (updates total_size via reduce_order)
             price_level.reduce_order(msg.order_id, msg.size);
-            order.size -= msg.size;
+            order.size = order.size.saturating_sub(msg.size);
             self.orders.insert(msg.order_id, order);
         }
 
@@ -1788,6 +1788,85 @@ mod tests {
         .unwrap();
 
         assert_eq!(lob.order_count(), 0);
+    }
+
+    // =========================================================================
+    // Saturating Subtraction Tests (Defensive Programming)
+    // =========================================================================
+    // These tests document the defensive use of saturating_sub in partial
+    // cancel and trade operations. While normal operation should never cause
+    // underflow (the msg.size >= order.size check prevents it), saturating_sub
+    // provides a safety net against potential data inconsistencies between
+    // Order and PriceLevel tracking.
+
+    #[test]
+    fn test_partial_cancel_size_reduction() {
+        // Test that partial cancel correctly reduces order size
+        let mut lob = LobReconstructor::new(10);
+
+        // Add order with 100 shares
+        lob.process_message(&create_test_message(1, Action::Add, Side::Bid, 100.0, 100))
+            .unwrap();
+
+        // Partial cancel of 30 shares
+        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 30))
+            .unwrap();
+
+        // Order should have 70 shares remaining
+        assert_eq!(lob.order_count(), 1);
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 70);
+
+        // Partial cancel of 40 more shares
+        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 40))
+            .unwrap();
+
+        // Order should have 30 shares remaining
+        assert_eq!(lob.order_count(), 1);
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 30);
+    }
+
+    #[test]
+    fn test_partial_trade_size_reduction() {
+        // Test that partial trade (fill) correctly reduces order size
+        let mut lob = LobReconstructor::new(10);
+
+        // Add order with 100 shares
+        lob.process_message(&create_test_message(1, Action::Add, Side::Ask, 100.0, 100))
+            .unwrap();
+
+        // Partial fill of 25 shares
+        lob.process_message(&create_test_message(1, Action::Trade, Side::Ask, 100.0, 25))
+            .unwrap();
+
+        // Order should have 75 shares remaining
+        assert_eq!(lob.order_count(), 1);
+        assert_eq!(lob.get_lob_state().ask_sizes[0], 75);
+
+        // Partial fill of 50 more shares
+        lob.process_message(&create_test_message(1, Action::Trade, Side::Ask, 100.0, 50))
+            .unwrap();
+
+        // Order should have 25 shares remaining
+        assert_eq!(lob.order_count(), 1);
+        assert_eq!(lob.get_lob_state().ask_sizes[0], 25);
+    }
+
+    #[test]
+    fn test_over_trade_removes_order() {
+        // Test that trading more than order size removes the order cleanly
+        // (analogous to test_over_cancel_removes_order)
+        let mut lob = LobReconstructor::new(10);
+
+        // Add order with 50 shares
+        lob.process_message(&create_test_message(1, Action::Add, Side::Ask, 100.0, 50))
+            .unwrap();
+
+        // Trade more than exists (100 > 50) - should remove entirely
+        lob.process_message(&create_test_message(1, Action::Trade, Side::Ask, 100.0, 100))
+            .unwrap();
+
+        assert_eq!(lob.order_count(), 0);
+        assert_eq!(lob.ask_levels(), 0);
     }
 
     // =========================================================================
