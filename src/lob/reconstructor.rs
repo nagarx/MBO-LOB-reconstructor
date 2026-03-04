@@ -8,6 +8,7 @@
 //! - Minimal allocations on hot path
 
 use ahash::AHashMap;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::error::{Result, TlobError};
@@ -152,7 +153,7 @@ pub struct LobReconstructor {
 }
 
 /// Statistics for monitoring LOB health.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LobStats {
     /// Total messages processed (excludes system messages if skip_system_messages=true)
     pub messages_processed: u64,
@@ -232,65 +233,15 @@ impl LobStats {
 
     /// Export stats to JSON file.
     pub fn export_to_file(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
-        use std::io::Write;
         let file = std::fs::File::create(path)?;
-        let mut writer = std::io::BufWriter::new(file);
+        let writer = std::io::BufWriter::new(file);
+        serde_json::to_writer_pretty(writer, self).map_err(std::io::Error::other)
+    }
 
-        writeln!(writer, "{{")?;
-        writeln!(
-            writer,
-            "  \"messages_processed\": {},",
-            self.messages_processed
-        )?;
-        writeln!(writer, "  \"active_orders\": {},", self.active_orders)?;
-        writeln!(writer, "  \"bid_levels\": {},", self.bid_levels)?;
-        writeln!(writer, "  \"ask_levels\": {},", self.ask_levels)?;
-        writeln!(writer, "  \"errors\": {},", self.errors)?;
-        writeln!(writer, "  \"crossed_quotes\": {},", self.crossed_quotes)?;
-        writeln!(writer, "  \"locked_quotes\": {},", self.locked_quotes)?;
-        writeln!(
-            writer,
-            "  \"last_timestamp\": {},",
-            self.last_timestamp.unwrap_or(0)
-        )?;
-        writeln!(writer, "  \"warnings\": {{")?;
-        writeln!(
-            writer,
-            "    \"cancel_order_not_found\": {},",
-            self.cancel_order_not_found
-        )?;
-        writeln!(
-            writer,
-            "    \"cancel_price_level_missing\": {},",
-            self.cancel_price_level_missing
-        )?;
-        writeln!(
-            writer,
-            "    \"cancel_order_at_level_missing\": {},",
-            self.cancel_order_at_level_missing
-        )?;
-        writeln!(
-            writer,
-            "    \"trade_order_not_found\": {},",
-            self.trade_order_not_found
-        )?;
-        writeln!(
-            writer,
-            "    \"trade_price_level_missing\": {},",
-            self.trade_price_level_missing
-        )?;
-        writeln!(
-            writer,
-            "    \"trade_order_at_level_missing\": {},",
-            self.trade_order_at_level_missing
-        )?;
-        writeln!(writer, "    \"total\": {}", self.total_warnings())?;
-        writeln!(writer, "  }},")?;
-        writeln!(writer, "  \"book_clears\": {},", self.book_clears)?;
-        writeln!(writer, "  \"noop_messages\": {}", self.noop_messages)?;
-        writeln!(writer, "}}")?;
-
-        writer.flush()
+    /// Load stats from a JSON file.
+    pub fn load_from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let json = std::fs::read_to_string(path)?;
+        serde_json::from_str(&json).map_err(std::io::Error::other)
     }
 }
 
@@ -466,9 +417,13 @@ impl LobReconstructor {
     fn track_consistency(&mut self, consistency: BookConsistency) {
         match consistency {
             BookConsistency::Valid => {
-                // Update last valid state
-                let state = self.get_lob_state();
-                self.last_valid_state = Some(state);
+                if matches!(
+                    self.config.crossed_quote_policy,
+                    CrossedQuotePolicy::UseLastValid | CrossedQuotePolicy::SkipUpdate
+                ) {
+                    let state = self.get_lob_state();
+                    self.last_valid_state = Some(state);
+                }
             }
             BookConsistency::Crossed => {
                 self.stats.crossed_quotes += 1;
@@ -2365,5 +2320,204 @@ mod tests {
 
         // Verify correctness
         assert!(state.best_bid.is_some() || state.best_ask.is_some());
+    }
+
+    // =========================================================================
+    // LobStats serialization tests
+    // =========================================================================
+
+    #[test]
+    fn test_lobstats_export_roundtrip() {
+        let stats = LobStats {
+            messages_processed: 1_000_000,
+            system_messages_skipped: 42,
+            active_orders: 500,
+            bid_levels: 10,
+            ask_levels: 10,
+            errors: 3,
+            crossed_quotes: 7,
+            locked_quotes: 2,
+            last_timestamp: Some(1_700_000_000_000_000_000),
+            cancel_order_not_found: 15,
+            cancel_price_level_missing: 4,
+            cancel_order_at_level_missing: 1,
+            trade_order_not_found: 20,
+            trade_price_level_missing: 5,
+            trade_order_at_level_missing: 2,
+            book_clears: 1,
+            noop_messages: 100,
+        };
+
+        let dir = std::env::temp_dir().join("lobstats_roundtrip_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stats.json");
+
+        stats.export_to_file(&path).unwrap();
+        let loaded = LobStats::load_from_file(&path).unwrap();
+
+        assert_eq!(loaded.messages_processed, 1_000_000);
+        assert_eq!(loaded.system_messages_skipped, 42);
+        assert_eq!(loaded.active_orders, 500);
+        assert_eq!(loaded.bid_levels, 10);
+        assert_eq!(loaded.ask_levels, 10);
+        assert_eq!(loaded.errors, 3);
+        assert_eq!(loaded.crossed_quotes, 7);
+        assert_eq!(loaded.locked_quotes, 2);
+        assert_eq!(loaded.last_timestamp, Some(1_700_000_000_000_000_000));
+        assert_eq!(loaded.cancel_order_not_found, 15);
+        assert_eq!(loaded.cancel_price_level_missing, 4);
+        assert_eq!(loaded.cancel_order_at_level_missing, 1);
+        assert_eq!(loaded.trade_order_not_found, 20);
+        assert_eq!(loaded.trade_price_level_missing, 5);
+        assert_eq!(loaded.trade_order_at_level_missing, 2);
+        assert_eq!(loaded.book_clears, 1);
+        assert_eq!(loaded.noop_messages, 100);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_lobstats_export_empty() {
+        let stats = LobStats::default();
+
+        let dir = std::env::temp_dir().join("lobstats_empty_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stats_empty.json");
+
+        stats.export_to_file(&path).unwrap();
+
+        let json_str = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(parsed["messages_processed"], 0);
+        assert_eq!(parsed["errors"], 0);
+        assert_eq!(parsed["book_clears"], 0);
+        assert_eq!(parsed["noop_messages"], 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_lobstats_export_null_timestamp() {
+        let stats = LobStats {
+            last_timestamp: None,
+            ..LobStats::default()
+        };
+
+        let dir = std::env::temp_dir().join("lobstats_null_ts_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stats_null_ts.json");
+
+        stats.export_to_file(&path).unwrap();
+
+        let json_str = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        assert!(parsed["last_timestamp"].is_null(), "None should serialize as null, got: {}", parsed["last_timestamp"]);
+
+        let loaded = LobStats::load_from_file(&path).unwrap();
+        assert_eq!(loaded.last_timestamp, None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // =========================================================================
+    // track_consistency policy optimization tests
+    // =========================================================================
+
+    #[test]
+    fn test_allow_policy_no_last_valid_state() {
+        let config = LobConfig {
+            levels: 10,
+            crossed_quote_policy: CrossedQuotePolicy::Allow,
+            ..LobConfig::default()
+        };
+        let mut lob = LobReconstructor::with_config(config);
+
+        let bid = create_test_message(1, Action::Add, Side::Bid, 100.0, 100);
+        lob.process_message(&bid).unwrap();
+        let ask = create_test_message(2, Action::Add, Side::Ask, 101.0, 200);
+        lob.process_message(&ask).unwrap();
+
+        // With Allow policy, last_valid_state is never populated.
+        // Force a crossed state by adding a bid above the ask.
+        let cross_bid = create_test_message(3, Action::Add, Side::Bid, 102.0, 50);
+        let state = lob.process_message(&cross_bid).unwrap();
+
+        // Allow policy returns the crossed state as-is
+        assert!(state.is_crossed(), "state should be crossed");
+        assert_eq!(state.best_bid, Some(102_000_000_000));
+        assert_eq!(state.best_ask, Some(101_000_000_000));
+    }
+
+    #[test]
+    fn test_use_last_valid_policy_stores_state() {
+        let config = LobConfig {
+            levels: 10,
+            crossed_quote_policy: CrossedQuotePolicy::UseLastValid,
+            ..LobConfig::default()
+        };
+        let mut lob = LobReconstructor::with_config(config);
+
+        // Build a valid book
+        let bid = create_test_message(1, Action::Add, Side::Bid, 100.0, 100);
+        lob.process_message(&bid).unwrap();
+        let ask = create_test_message(2, Action::Add, Side::Ask, 101.0, 200);
+        let valid_state = lob.process_message(&ask).unwrap();
+
+        assert!(valid_state.is_valid(), "book should be valid before crossing");
+
+        // Cross the book
+        let cross_bid = create_test_message(3, Action::Add, Side::Bid, 102.0, 50);
+        let crossed_result = lob.process_message(&cross_bid).unwrap();
+
+        // UseLastValid should return the previous valid state
+        assert!(
+            !crossed_result.is_crossed(),
+            "UseLastValid policy should return a non-crossed state"
+        );
+        assert_eq!(
+            crossed_result.best_bid,
+            Some(100_000_000_000),
+            "should return the last valid bid"
+        );
+        assert_eq!(
+            crossed_result.best_ask,
+            Some(101_000_000_000),
+            "should return the last valid ask"
+        );
+    }
+
+    #[test]
+    fn test_skip_update_policy_stores_state() {
+        let config = LobConfig {
+            levels: 10,
+            crossed_quote_policy: CrossedQuotePolicy::SkipUpdate,
+            ..LobConfig::default()
+        };
+        let mut lob = LobReconstructor::with_config(config);
+
+        // Build a valid book
+        let bid = create_test_message(1, Action::Add, Side::Bid, 100.0, 100);
+        lob.process_message(&bid).unwrap();
+        let ask = create_test_message(2, Action::Add, Side::Ask, 101.0, 200);
+        let valid_state = lob.process_message(&ask).unwrap();
+
+        assert!(valid_state.is_valid(), "book should be valid before crossing");
+
+        // Cross the book
+        let cross_bid = create_test_message(3, Action::Add, Side::Bid, 102.0, 50);
+        let result = lob.process_message(&cross_bid).unwrap();
+
+        // SkipUpdate should return the previous valid state
+        assert!(
+            !result.is_crossed(),
+            "SkipUpdate policy should return a non-crossed state"
+        );
+        assert_eq!(
+            result.best_bid,
+            Some(100_000_000_000),
+            "should return the last valid bid"
+        );
     }
 }

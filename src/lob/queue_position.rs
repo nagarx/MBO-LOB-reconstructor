@@ -462,18 +462,16 @@ impl QueuePositionTracker {
                 };
 
                 if let Some(level) = levels.get_mut(&msg.price) {
-                    // Remove and re-add to update size but keep position
-                    if let Some(_old_size) = level.orders.get_mut(&msg.order_id) {
-                        // Update size in place (preserves position)
-                        let old_size = *level.orders.get(&msg.order_id).unwrap();
-                        if msg.size > old_size {
-                            level.total_volume += (msg.size - old_size) as u64;
+                    if let Some(current_size) = level.orders.get_mut(&msg.order_id) {
+                        let old = *current_size;
+                        *current_size = msg.size;
+                        if msg.size > old {
+                            level.total_volume += (msg.size - old) as u64;
                         } else {
                             level.total_volume = level
                                 .total_volume
-                                .saturating_sub((old_size - msg.size) as u64);
+                                .saturating_sub((old - msg.size) as u64);
                         }
-                        *level.orders.get_mut(&msg.order_id).unwrap() = msg.size;
                     }
                 }
             }
@@ -1249,5 +1247,64 @@ mod tests {
         assert_eq!(changes[1].reason, PositionChangeReason::Removed);
         assert!(changes[1].old_position.is_some());
         assert_eq!(changes[1].new_position, None);
+    }
+
+    // =========================================================================
+    // Same-price modify tests (Fix 2)
+    // =========================================================================
+
+    #[test]
+    fn test_modify_same_price_updates_volume() {
+        let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
+
+        let add = make_msg(1, Action::Add, Side::Bid, 100_000_000_000, 100, 1000);
+        tracker.process_message(&add);
+
+        let add2 = make_msg(2, Action::Add, Side::Bid, 100_000_000_000, 200, 2000);
+        tracker.process_message(&add2);
+
+        // Increase size of order 1 (same price)
+        let modify_up = make_msg(1, Action::Modify, Side::Bid, 100_000_000_000, 300, 3000);
+        tracker.process_message(&modify_up);
+
+        let pos1 = tracker.queue_position(1).unwrap();
+        assert_eq!(pos1.order_size, 300, "order size should be updated to 300");
+        assert_eq!(pos1.total_level_volume, 500, "total volume should be 300+200=500");
+
+        // Decrease size of order 2 (same price)
+        let modify_down = make_msg(2, Action::Modify, Side::Bid, 100_000_000_000, 50, 4000);
+        tracker.process_message(&modify_down);
+
+        let pos2 = tracker.queue_position(2).unwrap();
+        assert_eq!(pos2.order_size, 50, "order size should be updated to 50");
+        assert_eq!(pos2.total_level_volume, 350, "total volume should be 300+50=350");
+    }
+
+    #[test]
+    fn test_modify_same_price_preserves_position() {
+        let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
+
+        let add1 = make_msg(1, Action::Add, Side::Ask, 200_000_000_000, 100, 1000);
+        tracker.process_message(&add1);
+
+        let add2 = make_msg(2, Action::Add, Side::Ask, 200_000_000_000, 200, 2000);
+        tracker.process_message(&add2);
+
+        let add3 = make_msg(3, Action::Add, Side::Ask, 200_000_000_000, 300, 3000);
+        tracker.process_message(&add3);
+
+        // Modify order 1 at same price -- FIFO position must not change
+        let modify = make_msg(1, Action::Modify, Side::Ask, 200_000_000_000, 500, 4000);
+        tracker.process_message(&modify);
+
+        let pos1 = tracker.queue_position(1).unwrap();
+        assert_eq!(pos1.position, 0, "FIFO position must be preserved on same-price modify");
+        assert_eq!(pos1.volume_ahead, 0, "no volume ahead of first order");
+
+        let pos2 = tracker.queue_position(2).unwrap();
+        assert_eq!(pos2.position, 1, "order 2 position unchanged");
+
+        let pos3 = tracker.queue_position(3).unwrap();
+        assert_eq!(pos3.position, 2, "order 3 position unchanged");
     }
 }

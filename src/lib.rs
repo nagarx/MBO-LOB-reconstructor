@@ -141,12 +141,14 @@
 //! | [`loader`] | DBN file loading (requires `databento` feature) |
 //! | [`dbn_bridge`] | Databento format conversion (requires `databento` feature) |
 //! | [`warnings`] | Warning tracking: `WarningTracker`, `Warning`, `WarningCategory` |
+//! | [`export`] | Parquet export for raw LOB/MBO data (requires `export` feature) |
 //!
 //! ## Feature Flags
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
 //! | `databento` | ✅ | Enable Databento DBN file support |
+//! | `export` | ❌ | Enable Apache Parquet export for LOB snapshots and MBO events |
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -169,6 +171,10 @@ pub mod hotstore;
 #[cfg(feature = "databento")]
 #[cfg_attr(docsrs, doc(cfg(feature = "databento")))]
 pub mod loader;
+
+#[cfg(feature = "export")]
+#[cfg_attr(docsrs, doc(cfg(feature = "export")))]
+pub mod export;
 
 // Re-exports - Core types
 pub use error::{Result, TlobError};
@@ -221,3 +227,7 @@ pub use hotstore::{HotStoreConfig, HotStoreManager};
 
 #[cfg(feature = "databento")]
 pub use loader::{is_valid_order, DbnLoader, LoaderStats, IO_BUFFER_SIZE};
+
+// Re-exports - Parquet export (feature-gated)
+#[cfg(feature = "export")]
+pub use export::{ExportConfig, LobSnapshotWriter, MboEventWriter, ParquetExportStats};

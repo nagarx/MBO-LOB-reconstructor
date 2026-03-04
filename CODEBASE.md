@@ -20,6 +20,7 @@
 12. [Integration with Feature Extractor](#12-integration-with-feature-extractor)
 13. [Known Limitations and Edge Cases](#13-known-limitations-and-edge-cases)
 14. [Composable Tracking Modules](#14-composable-tracking-modules)
+15. [Parquet Export Module](#15-parquet-export-module-feature-export)
 
 ---
 
@@ -62,6 +63,12 @@ src/
 │   ├── trade_aggregator.rs # TradeAggregator, Trade, Fill
 │   ├── order_lifecycle.rs # OrderLifecycleTracker, OrderLifecycle
 │   └── queue_position.rs # QueuePositionTracker (FIFO with IndexMap)
+├── export/             # Parquet export (requires `export` feature)
+│   ├── mod.rs          # ExportConfig, DownsampleConfig, DownsampleStrategy
+│   ├── schema.rs       # Arrow schemas for LOB snapshots & MBO events
+│   ├── lob_writer.rs   # LobSnapshotWriter: LobState → Parquet rows
+│   ├── mbo_writer.rs   # MboEventWriter: MboMessage → Parquet rows
+│   └── batch.rs        # Column-oriented batching (LobBatch, MboBatch)
 ├── source.rs           # MarketDataSource trait, DbnSource, VecSource
 ├── hotstore.rs         # HotStoreConfig, HotStoreManager
 ├── loader.rs           # DbnLoader for file I/O (auto-detects compression)
@@ -70,7 +77,8 @@ src/
 ├── analytics.rs        # DepthStats, MarketImpact, LiquidityMetrics
 ├── warnings.rs         # WarningTracker, WarningCategory
 └── bin/
-    └── decompress_to_hot_store.rs  # CLI tool for hot store population
+    ├── decompress_to_hot_store.rs  # CLI tool for hot store population
+    └── export_to_parquet.rs        # CLI tool for DBN → Parquet export
 ```
 
 ---
@@ -1090,6 +1098,116 @@ state.is_locked()     // bid == ask (unusual)
 lob.stats().has_warnings()
 lob.stats().total_warnings()
 ```
+
+---
+
+## 15. Parquet Export Module (feature: `export`)
+
+### Overview
+
+The `export` module provides a feature-gated Parquet export for raw LOB snapshots and MBO events. It writes data that has **not** been transformed by sampling, normalization, or labeling, making it suitable for unbiased statistical analysis in the `raw-lob-analyzer` Python repository.
+
+### Dependencies
+
+- `arrow = "55"` and `parquet = "55"` (MSRV 1.81, compatible with this project's `rust-version = "1.82"`)
+- Feature-gated: only compiled when `--features export` is specified
+
+### Module Structure
+
+| File | Purpose |
+|------|---------|
+| `export/mod.rs` | `ExportConfig`, `DownsampleConfig`, `DownsampleStrategy`, `ParquetExportStats` |
+| `export/schema.rs` | `lob_snapshot_schema()`, `mbo_event_schema()` — single source of truth for column definitions |
+| `export/batch.rs` | `LobBatch`, `MboBatch` — column-oriented buffers that convert to Arrow `RecordBatch` |
+| `export/lob_writer.rs` | `LobSnapshotWriter` — buffers `LobState` and writes Parquet row groups |
+| `export/mbo_writer.rs` | `MboEventWriter` — buffers `MboMessage` and writes Parquet row groups |
+| `bin/export_to_parquet.rs` | CLI binary for batch DBN-to-Parquet conversion |
+
+### LOB Snapshot Schema
+
+| Column | Type | Nullable | Description |
+|--------|------|----------|-------------|
+| `timestamp_ns` | Int64 | No | Nanoseconds since epoch |
+| `sequence` | UInt64 | No | Message sequence number |
+| `levels` | UInt8 | No | Active level count |
+| `best_bid` | Int64 | Yes | Best bid in nanodollars |
+| `best_ask` | Int64 | Yes | Best ask in nanodollars |
+| `bid_prices` | FixedSizeList(Int64, N) | No | Bid prices per level |
+| `bid_sizes` | FixedSizeList(UInt32, N) | No | Bid sizes per level |
+| `ask_prices` | FixedSizeList(Int64, N) | No | Ask prices per level |
+| `ask_sizes` | FixedSizeList(UInt32, N) | No | Ask sizes per level |
+| `delta_ns` | UInt64 | No | Nanoseconds since previous update |
+| `triggering_action` | UInt8 | Yes | Action enum byte |
+| `triggering_side` | UInt8 | Yes | Side enum byte |
+| `mid_price` | Float64 | Yes | Derived: (bid+ask)/2 in dollars |
+| `spread` | Float64 | Yes | Derived: ask-bid in dollars |
+| `spread_bps` | Float64 | Yes | Derived: spread in basis points |
+| `microprice` | Float64 | Yes | Derived: volume-weighted mid |
+| `total_bid_volume` | UInt64 | No | Derived: sum of bid sizes |
+| `total_ask_volume` | UInt64 | No | Derived: sum of ask sizes |
+| `depth_imbalance` | Float64 | Yes | Derived: (bid_vol-ask_vol)/(bid_vol+ask_vol) |
+| `book_consistency` | UInt8 | No | Derived: 0=Valid, 1=Empty, 2=Locked, 3=Crossed |
+
+Derived columns are included when `ExportConfig::include_derived = true` (default).
+
+### MBO Event Schema
+
+| Column | Type | Nullable |
+|--------|------|----------|
+| `timestamp_ns` | Int64 | Yes |
+| `order_id` | UInt64 | No |
+| `action` | UInt8 | No |
+| `side` | UInt8 | No |
+| `price` | Int64 | No |
+| `size` | UInt32 | No |
+
+### File Metadata
+
+Both Parquet files embed key-value metadata in the footer:
+
+- `schema_version`: "1.0"
+- `source`: "mbo-lob-reconstructor"
+- `reconstructor_version`: from Cargo.toml
+- `price_unit`: "nanodollars"
+- `size_unit`: "shares"
+- `timestamp_unit`: "nanoseconds_since_epoch"
+- `lob_levels`: (LOB files only) number of exported levels
+- `date`, `symbol`: when provided via extra metadata
+
+### Configuration
+
+```rust
+ExportConfig {
+    levels: usize,              // LOB levels (default: 10, max: 20)
+    include_derived: bool,       // mid_price, spread, etc. (default: true)
+    include_mbo_events: bool,    // also export MBO events (default: true)
+    batch_size: usize,           // rows per row group (default: 65536)
+    compression: Compression,    // Snappy (default) or Uncompressed
+    downsample: Option<DownsampleConfig>,
+}
+```
+
+### Downsampling Strategies
+
+| Strategy | Description |
+|----------|-------------|
+| `DownsampleStrategy::None` | Export every snapshot |
+| `DownsampleStrategy::EveryN(n)` | Export every N-th snapshot |
+| `DownsampleStrategy::MinIntervalNs(ns)` | At most one snapshot per N nanoseconds |
+
+### Data Volume Estimates (NVDA, per day)
+
+| Dataset | Rows | Uncompressed | Snappy |
+|---------|------|-------------|--------|
+| MBO events | ~7M | ~392 MB | ~80-120 MB |
+| LOB snapshots (all) | ~7M | ~2.8 GB | ~400-600 MB |
+| LOB snapshots (EveryN(100)) | ~70K | ~28 MB | ~6 MB |
+
+### Testing
+
+45 tests cover the export module:
+- 10 inline unit tests in `schema.rs` (schema construction, metadata, nullability)
+- 35 integration tests in `tests/export_test.rs` (round-trip, edge cases, batching, downsampling, metadata, numerical precision)
 
 ---
 

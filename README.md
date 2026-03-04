@@ -32,6 +32,7 @@ Additional standalone modules that can be used alongside LOB reconstruction:
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `databento` | Yes | Enable Databento DBN file support |
+| `export` | No | Enable Apache Parquet export for raw LOB snapshots and MBO events |
 
 ## Quick Start
 
@@ -346,6 +347,64 @@ let normalized = params.normalize(value, feature_idx);
 let denormalized = params.denormalize(normalized, feature_idx);
 ```
 
+## Parquet Export (feature: `export`)
+
+Export raw LOB snapshots and MBO events to Apache Parquet files for downstream
+statistical analysis (e.g., `raw-lob-analyzer`). This captures the unbiased
+LOB state before any feature extraction transforms.
+
+### CLI
+
+```bash
+# Export all days in a directory
+cargo run --release --features export --bin export_to_parquet -- \
+    --input data/NVDA_2025-02-03_to_2026-01-07/ \
+    --output data/exports/raw_lob/ \
+    --symbol NVDA --levels 10
+
+# Export with downsampling (every 100th snapshot)
+cargo run --release --features export --bin export_to_parquet -- \
+    --input data/NVDA/ --output data/exports/raw_lob_sampled/ \
+    --symbol NVDA --downsample-every 100
+```
+
+### Programmatic API
+
+```rust
+use mbo_lob_reconstructor::export::{ExportConfig, LobSnapshotWriter, MboEventWriter};
+
+let config = ExportConfig::default();
+let mut lob_writer = LobSnapshotWriter::builder("snapshots.parquet")
+    .levels(10)
+    .include_derived(true)
+    .date("2025-02-03")
+    .symbol("NVDA")
+    .build()?;
+
+// Write each LOB state as it comes from the reconstructor
+lob_writer.write_snapshot(&lob_state)?;
+
+// Finalize (writes Parquet footer)
+let stats = lob_writer.finish()?;
+println!("Wrote {} snapshots", stats.rows_written);
+```
+
+### Output Files (per day)
+
+| File | Description |
+|------|-------------|
+| `{date}_lob_snapshots.parquet` | Full LOB state at each message (~7M rows/day) |
+| `{date}_mbo_events.parquet` | Raw MBO messages (order_id, action, side, price, size) |
+
+### Data Contract
+
+- **Prices**: `Int64` in nanodollars (divide by 1e9 for dollars)
+- **Sizes**: `UInt32` in shares
+- **Timestamps**: `Int64` nanoseconds since epoch
+- **Schema version**: `1.0` (embedded in file metadata)
+
+See `src/export/schema.rs` for the authoritative column definitions.
+
 ## Architecture
 
 ```
@@ -360,6 +419,12 @@ mbo_lob_reconstructor/
         order_lifecycle.rs  # OrderLifecycleTracker (Add→Modify→Cancel/Fill)
         day_boundary.rs     # DayBoundaryDetector (trading day detection)
         trade_aggregator.rs # TradeAggregator (fills→trades, aggressor side)
+    export/               # Parquet export (requires `export` feature)
+        mod.rs            # ExportConfig, DownsampleConfig, re-exports
+        schema.rs         # Arrow schema definitions (LOB + MBO)
+        lob_writer.rs     # LobSnapshotWriter: LobState -> Parquet
+        mbo_writer.rs     # MboEventWriter: MboMessage -> Parquet
+        batch.rs          # Column-oriented row batching
     source.rs         # MarketDataSource trait, DbnSource, VecSource
     dbn_bridge.rs     # Databento format conversion
     loader.rs         # DBN file streaming (zero-copy message iteration)
@@ -396,8 +461,14 @@ Benchmarked on real NVIDIA MBO data (17.8M messages):
 ## Testing
 
 ```bash
-# Run all tests
+# Run all tests (default features)
 cargo test
+
+# Run all tests including Parquet export
+cargo test --features export
+
+# Run export tests only
+cargo test --features export --test export_test
 
 # Run with real data (integration tests)
 cargo test --release

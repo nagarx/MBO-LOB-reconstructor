@@ -21,11 +21,19 @@ path = "src/lib.rs"
 [features]
 default = ["databento"]
 databento = ["dbn", "zstd"]
+export = ["dep:arrow", "dep:parquet", "dep:toml"]
 
 [dependencies]
 # DBN decoding (optional, enabled by default)
 dbn = { git = "https://github.com/databento/dbn.git", tag = "v0.20.0", optional = true }
 zstd = { version = "0.13", optional = true }
+
+# Parquet/Arrow export (optional, requires `export` feature)
+arrow = { version = "55", optional = true, default-features = false }
+parquet = { version = "55", optional = true, default-features = false, features = ["arrow", "snap", "zstd"] }
+
+# TOML config parsing (optional, for export CLI)
+toml = { version = "0.8", optional = true }
 
 # Core data structures
 ahash = "0.8"
@@ -44,6 +52,8 @@ indexmap = "2.12.1"
 
 [dev-dependencies]
 criterion = "0.5"
+arrow = { version = "55", default-features = false }
+parquet = { version = "55", default-features = false, features = ["arrow", "snap"] }
 
 [[bench]]
 name = "reconstruction"
@@ -59,6 +69,12 @@ required-features = ["databento"]
 name = "decompress_to_hot_store"
 path = "src/bin/decompress_to_hot_store.rs"
 required-features = ["databento"]
+
+# CLI tool for exporting LOB snapshots to Parquet
+[[bin]]
+name = "export_to_parquet"
+path = "src/bin/export_to_parquet.rs"
+required-features = ["databento", "export"]
 
 [profile.release]
 opt-level = 3
