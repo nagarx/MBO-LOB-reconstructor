@@ -8,14 +8,16 @@
 //! - Minimal allocations on hot path
 
 use ahash::AHashMap;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::constants::NANODOLLARS_PER_DOLLAR_F64;
 use crate::error::{Result, TlobError};
 use crate::lob::price_level::PriceLevel;
 use crate::types::{Action, BookConsistency, LobState, MboMessage, Order, Side};
 
 /// How to handle crossed quotes (bid >= ask) when they occur.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum CrossedQuotePolicy {
     /// Allow crossed quotes (default) - just track in stats
     #[default]
@@ -27,12 +29,16 @@ pub enum CrossedQuotePolicy {
     /// Return an error when a crossed quote would occur
     Error,
 
-    /// Skip the update entirely (don't change the book state)
+    /// Return last valid book state when crossing would occur.
+    ///
+    /// Book mutations are still applied internally (the order IS added/cancelled/traded).
+    /// Only the returned LobState uses the last valid snapshot. Functionally identical
+    /// to `UseLastValid` — both share the same code path.
     SkipUpdate,
 }
 
 /// Configuration for LOB reconstructor behavior.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LobConfig {
     /// Number of price levels to track
     pub levels: usize,
@@ -111,6 +117,26 @@ impl LobConfig {
         self.skip_system_messages = skip;
         self
     }
+
+    /// Validate configuration values.
+    ///
+    /// Returns `Err` if any field has a degenerate value that would produce
+    /// incorrect results or pathological behavior.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.levels == 0 {
+            return Err(crate::error::TlobError::InvalidConfig(
+                "LobConfig.levels must be at least 1".into(),
+            ));
+        }
+        if self.levels > crate::types::MAX_LOB_LEVELS {
+            return Err(crate::error::TlobError::InvalidConfig(format!(
+                "LobConfig.levels must be <= {} (got {})",
+                crate::types::MAX_LOB_LEVELS,
+                self.levels
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Single-symbol LOB reconstructor.
@@ -152,7 +178,7 @@ pub struct LobReconstructor {
 }
 
 /// Statistics for monitoring LOB health.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LobStats {
     /// Total messages processed (excludes system messages if skip_system_messages=true)
     pub messages_processed: u64,
@@ -232,65 +258,37 @@ impl LobStats {
 
     /// Export stats to JSON file.
     pub fn export_to_file(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
-        use std::io::Write;
         let file = std::fs::File::create(path)?;
-        let mut writer = std::io::BufWriter::new(file);
+        let writer = std::io::BufWriter::new(file);
+        serde_json::to_writer_pretty(writer, self).map_err(std::io::Error::other)
+    }
 
-        writeln!(writer, "{{")?;
-        writeln!(
-            writer,
-            "  \"messages_processed\": {},",
-            self.messages_processed
-        )?;
-        writeln!(writer, "  \"active_orders\": {},", self.active_orders)?;
-        writeln!(writer, "  \"bid_levels\": {},", self.bid_levels)?;
-        writeln!(writer, "  \"ask_levels\": {},", self.ask_levels)?;
-        writeln!(writer, "  \"errors\": {},", self.errors)?;
-        writeln!(writer, "  \"crossed_quotes\": {},", self.crossed_quotes)?;
-        writeln!(writer, "  \"locked_quotes\": {},", self.locked_quotes)?;
-        writeln!(
-            writer,
-            "  \"last_timestamp\": {},",
-            self.last_timestamp.unwrap_or(0)
-        )?;
-        writeln!(writer, "  \"warnings\": {{")?;
-        writeln!(
-            writer,
-            "    \"cancel_order_not_found\": {},",
-            self.cancel_order_not_found
-        )?;
-        writeln!(
-            writer,
-            "    \"cancel_price_level_missing\": {},",
-            self.cancel_price_level_missing
-        )?;
-        writeln!(
-            writer,
-            "    \"cancel_order_at_level_missing\": {},",
-            self.cancel_order_at_level_missing
-        )?;
-        writeln!(
-            writer,
-            "    \"trade_order_not_found\": {},",
-            self.trade_order_not_found
-        )?;
-        writeln!(
-            writer,
-            "    \"trade_price_level_missing\": {},",
-            self.trade_price_level_missing
-        )?;
-        writeln!(
-            writer,
-            "    \"trade_order_at_level_missing\": {},",
-            self.trade_order_at_level_missing
-        )?;
-        writeln!(writer, "    \"total\": {}", self.total_warnings())?;
-        writeln!(writer, "  }},")?;
-        writeln!(writer, "  \"book_clears\": {},", self.book_clears)?;
-        writeln!(writer, "  \"noop_messages\": {}", self.noop_messages)?;
-        writeln!(writer, "}}")?;
+    /// Load stats from a JSON file.
+    pub fn load_from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let json = std::fs::read_to_string(path)?;
+        serde_json::from_str(&json).map_err(std::io::Error::other)
+    }
+}
 
-        writer.flush()
+/// The type of order reduction operation being performed.
+///
+/// Both cancel and trade operations follow the same 3-stage lookup
+/// (order → price level → order at level) with identical partial/full
+/// removal logic. This enum selects the appropriate stat counters
+/// and log prefixes for each operation type.
+#[derive(Debug, Clone, Copy)]
+enum OrderReductionOp {
+    Cancel,
+    Trade,
+}
+
+impl OrderReductionOp {
+    /// Log prefix for diagnostic messages.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Cancel => "Cancel",
+            Self::Trade => "Trade",
+        }
     }
 }
 
@@ -324,6 +322,7 @@ impl LobReconstructor {
     /// let lob = LobReconstructor::with_config(config);
     /// ```
     pub fn with_config(config: LobConfig) -> Self {
+        config.validate().expect("LobConfig validation failed");
         Self {
             config,
             bids: BTreeMap::new(),
@@ -348,100 +347,30 @@ impl LobReconstructor {
         &self.config
     }
 
-    /// Process a single MBO message and update LOB state.
+    /// Process a single MBO message and return the LOB state.
     ///
-    /// This is the main entry point for LOB updates. It:
-    /// 1. Skips system messages (if skip_system_messages=true in config)
-    /// 2. Validates the message (if validate_messages=true in config)
-    /// 3. Updates internal state based on action
-    /// 4. Updates cached best prices
-    /// 5. Checks for book consistency (crossed/locked quotes)
-    /// 6. Applies crossed quote policy
-    /// 7. Returns current LOB snapshot
+    /// Convenience API that allocates a fresh `LobState` on each call.
+    /// Delegates to `process_message_into()` — the single source of truth
+    /// for dispatch, stats, and policy logic.
     ///
-    /// # Arguments
-    /// * `msg` - The MBO message to process
+    /// For hot paths requiring zero allocation, use `process_message_into()` instead.
     ///
-    /// # Returns
-    /// Current LOB state after processing the message.
-    /// For system messages (when skip_system_messages=true), returns current state unchanged.
+    /// # Temporal Fields
+    ///
+    /// Returns `triggering_action`, `triggering_side`, and `sequence` populated
+    /// from the current message. `delta_ns` is always 0 and `previous_timestamp`
+    /// is always `None` because each call uses a fresh buffer with no temporal
+    /// chain. Use `process_message_into()` with a reused buffer for temporal
+    /// continuity (FI-2010 u6-u9 features).
     ///
     /// # Errors
     /// Returns error if message is invalid or causes inconsistent state
     /// (depending on configuration)
-    ///
-    /// # System Messages
-    ///
-    /// DBN/MBO data often contains system messages (heartbeats, status updates)
-    /// identified by:
-    /// - order_id = 0
-    /// - size = 0
-    /// - price <= 0
-    ///
-    /// By default (skip_system_messages=true), these are silently skipped.
-    /// The count is tracked in `stats.system_messages_skipped`.
     #[inline]
     pub fn process_message(&mut self, msg: &MboMessage) -> Result<LobState> {
-        // Skip system messages if configured (default: true)
-        // System messages are identified by: order_id=0, size=0, or price<=0
-        // These are NOT valid orders - they're heartbeats, status updates, etc.
-        if self.config.skip_system_messages
-            && (msg.order_id == 0 || msg.size == 0 || msg.price <= 0)
-        {
-            self.stats.system_messages_skipped += 1;
-            // Return current state unchanged
-            return Ok(self.get_lob_state());
-        }
-
-        // Validate message (if enabled)
-        if self.config.validate_messages {
-            msg.validate()?;
-        }
-
-        // Process based on action
-        match msg.action {
-            Action::Add => self.add_order(msg)?,
-            Action::Modify => self.modify_order(msg)?,
-            Action::Cancel => self.cancel_order(msg)?,
-            Action::Trade | Action::Fill => self.process_trade(msg)?,
-            Action::Clear => {
-                self.stats.book_clears += 1;
-                if self.config.log_warnings {
-                    log::info!(
-                        "Book clear received (msg #{}, ts={:?}, orders_before={})",
-                        self.stats.messages_processed,
-                        msg.timestamp,
-                        self.orders.len()
-                    );
-                }
-                self.reset();
-            }
-            Action::None => {
-                // No-op, may carry flags or other info
-                self.stats.noop_messages += 1;
-            }
-        }
-
-        // Update statistics
-        self.stats.messages_processed += 1;
-        self.stats.active_orders = self.orders.len();
-        self.stats.bid_levels = self.bids.len();
-        self.stats.ask_levels = self.asks.len();
-
-        // Track timestamp
-        if let Some(ts) = msg.timestamp {
-            self.stats.last_timestamp = Some(ts);
-        }
-
-        // Update best prices
-        self.update_best_prices();
-
-        // Check for book consistency and apply policy
-        let consistency = self.check_consistency();
-        self.track_consistency(consistency);
-
-        // Apply crossed quote policy
-        self.apply_crossed_quote_policy(consistency, msg.timestamp)
+        let mut state = LobState::new(self.config.levels);
+        self.process_message_into(msg, &mut state)?;
+        Ok(state)
     }
 
     /// Check book consistency and return the status.
@@ -466,9 +395,13 @@ impl LobReconstructor {
     fn track_consistency(&mut self, consistency: BookConsistency) {
         match consistency {
             BookConsistency::Valid => {
-                // Update last valid state
-                let state = self.get_lob_state();
-                self.last_valid_state = Some(state);
+                if matches!(
+                    self.config.crossed_quote_policy,
+                    CrossedQuotePolicy::UseLastValid | CrossedQuotePolicy::SkipUpdate
+                ) {
+                    let state = self.get_lob_state();
+                    self.last_valid_state = Some(state);
+                }
             }
             BookConsistency::Crossed => {
                 self.stats.crossed_quotes += 1;
@@ -476,8 +409,8 @@ impl LobReconstructor {
                     if let (Some(bid), Some(ask)) = (self.best_bid, self.best_ask) {
                         log::warn!(
                             "Crossed quote detected: bid={:.4} > ask={:.4} (message #{})",
-                            bid as f64 / 1e9,
-                            ask as f64 / 1e9,
+                            bid as f64 / NANODOLLARS_PER_DOLLAR_F64,
+                            ask as f64 / NANODOLLARS_PER_DOLLAR_F64,
                             self.stats.messages_processed
                         );
                     }
@@ -489,60 +422,13 @@ impl LobReconstructor {
                     if let Some(bid) = self.best_bid {
                         log::debug!(
                             "Locked quote detected: bid=ask={:.4} (message #{})",
-                            bid as f64 / 1e9,
+                            bid as f64 / NANODOLLARS_PER_DOLLAR_F64,
                             self.stats.messages_processed
                         );
                     }
                 }
             }
             BookConsistency::Empty => {}
-        }
-    }
-
-    /// Apply the configured crossed quote policy.
-    #[inline]
-    fn apply_crossed_quote_policy(
-        &self,
-        consistency: BookConsistency,
-        timestamp: Option<i64>,
-    ) -> Result<LobState> {
-        // For valid or empty states, always return current state
-        if consistency == BookConsistency::Valid || consistency == BookConsistency::Empty {
-            return Ok(self.get_lob_state_with_metadata(timestamp));
-        }
-
-        // For crossed or locked states, apply policy
-        match self.config.crossed_quote_policy {
-            CrossedQuotePolicy::Allow => {
-                // Return the crossed/locked state as-is
-                Ok(self.get_lob_state_with_metadata(timestamp))
-            }
-            CrossedQuotePolicy::UseLastValid => {
-                // Return the last known valid state
-                Ok(self
-                    .last_valid_state
-                    .clone()
-                    .unwrap_or_else(|| self.get_lob_state_with_metadata(timestamp)))
-            }
-            CrossedQuotePolicy::Error => {
-                // Return an error
-                if let (Some(bid), Some(ask)) = (self.best_bid, self.best_ask) {
-                    if bid > ask {
-                        Err(TlobError::CrossedQuote(bid, ask))
-                    } else {
-                        Err(TlobError::LockedQuote(bid, ask))
-                    }
-                } else {
-                    Ok(self.get_lob_state_with_metadata(timestamp))
-                }
-            }
-            CrossedQuotePolicy::SkipUpdate => {
-                // Return the last valid state (same as UseLastValid in effect)
-                Ok(self
-                    .last_valid_state
-                    .clone()
-                    .unwrap_or_else(|| self.get_lob_state_with_metadata(timestamp)))
-            }
         }
     }
 
@@ -630,99 +516,7 @@ impl LobReconstructor {
     /// Uses soft error handling - anomalies are tracked in stats but don't fail.
     #[inline]
     fn cancel_order(&mut self, msg: &MboMessage) -> Result<()> {
-        // Get existing order
-        let mut order = match self.orders.get(&msg.order_id) {
-            Some(order) => *order,
-            None => {
-                // Order not found - common in real markets (already cancelled, late message, etc.)
-                // Track as warning, don't fail
-                self.stats.cancel_order_not_found += 1;
-                if self.config.log_warnings {
-                    log::debug!(
-                        "Cancel: order {} not found (msg #{}, ts={:?})",
-                        msg.order_id,
-                        self.stats.messages_processed,
-                        msg.timestamp
-                    );
-                }
-                return Ok(());
-            }
-        };
-
-        // Get price level
-        let price_level = match order.side {
-            Side::Bid => self.bids.get_mut(&order.price),
-            Side::Ask => self.asks.get_mut(&order.price),
-            Side::None => return Ok(()),
-        };
-
-        let price_level = match price_level {
-            Some(level) => level,
-            None => {
-                // Price level doesn't exist - data anomaly, but recoverable
-                // Clean up the orphaned order tracking and continue
-                self.stats.cancel_price_level_missing += 1;
-                self.orders.remove(&msg.order_id);
-                if self.config.log_warnings {
-                    log::warn!(
-                        "Cancel: price level {} not found for order {} (msg #{}, cleaning up)",
-                        order.price as f64 / 1e9,
-                        msg.order_id,
-                        self.stats.messages_processed
-                    );
-                }
-                return Ok(());
-            }
-        };
-
-        // Get current order size at price level
-        let current_size = match price_level.get(&msg.order_id) {
-            Some(&size) => size,
-            None => {
-                // Order not at price level - data anomaly, but recoverable
-                // Clean up the orphaned order tracking and continue
-                self.stats.cancel_order_at_level_missing += 1;
-                self.orders.remove(&msg.order_id);
-                if self.config.log_warnings {
-                    log::warn!(
-                        "Cancel: order {} not found at price level {} (msg #{}, cleaning up)",
-                        msg.order_id,
-                        order.price as f64 / 1e9,
-                        self.stats.messages_processed
-                    );
-                }
-                return Ok(());
-            }
-        };
-
-        // Check if partial or full cancel
-        if msg.size >= current_size {
-            // Full cancel - remove order entirely (updates total_size)
-            price_level.remove_order(msg.order_id);
-
-            // Remove empty price level
-            if price_level.is_empty() {
-                match order.side {
-                    Side::Bid => {
-                        self.bids.remove(&order.price);
-                    }
-                    Side::Ask => {
-                        self.asks.remove(&order.price);
-                    }
-                    Side::None => {}
-                }
-            }
-
-            // Remove from order tracking
-            self.orders.remove(&msg.order_id);
-        } else {
-            // Partial cancel - reduce size (updates total_size via reduce_order)
-            price_level.reduce_order(msg.order_id, msg.size);
-            order.size -= msg.size;
-            self.orders.insert(msg.order_id, order);
-        }
-
-        Ok(())
+        self.reduce_or_remove_order(msg, OrderReductionOp::Cancel)
     }
 
     /// Process a trade (execution).
@@ -731,16 +525,37 @@ impl LobReconstructor {
     /// Uses soft error handling - anomalies are tracked in stats but don't fail.
     #[inline]
     fn process_trade(&mut self, msg: &MboMessage) -> Result<()> {
-        // Get existing order
+        self.reduce_or_remove_order(msg, OrderReductionOp::Trade)
+    }
+
+    /// Unified order reduction: look up order, reduce or remove from book.
+    ///
+    /// Both cancel and trade follow the same 3-stage lookup with identical
+    /// partial/full removal logic. Only stat counters and log prefixes differ,
+    /// selected by `op`. This eliminates the ~90% code duplication that was
+    /// the root cause of bugs #2 and #3 (fix applied to one path but not the other).
+    ///
+    /// # Stages
+    /// 1. Order lookup in `self.orders` → not found: increment stat, return Ok
+    /// 2. Price level lookup in bids/asks → not found: cleanup orphan, return Ok
+    /// 3. Order-at-level lookup → not found: cleanup orphan, return Ok
+    /// 4. Full or partial size reduction
+    #[inline]
+    fn reduce_or_remove_order(&mut self, msg: &MboMessage, op: OrderReductionOp) -> Result<()> {
+        // Stage 1: Look up order
         let mut order = match self.orders.get(&msg.order_id) {
             Some(order) => *order,
             None => {
-                // Trade for unknown order - common for aggressor side trades
-                // Track as warning, don't fail
-                self.stats.trade_order_not_found += 1;
+                // Order not found - common in real markets (already cancelled,
+                // late message, aggressor side trades, etc.)
+                match op {
+                    OrderReductionOp::Cancel => self.stats.cancel_order_not_found += 1,
+                    OrderReductionOp::Trade => self.stats.trade_order_not_found += 1,
+                }
                 if self.config.log_warnings {
                     log::debug!(
-                        "Trade: order {} not found (msg #{}, ts={:?})",
+                        "{}: order {} not found (msg #{}, ts={:?})",
+                        op.label(),
                         msg.order_id,
                         self.stats.messages_processed,
                         msg.timestamp
@@ -750,7 +565,7 @@ impl LobReconstructor {
             }
         };
 
-        // Get price level
+        // Stage 2: Look up price level
         let price_level = match order.side {
             Side::Bid => self.bids.get_mut(&order.price),
             Side::Ask => self.asks.get_mut(&order.price),
@@ -762,12 +577,16 @@ impl LobReconstructor {
             None => {
                 // Price level doesn't exist - data anomaly, but recoverable
                 // Clean up the orphaned order tracking and continue
-                self.stats.trade_price_level_missing += 1;
+                match op {
+                    OrderReductionOp::Cancel => self.stats.cancel_price_level_missing += 1,
+                    OrderReductionOp::Trade => self.stats.trade_price_level_missing += 1,
+                }
                 self.orders.remove(&msg.order_id);
                 if self.config.log_warnings {
                     log::warn!(
-                        "Trade: price level {} not found for order {} (msg #{}, cleaning up)",
-                        order.price as f64 / 1e9,
+                        "{}: price level {} not found for order {} (msg #{}, cleaning up)",
+                        op.label(),
+                        order.price as f64 / NANODOLLARS_PER_DOLLAR_F64,
                         msg.order_id,
                         self.stats.messages_processed
                     );
@@ -776,19 +595,23 @@ impl LobReconstructor {
             }
         };
 
-        // Get current order size at price level
+        // Stage 3: Look up order at price level
         let current_size = match price_level.get(&msg.order_id) {
             Some(&size) => size,
             None => {
                 // Order not at price level - data anomaly, but recoverable
                 // Clean up the orphaned order tracking and continue
-                self.stats.trade_order_at_level_missing += 1;
+                match op {
+                    OrderReductionOp::Cancel => self.stats.cancel_order_at_level_missing += 1,
+                    OrderReductionOp::Trade => self.stats.trade_order_at_level_missing += 1,
+                }
                 self.orders.remove(&msg.order_id);
                 if self.config.log_warnings {
                     log::warn!(
-                        "Trade: order {} not found at price level {} (msg #{}, cleaning up)",
+                        "{}: order {} not found at price level {} (msg #{}, cleaning up)",
+                        op.label(),
                         msg.order_id,
-                        order.price as f64 / 1e9,
+                        order.price as f64 / NANODOLLARS_PER_DOLLAR_F64,
                         self.stats.messages_processed
                     );
                 }
@@ -796,9 +619,9 @@ impl LobReconstructor {
             }
         };
 
-        // Reduce order size
+        // Stage 4: Full or partial reduction
         if msg.size >= current_size {
-            // Full fill - remove order (updates total_size)
+            // Full removal (updates total_size)
             price_level.remove_order(msg.order_id);
 
             // Remove empty price level
@@ -817,9 +640,9 @@ impl LobReconstructor {
             // Remove from order tracking
             self.orders.remove(&msg.order_id);
         } else {
-            // Partial fill - reduce size (updates total_size via reduce_order)
+            // Partial reduction (updates total_size via reduce_order)
             price_level.reduce_order(msg.order_id, msg.size);
-            order.size -= msg.size;
+            order.size = order.size.saturating_sub(msg.size);
             self.orders.insert(msg.order_id, order);
         }
 
@@ -1061,10 +884,8 @@ impl LobReconstructor {
     /// ```
     #[inline]
     pub fn process_message_into(&mut self, msg: &MboMessage, state: &mut LobState) -> Result<()> {
-        // Skip system messages if configured
-        if self.config.skip_system_messages
-            && (msg.order_id == 0 || msg.size == 0 || msg.price <= 0)
-        {
+        // System messages (heartbeats, status updates) are not valid orders.
+        if self.config.skip_system_messages && msg.is_system_message() {
             self.stats.system_messages_skipped += 1;
             // Still populate temporal info even for skipped messages
             self.fill_lob_state_with_temporal(
@@ -1100,6 +921,7 @@ impl LobReconstructor {
                 self.reset();
             }
             Action::None => {
+                // No-op, may carry flags or other info
                 self.stats.noop_messages += 1;
             }
         }
@@ -1154,13 +976,26 @@ impl LobReconstructor {
                 self.fill_lob_state_with_temporal(state, timestamp, action, side);
                 Ok(())
             }
-            CrossedQuotePolicy::UseLastValid => {
-                // Copy from last valid state if available
+            CrossedQuotePolicy::UseLastValid | CrossedQuotePolicy::SkipUpdate => {
                 if let Some(ref last_valid) = self.last_valid_state {
+                    // Preserve the caller's temporal chain before overwriting
+                    let previous_ts = state.timestamp;
+
+                    // Clone the last valid book state (prices, sizes, levels, best_bid/ask)
                     *state = last_valid.clone();
-                    // Update temporal info even for cached state
+
+                    // Patch temporal fields to maintain continuity:
+                    // - Book data comes from the last valid snapshot
+                    // - Temporal data comes from the current message
                     state.triggering_action = action;
                     state.triggering_side = side;
+                    state.timestamp = timestamp.or(self.stats.last_timestamp);
+                    state.previous_timestamp = previous_ts;
+                    state.delta_ns = match (timestamp, previous_ts) {
+                        (Some(current), Some(prev)) if current > prev => (current - prev) as u64,
+                        _ => 0,
+                    };
+                    state.sequence = self.stats.messages_processed;
                 } else {
                     self.fill_lob_state_with_temporal(state, timestamp, action, side);
                 }
@@ -1168,23 +1003,15 @@ impl LobReconstructor {
             }
             CrossedQuotePolicy::Error => {
                 if let (Some(bid), Some(ask)) = (self.best_bid, self.best_ask) {
-                    Err(TlobError::CrossedQuote(bid, ask))
+                    if bid > ask {
+                        Err(TlobError::CrossedQuote(bid, ask))
+                    } else {
+                        Err(TlobError::LockedQuote(bid, ask))
+                    }
                 } else {
                     self.fill_lob_state_with_temporal(state, timestamp, action, side);
                     Ok(())
                 }
-            }
-            CrossedQuotePolicy::SkipUpdate => {
-                // Return last valid state (same behavior as UseLastValid)
-                if let Some(ref last_valid) = self.last_valid_state {
-                    *state = last_valid.clone();
-                    // Update temporal info even for cached state
-                    state.triggering_action = action;
-                    state.triggering_side = side;
-                } else {
-                    self.fill_lob_state_with_temporal(state, timestamp, action, side);
-                }
-                Ok(())
             }
         }
     }
@@ -1791,6 +1618,103 @@ mod tests {
     }
 
     // =========================================================================
+    // Saturating Subtraction Tests (Defensive Programming)
+    // =========================================================================
+    // These tests document the defensive use of saturating_sub in partial
+    // cancel and trade operations. While normal operation should never cause
+    // underflow (the msg.size >= order.size check prevents it), saturating_sub
+    // provides a safety net against potential data inconsistencies between
+    // Order and PriceLevel tracking.
+
+    #[test]
+    fn test_partial_cancel_size_reduction() {
+        // Test that partial cancel correctly reduces order size
+        let mut lob = LobReconstructor::new(10);
+
+        // Add order with 100 shares
+        lob.process_message(&create_test_message(1, Action::Add, Side::Bid, 100.0, 100))
+            .unwrap();
+
+        // Partial cancel of 30 shares
+        lob.process_message(&create_test_message(
+            1,
+            Action::Cancel,
+            Side::Bid,
+            100.0,
+            30,
+        ))
+        .unwrap();
+
+        // Order should have 70 shares remaining
+        assert_eq!(lob.order_count(), 1);
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 70);
+
+        // Partial cancel of 40 more shares
+        lob.process_message(&create_test_message(
+            1,
+            Action::Cancel,
+            Side::Bid,
+            100.0,
+            40,
+        ))
+        .unwrap();
+
+        // Order should have 30 shares remaining
+        assert_eq!(lob.order_count(), 1);
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 30);
+    }
+
+    #[test]
+    fn test_partial_trade_size_reduction() {
+        // Test that partial trade (fill) correctly reduces order size
+        let mut lob = LobReconstructor::new(10);
+
+        // Add order with 100 shares
+        lob.process_message(&create_test_message(1, Action::Add, Side::Ask, 100.0, 100))
+            .unwrap();
+
+        // Partial fill of 25 shares
+        lob.process_message(&create_test_message(1, Action::Trade, Side::Ask, 100.0, 25))
+            .unwrap();
+
+        // Order should have 75 shares remaining
+        assert_eq!(lob.order_count(), 1);
+        assert_eq!(lob.get_lob_state().ask_sizes[0], 75);
+
+        // Partial fill of 50 more shares
+        lob.process_message(&create_test_message(1, Action::Trade, Side::Ask, 100.0, 50))
+            .unwrap();
+
+        // Order should have 25 shares remaining
+        assert_eq!(lob.order_count(), 1);
+        assert_eq!(lob.get_lob_state().ask_sizes[0], 25);
+    }
+
+    #[test]
+    fn test_over_trade_removes_order() {
+        // Test that trading more than order size removes the order cleanly
+        // (analogous to test_over_cancel_removes_order)
+        let mut lob = LobReconstructor::new(10);
+
+        // Add order with 50 shares
+        lob.process_message(&create_test_message(1, Action::Add, Side::Ask, 100.0, 50))
+            .unwrap();
+
+        // Trade more than exists (100 > 50) - should remove entirely
+        lob.process_message(&create_test_message(
+            1,
+            Action::Trade,
+            Side::Ask,
+            100.0,
+            100,
+        ))
+        .unwrap();
+
+        assert_eq!(lob.order_count(), 0);
+        assert_eq!(lob.ask_levels(), 0);
+    }
+
+    // =========================================================================
     // Action::Clear Tests
     // =========================================================================
 
@@ -2286,5 +2210,348 @@ mod tests {
 
         // Verify correctness
         assert!(state.best_bid.is_some() || state.best_ask.is_some());
+    }
+
+    // =========================================================================
+    // LobStats serialization tests
+    // =========================================================================
+
+    #[test]
+    fn test_lobstats_export_roundtrip() {
+        let stats = LobStats {
+            messages_processed: 1_000_000,
+            system_messages_skipped: 42,
+            active_orders: 500,
+            bid_levels: 10,
+            ask_levels: 10,
+            errors: 3,
+            crossed_quotes: 7,
+            locked_quotes: 2,
+            last_timestamp: Some(1_700_000_000_000_000_000),
+            cancel_order_not_found: 15,
+            cancel_price_level_missing: 4,
+            cancel_order_at_level_missing: 1,
+            trade_order_not_found: 20,
+            trade_price_level_missing: 5,
+            trade_order_at_level_missing: 2,
+            book_clears: 1,
+            noop_messages: 100,
+        };
+
+        let dir = std::env::temp_dir().join("lobstats_roundtrip_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stats.json");
+
+        stats.export_to_file(&path).unwrap();
+        let loaded = LobStats::load_from_file(&path).unwrap();
+
+        assert_eq!(loaded.messages_processed, 1_000_000);
+        assert_eq!(loaded.system_messages_skipped, 42);
+        assert_eq!(loaded.active_orders, 500);
+        assert_eq!(loaded.bid_levels, 10);
+        assert_eq!(loaded.ask_levels, 10);
+        assert_eq!(loaded.errors, 3);
+        assert_eq!(loaded.crossed_quotes, 7);
+        assert_eq!(loaded.locked_quotes, 2);
+        assert_eq!(loaded.last_timestamp, Some(1_700_000_000_000_000_000));
+        assert_eq!(loaded.cancel_order_not_found, 15);
+        assert_eq!(loaded.cancel_price_level_missing, 4);
+        assert_eq!(loaded.cancel_order_at_level_missing, 1);
+        assert_eq!(loaded.trade_order_not_found, 20);
+        assert_eq!(loaded.trade_price_level_missing, 5);
+        assert_eq!(loaded.trade_order_at_level_missing, 2);
+        assert_eq!(loaded.book_clears, 1);
+        assert_eq!(loaded.noop_messages, 100);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_lobstats_export_empty() {
+        let stats = LobStats::default();
+
+        let dir = std::env::temp_dir().join("lobstats_empty_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stats_empty.json");
+
+        stats.export_to_file(&path).unwrap();
+
+        let json_str = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(parsed["messages_processed"], 0);
+        assert_eq!(parsed["errors"], 0);
+        assert_eq!(parsed["book_clears"], 0);
+        assert_eq!(parsed["noop_messages"], 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_lobstats_export_null_timestamp() {
+        let stats = LobStats {
+            last_timestamp: None,
+            ..LobStats::default()
+        };
+
+        let dir = std::env::temp_dir().join("lobstats_null_ts_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stats_null_ts.json");
+
+        stats.export_to_file(&path).unwrap();
+
+        let json_str = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        assert!(
+            parsed["last_timestamp"].is_null(),
+            "None should serialize as null, got: {}",
+            parsed["last_timestamp"]
+        );
+
+        let loaded = LobStats::load_from_file(&path).unwrap();
+        assert_eq!(loaded.last_timestamp, None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // =========================================================================
+    // track_consistency policy optimization tests
+    // =========================================================================
+
+    #[test]
+    fn test_allow_policy_no_last_valid_state() {
+        let config = LobConfig {
+            levels: 10,
+            crossed_quote_policy: CrossedQuotePolicy::Allow,
+            ..LobConfig::default()
+        };
+        let mut lob = LobReconstructor::with_config(config);
+
+        let bid = create_test_message(1, Action::Add, Side::Bid, 100.0, 100);
+        lob.process_message(&bid).unwrap();
+        let ask = create_test_message(2, Action::Add, Side::Ask, 101.0, 200);
+        lob.process_message(&ask).unwrap();
+
+        // With Allow policy, last_valid_state is never populated.
+        // Force a crossed state by adding a bid above the ask.
+        let cross_bid = create_test_message(3, Action::Add, Side::Bid, 102.0, 50);
+        let state = lob.process_message(&cross_bid).unwrap();
+
+        // Allow policy returns the crossed state as-is
+        assert!(state.is_crossed(), "state should be crossed");
+        assert_eq!(state.best_bid, Some(102_000_000_000));
+        assert_eq!(state.best_ask, Some(101_000_000_000));
+    }
+
+    #[test]
+    fn test_use_last_valid_policy_stores_state() {
+        let config = LobConfig {
+            levels: 10,
+            crossed_quote_policy: CrossedQuotePolicy::UseLastValid,
+            ..LobConfig::default()
+        };
+        let mut lob = LobReconstructor::with_config(config);
+
+        // Build a valid book
+        let bid = create_test_message(1, Action::Add, Side::Bid, 100.0, 100);
+        lob.process_message(&bid).unwrap();
+        let ask = create_test_message(2, Action::Add, Side::Ask, 101.0, 200);
+        let valid_state = lob.process_message(&ask).unwrap();
+
+        assert!(
+            valid_state.is_valid(),
+            "book should be valid before crossing"
+        );
+
+        // Cross the book
+        let cross_bid = create_test_message(3, Action::Add, Side::Bid, 102.0, 50);
+        let crossed_result = lob.process_message(&cross_bid).unwrap();
+
+        // UseLastValid should return the previous valid state
+        assert!(
+            !crossed_result.is_crossed(),
+            "UseLastValid policy should return a non-crossed state"
+        );
+        assert_eq!(
+            crossed_result.best_bid,
+            Some(100_000_000_000),
+            "should return the last valid bid"
+        );
+        assert_eq!(
+            crossed_result.best_ask,
+            Some(101_000_000_000),
+            "should return the last valid ask"
+        );
+    }
+
+    #[test]
+    fn test_skip_update_policy_stores_state() {
+        let config = LobConfig {
+            levels: 10,
+            crossed_quote_policy: CrossedQuotePolicy::SkipUpdate,
+            ..LobConfig::default()
+        };
+        let mut lob = LobReconstructor::with_config(config);
+
+        // Build a valid book
+        let bid = create_test_message(1, Action::Add, Side::Bid, 100.0, 100);
+        lob.process_message(&bid).unwrap();
+        let ask = create_test_message(2, Action::Add, Side::Ask, 101.0, 200);
+        let valid_state = lob.process_message(&ask).unwrap();
+
+        assert!(
+            valid_state.is_valid(),
+            "book should be valid before crossing"
+        );
+
+        // Cross the book
+        let cross_bid = create_test_message(3, Action::Add, Side::Bid, 102.0, 50);
+        let result = lob.process_message(&cross_bid).unwrap();
+
+        // SkipUpdate should return the previous valid state
+        assert!(
+            !result.is_crossed(),
+            "SkipUpdate policy should return a non-crossed state"
+        );
+        assert_eq!(
+            result.best_bid,
+            Some(100_000_000_000),
+            "should return the last valid bid"
+        );
+    }
+
+    // =========================================================================
+    // LobConfig validation tests
+    // =========================================================================
+
+    #[test]
+    fn test_lob_config_validate_valid() {
+        use crate::types::MAX_LOB_LEVELS;
+        LobConfig::new(1).validate().unwrap();
+        LobConfig::new(10).validate().unwrap();
+        LobConfig::new(MAX_LOB_LEVELS).validate().unwrap();
+    }
+
+    #[test]
+    fn test_lob_config_validate_zero_levels() {
+        let result = LobConfig::new(0).validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("at least 1"));
+    }
+
+    #[test]
+    fn test_lob_config_validate_excessive_levels() {
+        use crate::types::MAX_LOB_LEVELS;
+        let result = LobConfig::new(MAX_LOB_LEVELS + 1).validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must be <="));
+    }
+
+    #[test]
+    #[should_panic(expected = "LobConfig validation failed")]
+    fn test_lob_reconstructor_panics_on_zero_levels() {
+        let _ = LobReconstructor::new(0);
+    }
+
+    #[test]
+    fn test_error_policy_distinguishes_crossed_from_locked_into() {
+        // Test locked book: bid == ask -> should return LockedQuote
+        let config = LobConfig::new(10).with_crossed_quote_policy(CrossedQuotePolicy::Error);
+        let mut lob = LobReconstructor::with_config(config);
+        let mut state = LobState::new(10);
+
+        lob.process_message_into(
+            &MboMessage::new(1, Action::Add, Side::Bid, 100_000_000_000, 100).with_timestamp(1000),
+            &mut state,
+        )
+        .unwrap();
+        let result = lob.process_message_into(
+            &MboMessage::new(2, Action::Add, Side::Ask, 100_000_000_000, 100).with_timestamp(2000),
+            &mut state,
+        );
+
+        assert!(
+            matches!(result, Err(TlobError::LockedQuote(_, _))),
+            "Locked quote (bid==ask) should return LockedQuote, not CrossedQuote. Got: {:?}",
+            result
+        );
+
+        // Test crossed book: bid > ask -> should return CrossedQuote
+        let config = LobConfig::new(10).with_crossed_quote_policy(CrossedQuotePolicy::Error);
+        let mut lob = LobReconstructor::with_config(config);
+        let mut state = LobState::new(10);
+
+        lob.process_message_into(
+            &MboMessage::new(1, Action::Add, Side::Bid, 101_000_000_000, 100).with_timestamp(1000),
+            &mut state,
+        )
+        .unwrap();
+        let result = lob.process_message_into(
+            &MboMessage::new(2, Action::Add, Side::Ask, 100_000_000_000, 100).with_timestamp(2000),
+            &mut state,
+        );
+
+        assert!(
+            matches!(result, Err(TlobError::CrossedQuote(_, _))),
+            "Crossed quote (bid>ask) should return CrossedQuote. Got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_use_last_valid_preserves_temporal_chain_into() {
+        let config = LobConfig::new(10).with_crossed_quote_policy(CrossedQuotePolicy::UseLastValid);
+        let mut lob = LobReconstructor::with_config(config);
+        let mut state = LobState::new(10);
+
+        // Build valid book
+        lob.process_message_into(
+            &MboMessage::new(1, Action::Add, Side::Bid, 100_000_000_000, 100).with_timestamp(1000),
+            &mut state,
+        )
+        .unwrap();
+        lob.process_message_into(
+            &MboMessage::new(2, Action::Add, Side::Ask, 101_000_000_000, 100).with_timestamp(2000),
+            &mut state,
+        )
+        .unwrap();
+
+        // Verify valid state captured
+        assert!(state.best_bid.is_some());
+        assert!(state.best_ask.is_some());
+        let valid_timestamp = state.timestamp;
+
+        // Cause a crossed state (bid > ask)
+        lob.process_message_into(
+            &MboMessage::new(3, Action::Add, Side::Bid, 102_000_000_000, 100).with_timestamp(5000),
+            &mut state,
+        )
+        .unwrap();
+
+        // Book data should come from last valid state (bid=100, ask=101)
+        assert_eq!(state.best_bid, Some(100_000_000_000));
+        assert_eq!(state.best_ask, Some(101_000_000_000));
+
+        // Temporal data should come from the CURRENT message (timestamp=5000)
+        assert_eq!(
+            state.timestamp,
+            Some(5000),
+            "Timestamp should be current message's, not stale"
+        );
+        assert_eq!(
+            state.previous_timestamp, valid_timestamp,
+            "Previous should be the valid state's timestamp"
+        );
+        assert!(
+            state.delta_ns > 0,
+            "delta_ns should be non-zero (5000 - 2000 = 3000)"
+        );
+        assert_eq!(
+            state.sequence, 3,
+            "Sequence should be current message count"
+        );
+        assert_eq!(state.triggering_action, Some(Action::Add));
+        assert_eq!(state.triggering_side, Some(Side::Bid));
     }
 }

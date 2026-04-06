@@ -116,7 +116,7 @@ impl WarningCategory {
 }
 
 /// A single warning record.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Warning {
     /// Unique warning ID (auto-incremented)
     pub id: u64,
@@ -209,7 +209,7 @@ impl Warning {
 }
 
 /// Summary statistics for warnings.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WarningSummary {
     /// Total number of warnings
     pub total: u64,
@@ -231,7 +231,7 @@ pub struct WarningSummary {
 }
 
 /// Configuration for warning tracker.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WarningTrackerConfig {
     /// Maximum number of warnings to keep in memory
     pub max_warnings: usize,
@@ -249,6 +249,18 @@ pub struct WarningTrackerConfig {
     pub dedupe_window_ns: u64,
 }
 
+impl WarningTrackerConfig {
+    /// Validate configuration values.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.max_warnings == 0 {
+            return Err(crate::error::TlobError::InvalidConfig(
+                "WarningTrackerConfig.max_warnings must be > 0".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for WarningTrackerConfig {
     fn default() -> Self {
         Self {
@@ -256,7 +268,7 @@ impl Default for WarningTrackerConfig {
             log_to_stderr: true,
             min_log_severity: 1,
             deduplicate: true,
-            dedupe_window_ns: 1_000_000_000, // 1 second
+            dedupe_window_ns: crate::constants::NS_PER_SECOND as u64, // 1 second
         }
     }
 }
@@ -290,6 +302,9 @@ impl WarningTracker {
 
     /// Create a new warning tracker with custom configuration.
     pub fn with_config(config: WarningTrackerConfig) -> Self {
+        config
+            .validate()
+            .expect("WarningTrackerConfig validation failed");
         Self {
             config,
             warnings: Vec::new(),
@@ -444,37 +459,19 @@ impl WarningTracker {
 
     /// Export warnings to a JSON file.
     pub fn export_to_file(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        let file = File::create(path)?;
-        let mut writer = BufWriter::new(file);
-
-        // Write header
-        writeln!(writer, "{{")?;
-
-        // Write summary
-        let summary = self.summary();
-        writeln!(
-            writer,
-            "  \"summary\": {},",
-            serde_json::to_string(&summary).unwrap_or_default()
-        )?;
-
-        // Write warnings array
-        writeln!(writer, "  \"warnings\": [")?;
-
-        for (i, warning) in self.warnings.iter().enumerate() {
-            let json = serde_json::to_string(warning).unwrap_or_default();
-            if i < self.warnings.len() - 1 {
-                writeln!(writer, "    {json},")?;
-            } else {
-                writeln!(writer, "    {json}")?;
-            }
+        #[derive(Serialize)]
+        struct WarningExport<'a> {
+            summary: WarningSummary,
+            warnings: &'a [Warning],
         }
 
-        writeln!(writer, "  ]")?;
-        writeln!(writer, "}}")?;
-
-        writer.flush()?;
-        Ok(())
+        let export = WarningExport {
+            summary: self.summary(),
+            warnings: &self.warnings,
+        };
+        let file = File::create(path)?;
+        let writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(writer, &export).map_err(std::io::Error::other)
     }
 
     /// Export warnings to a CSV file (for spreadsheet analysis).
@@ -586,6 +583,15 @@ mod tests {
     }
 
     #[test]
+    fn test_warning_tracker_config_validate() {
+        WarningTrackerConfig::default().validate().unwrap();
+
+        let mut config = WarningTrackerConfig::default();
+        config.max_warnings = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn test_warning_tracker_deduplication() {
         let mut config = WarningTrackerConfig::default();
         config.deduplicate = true;
@@ -646,5 +652,66 @@ mod tests {
             warning.context.get("actual_value"),
             Some(&"-100".to_string())
         );
+    }
+
+    #[test]
+    fn test_warning_export_roundtrip() {
+        let mut config = WarningTrackerConfig::default();
+        config.log_to_stderr = false;
+
+        let mut tracker = WarningTracker::with_config(config);
+
+        tracker.record_order_warning(
+            WarningCategory::OrderNotFound,
+            "Order 123 not found",
+            123,
+            Some(100_000_000_000),
+            Some(1_700_000_000_000_000_000),
+        );
+        tracker.record_order_warning(
+            WarningCategory::PriceLevelNotFound,
+            "Price level missing",
+            456,
+            Some(200_000_000_000),
+            Some(1_700_000_001_000_000_000),
+        );
+
+        let dir = std::env::temp_dir().join("warning_export_roundtrip_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("warnings.json");
+
+        tracker.export_to_file(&path).unwrap();
+
+        let json_str = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json_str).expect("export_to_file must produce valid JSON");
+
+        assert_eq!(parsed["summary"]["total"], 2);
+        assert_eq!(parsed["warnings"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["warnings"][0]["category"], "OrderNotFound");
+        assert_eq!(parsed["warnings"][1]["category"], "PriceLevelNotFound");
+        assert_eq!(parsed["summary"]["unique_orders"], 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_warning_export_empty() {
+        let tracker = WarningTracker::new();
+
+        let dir = std::env::temp_dir().join("warning_export_empty_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("warnings_empty.json");
+
+        tracker.export_to_file(&path).unwrap();
+
+        let json_str = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json_str).expect("empty export must produce valid JSON");
+
+        assert_eq!(parsed["summary"]["total"], 0);
+        assert_eq!(parsed["warnings"].as_array().unwrap().len(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

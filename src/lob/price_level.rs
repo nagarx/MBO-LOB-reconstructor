@@ -124,11 +124,28 @@ impl PriceLevel {
         self.orders.get(order_id)
     }
 
-    /// Get a mutable reference to an order's size.
-    /// WARNING: Direct mutation will NOT update total_size.
+    /// Update an order's size atomically, maintaining the `total_size` invariant.
+    ///
+    /// Returns the old size if the order exists, `None` if it doesn't.
+    /// Unlike the former `get_mut`, this method is always invariant-safe.
     #[inline]
-    pub fn get_mut(&mut self, order_id: &u64) -> Option<&mut u32> {
-        self.orders.get_mut(order_id)
+    pub fn update_order_size(&mut self, order_id: &u64, new_size: u32) -> Option<u32> {
+        if let Some(size) = self.orders.get_mut(order_id) {
+            let old = *size;
+            *size = new_size;
+            if new_size >= old {
+                self.total_size = self.total_size.saturating_add(new_size - old);
+            } else {
+                self.total_size = self.total_size.saturating_sub(old - new_size);
+            }
+
+            #[cfg(debug_assertions)]
+            self.verify_invariant();
+
+            Some(old)
+        } else {
+            None
+        }
     }
 
     /// Check if an order exists at this price level.
@@ -350,5 +367,64 @@ mod tests {
         }
         assert_eq!(level.total_size(), 25500);
         level.verify_invariant();
+    }
+
+    // =========================================================================
+    // update_order_size tests
+    // =========================================================================
+
+    #[test]
+    fn test_update_order_size_maintains_invariant() {
+        let mut level = PriceLevel::new();
+        level.add_order(1, 100);
+        level.add_order(2, 200);
+        assert_eq!(level.total_size(), 300);
+
+        // Increase size
+        let old = level.update_order_size(&1, 250);
+        assert_eq!(old, Some(100));
+        assert_eq!(level.total_size(), 450);
+        assert_eq!(level.compute_actual_total(), level.total_size());
+
+        // Decrease size
+        let old = level.update_order_size(&2, 50);
+        assert_eq!(old, Some(200));
+        assert_eq!(level.total_size(), 300);
+        assert_eq!(level.compute_actual_total(), level.total_size());
+
+        level.verify_invariant();
+    }
+
+    #[test]
+    fn test_update_order_size_nonexistent_order() {
+        let mut level = PriceLevel::new();
+        level.add_order(1, 100);
+
+        let result = level.update_order_size(&999, 50);
+        assert_eq!(result, None);
+        assert_eq!(
+            level.total_size(),
+            100,
+            "total_size must not change on nonexistent order"
+        );
+        assert_eq!(level.compute_actual_total(), level.total_size());
+    }
+
+    #[test]
+    fn test_update_order_size_to_zero() {
+        let mut level = PriceLevel::new();
+        level.add_order(1, 100);
+        level.add_order(2, 200);
+
+        let old = level.update_order_size(&1, 0);
+        assert_eq!(old, Some(100));
+        assert_eq!(level.total_size(), 200);
+        assert_eq!(
+            level.order_count(),
+            2,
+            "order must remain in map even at size 0"
+        );
+        assert_eq!(level.get(&1), Some(&0));
+        assert_eq!(level.compute_actual_total(), level.total_size());
     }
 }

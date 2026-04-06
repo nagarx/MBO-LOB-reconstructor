@@ -417,31 +417,20 @@ impl<D: DecodeRecord> MessageIterator<D> {
 
 /// Check if an MBO message represents a valid order (not a system message).
 ///
-/// Returns `false` for:
-/// - System messages (`order_id = 0`)
-/// - Invalid size (`size = 0`)
-/// - Invalid price (`price <= 0`)
+/// Returns `false` for system messages (heartbeats, status updates).
 ///
-/// This is a utility function for cases where you want to filter
-/// messages before passing to `LobReconstructor`, or when
-/// `skip_system_messages` is disabled in `LobConfig`.
+/// # Deprecated
 ///
-/// Note: With the default `LobConfig` (skip_system_messages=true),
-/// you don't need to use this function - the reconstructor handles it.
-///
-/// # Example
-///
+/// Use [`MboMessage::is_system_message()`] instead:
 /// ```ignore
-/// // Only needed if skip_system_messages=false in LobConfig
-/// for msg in loader.iter_messages()? {
-///     if is_valid_order(&msg) {
-///         lob.process_message(&msg)?;
-///     }
+/// if !msg.is_system_message() {
+///     lob.process_message(&msg)?;
 /// }
 /// ```
+#[deprecated(since = "0.2.0", note = "Use `!msg.is_system_message()` instead")]
 #[inline]
 pub fn is_valid_order(msg: &MboMessage) -> bool {
-    msg.order_id != 0 && msg.size != 0 && msg.price > 0
+    !msg.is_system_message()
 }
 
 #[cfg(test)]
@@ -491,25 +480,36 @@ mod tests {
     }
 
     #[test]
-    fn test_is_valid_order() {
-        // Valid order
+    fn test_is_system_message() {
+        // Valid order is NOT a system message
         let valid = MboMessage::new(123, Action::Add, Side::Bid, 100_000_000_000, 100);
-        assert!(is_valid_order(&valid));
+        assert!(!valid.is_system_message());
 
-        // Invalid: order_id = 0 (system message)
-        let invalid = MboMessage::new(0, Action::Add, Side::Bid, 100_000_000_000, 100);
-        assert!(!is_valid_order(&invalid));
+        // order_id=0 IS a system message
+        let sys1 = MboMessage::new(0, Action::Add, Side::Bid, 100_000_000_000, 100);
+        assert!(sys1.is_system_message());
 
-        // Invalid: size = 0
-        let invalid = MboMessage::new(123, Action::Add, Side::Bid, 100_000_000_000, 0);
-        assert!(!is_valid_order(&invalid));
+        // size=0 IS a system message
+        let sys2 = MboMessage::new(123, Action::Add, Side::Bid, 100_000_000_000, 0);
+        assert!(sys2.is_system_message());
 
-        // Invalid: price <= 0
-        let invalid = MboMessage::new(123, Action::Add, Side::Bid, 0, 100);
-        assert!(!is_valid_order(&invalid));
+        // price=0 IS a system message
+        let sys3 = MboMessage::new(123, Action::Add, Side::Bid, 0, 100);
+        assert!(sys3.is_system_message());
 
-        let invalid = MboMessage::new(123, Action::Add, Side::Bid, -100, 100);
-        assert!(!is_valid_order(&invalid));
+        // price<0 IS a system message
+        let sys4 = MboMessage::new(123, Action::Add, Side::Bid, -100, 100);
+        assert!(sys4.is_system_message());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_is_valid_order_delegates_to_is_system_message() {
+        let valid = MboMessage::new(123, Action::Add, Side::Bid, 100_000_000_000, 100);
+        assert_eq!(is_valid_order(&valid), !valid.is_system_message());
+
+        let sys = MboMessage::new(0, Action::Add, Side::Bid, 100_000_000_000, 100);
+        assert_eq!(is_valid_order(&sys), !sys.is_system_message());
     }
 
     #[test]

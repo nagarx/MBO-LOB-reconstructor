@@ -10,6 +10,7 @@
 //!
 //! Run with: cargo run --example advanced_analytics
 
+use mbo_lob_reconstructor::constants::{BASIS_POINTS_PER_UNIT, NANODOLLARS_PER_DOLLAR_F64};
 use mbo_lob_reconstructor::{
     Action, CrossedQuotePolicy, DayStats, DepthStats, LiquidityMetrics, LobConfig,
     LobReconstructor, LobState, MarketImpact, MboMessage, NormalizationParams, Side,
@@ -60,7 +61,13 @@ fn create_sample_lob() -> LobState {
     ];
 
     for (id, price, size) in bids {
-        let msg = MboMessage::new(id, Action::Add, Side::Bid, (price * 1e9) as i64, size);
+        let msg = MboMessage::new(
+            id,
+            Action::Add,
+            Side::Bid,
+            (price * NANODOLLARS_PER_DOLLAR_F64) as i64,
+            size,
+        );
         lob.process_message(&msg).unwrap();
     }
 
@@ -74,7 +81,13 @@ fn create_sample_lob() -> LobState {
     ];
 
     for (id, price, size) in asks {
-        let msg = MboMessage::new(id, Action::Add, Side::Ask, (price * 1e9) as i64, size);
+        let msg = MboMessage::new(
+            id,
+            Action::Add,
+            Side::Ask,
+            (price * NANODOLLARS_PER_DOLLAR_F64) as i64,
+            size,
+        );
         lob.process_message(&msg).unwrap();
     }
 
@@ -104,7 +117,7 @@ fn demo_enriched_analytics(state: &LobState) {
     if let Some(microprice) = state.microprice() {
         println!("     Microprice:       ${microprice:.4}");
         if let Some(mid) = state.mid_price() {
-            let diff = (microprice - mid) * 10000.0 / mid;
+            let diff = (microprice - mid) * BASIS_POINTS_PER_UNIT / mid;
             println!("     vs Mid-price:     {diff:+.2} bps");
         }
     }
@@ -370,7 +383,13 @@ fn demo_day_stats() {
     ];
 
     for (id, action, side, price, size) in events {
-        let msg = MboMessage::new(id, action, side, (price * 1e9) as i64, size);
+        let msg = MboMessage::new(
+            id,
+            action,
+            side,
+            (price * NANODOLLARS_PER_DOLLAR_F64) as i64,
+            size,
+        );
         if let Ok(state) = lob.process_message(&msg) {
             day_stats.update(&state);
         }

@@ -36,6 +36,7 @@
 //! println!("Buy pressure: {:.2}%", (imbalance + 1.0) / 2.0 * 100.0);
 //! ```
 
+use crate::constants::NANODOLLARS_PER_DOLLAR_F64;
 use crate::types::{Action, MboMessage, Side};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -45,7 +46,7 @@ use std::collections::VecDeque;
 // ============================================================================
 
 /// Configuration for the trade aggregator.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TradeAggregatorConfig {
     /// Maximum number of recent trades to keep in memory.
     ///
@@ -94,6 +95,22 @@ impl TradeAggregatorConfig {
         self.track_fills = true;
         self
     }
+
+    /// Validate configuration values.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.aggregation_window_ns < 0 {
+            return Err(crate::error::TlobError::InvalidConfig(format!(
+                "TradeAggregatorConfig.aggregation_window_ns must be non-negative (got {})",
+                self.aggregation_window_ns
+            )));
+        }
+        if self.max_recent_trades == 0 {
+            return Err(crate::error::TlobError::InvalidConfig(
+                "TradeAggregatorConfig.max_recent_trades must be > 0".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -101,7 +118,7 @@ impl TradeAggregatorConfig {
 // ============================================================================
 
 /// A completed trade (potentially aggregating multiple fills).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trade {
     /// Trade timestamp (from the first fill).
     pub timestamp: i64,
@@ -135,7 +152,7 @@ pub struct Trade {
 impl Trade {
     /// Get the price as f64 (dollars).
     pub fn price_f64(&self) -> f64 {
-        self.price as f64 / 1_000_000_000.0
+        self.price as f64 / NANODOLLARS_PER_DOLLAR_F64
     }
 
     /// Check if this was a buyer-initiated trade.
@@ -150,7 +167,7 @@ impl Trade {
 }
 
 /// An individual fill within a trade.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fill {
     /// Fill timestamp.
     pub timestamp: i64,
@@ -186,6 +203,11 @@ pub struct TradeAggregator {
     total_buy_volume: u64,
     total_sell_volume: u64,
     total_trades: u64,
+
+    /// Count of fill messages with missing timestamps.
+    /// When timestamp is None, time-based aggregation cannot be performed.
+    /// These fills are treated as standalone trades.
+    fills_missing_timestamp: u64,
 }
 
 /// Internal: trade being aggregated.
@@ -201,6 +223,9 @@ struct PendingTrade {
 impl TradeAggregator {
     /// Create a new trade aggregator.
     pub fn new(config: TradeAggregatorConfig) -> Self {
+        config
+            .validate()
+            .expect("TradeAggregatorConfig validation failed");
         Self {
             config,
             recent_trades: VecDeque::new(),
@@ -209,6 +234,7 @@ impl TradeAggregator {
             total_buy_volume: 0,
             total_sell_volume: 0,
             total_trades: 0,
+            fills_missing_timestamp: 0,
         }
     }
 
@@ -216,6 +242,12 @@ impl TradeAggregator {
     ///
     /// Call this for every MBO message. Returns `Some(Trade)` when a trade
     /// is complete (either a single fill or after aggregation window expires).
+    ///
+    /// # Timestamp Handling
+    ///
+    /// When `msg.timestamp` is `None`, time-based aggregation cannot be performed.
+    /// The fill is treated as a standalone trade and the missing timestamp counter
+    /// is incremented. This follows RULE.md §7: never silently handle anomalies.
     pub fn process_message(&mut self, msg: &MboMessage) -> Option<Trade> {
         // Only process trades/fills
         if msg.action != Action::Trade && msg.action != Action::Fill {
@@ -223,7 +255,6 @@ impl TradeAggregator {
             return self.check_finalize_pending(msg.timestamp);
         }
 
-        let timestamp = msg.timestamp.unwrap_or(0);
         let price = msg.price;
         let size = msg.size;
 
@@ -237,13 +268,32 @@ impl TradeAggregator {
             Side::None => return self.check_finalize_pending(msg.timestamp), // Skip unknown side
         };
 
+        // Handle missing timestamp: cannot perform time-based aggregation
+        let timestamp = match msg.timestamp {
+            Some(ts) => ts,
+            None => {
+                self.fills_missing_timestamp += 1;
+                // Finalize any pending trade (can't aggregate across unknown time boundary)
+                let finalized = self.finalize_pending();
+                // Create standalone trade immediately (use 0 as timestamp marker)
+                self.create_standalone_trade(0, price, size, aggressor_side, msg.order_id);
+                // Return the previously pending trade (if any)
+                // The standalone trade will be returned on next finalize
+                return finalized;
+            }
+        };
+
         // Check if this fill can be aggregated with pending trade
         if let Some(ref mut pending) = self.pending_trade {
             let time_diff = timestamp - pending.timestamp;
             let same_price = pending.price == price;
             let same_aggressor = pending.aggressor_side == aggressor_side;
 
-            if same_price && same_aggressor && time_diff <= self.config.aggregation_window_ns {
+            if same_price
+                && same_aggressor
+                && time_diff >= 0
+                && time_diff <= self.config.aggregation_window_ns
+            {
                 // Aggregate into pending trade
                 pending.size += size as u64;
                 pending.num_fills += 1;
@@ -368,6 +418,37 @@ impl TradeAggregator {
         Some(trade)
     }
 
+    /// Create a standalone trade without aggregation.
+    ///
+    /// Used when timestamp is missing and time-based aggregation cannot be performed.
+    #[inline]
+    fn create_standalone_trade(
+        &mut self,
+        timestamp: i64,
+        price: i64,
+        size: u32,
+        aggressor_side: Side,
+        order_id: u64,
+    ) {
+        self.pending_trade = Some(PendingTrade {
+            timestamp,
+            price,
+            size: size as u64,
+            aggressor_side,
+            num_fills: 1,
+            fills: if self.config.track_fills {
+                vec![Fill {
+                    timestamp,
+                    price,
+                    size,
+                    order_id,
+                }]
+            } else {
+                Vec::new()
+            },
+        });
+    }
+
     // ========================================================================
     // Statistics
     // ========================================================================
@@ -431,6 +512,14 @@ impl TradeAggregator {
         self.total_trades
     }
 
+    /// Get count of fill messages with missing timestamps.
+    ///
+    /// When timestamp is `None`, time-based aggregation cannot be performed.
+    /// These fills are treated as standalone trades.
+    pub fn fills_missing_timestamp(&self) -> u64 {
+        self.fills_missing_timestamp
+    }
+
     /// Get last trade price (fixed-point).
     pub fn last_trade_price(&self) -> Option<i64> {
         self.last_trade_price
@@ -444,6 +533,7 @@ impl TradeAggregator {
         self.total_buy_volume = 0;
         self.total_sell_volume = 0;
         self.total_trades = 0;
+        self.fills_missing_timestamp = 0;
     }
 }
 
@@ -472,6 +562,19 @@ mod tests {
         assert_eq!(config.max_recent_trades, 1000);
         assert_eq!(config.aggregation_window_ns, 1_000_000);
         assert!(!config.track_fills);
+    }
+
+    #[test]
+    fn test_trade_aggregator_config_validate() {
+        TradeAggregatorConfig::default().validate().unwrap();
+
+        let mut config = TradeAggregatorConfig::default();
+        config.aggregation_window_ns = -1;
+        assert!(config.validate().is_err());
+
+        let mut config = TradeAggregatorConfig::default();
+        config.max_recent_trades = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -716,5 +819,125 @@ mod tests {
         // Last 3 trades: 1 buy, 2 sell = -0.333...
         let recent_3 = agg.recent_trade_imbalance(3);
         assert!((recent_3 - (-1.0 / 3.0)).abs() < 0.001);
+    }
+
+    // =========================================================================
+    // None Timestamp Handling Tests
+    // =========================================================================
+    // These tests verify that fills with None timestamps are handled correctly:
+    // - Time-based aggregation is not performed (would cause incorrect behavior)
+    // - The missing timestamp counter is incremented
+    // - Pending trades are finalized before the None-timestamp trade
+
+    fn make_trade_msg_no_ts(order_id: u64, side: Side, price: i64, size: u32) -> MboMessage {
+        MboMessage {
+            order_id,
+            action: Action::Trade,
+            side,
+            price,
+            size,
+            timestamp: None,
+        }
+    }
+
+    #[test]
+    fn test_none_timestamp_increments_counter() {
+        let config = TradeAggregatorConfig::default();
+        let mut agg = TradeAggregator::new(config);
+
+        assert_eq!(agg.fills_missing_timestamp(), 0);
+
+        // Process a fill with None timestamp
+        agg.process_message(&make_trade_msg_no_ts(1, Side::Ask, 100_000_000_000, 100));
+
+        assert_eq!(agg.fills_missing_timestamp(), 1);
+
+        // Process another fill with None timestamp
+        agg.process_message(&make_trade_msg_no_ts(2, Side::Bid, 100_000_000_000, 50));
+
+        assert_eq!(agg.fills_missing_timestamp(), 2);
+
+        // Process a fill with valid timestamp - counter should NOT increment
+        agg.process_message(&make_trade_msg(3, Side::Ask, 100_000_000_000, 75, 1000));
+
+        assert_eq!(agg.fills_missing_timestamp(), 2);
+    }
+
+    #[test]
+    fn test_none_timestamp_finalizes_pending() {
+        let config = TradeAggregatorConfig::default();
+        let mut agg = TradeAggregator::new(config);
+
+        // Start a pending trade with valid timestamp
+        let result1 =
+            agg.process_message(&make_trade_msg(1, Side::Ask, 100_000_000_000, 100, 1000));
+        assert!(result1.is_none()); // Becomes pending
+
+        // Process a fill with None timestamp - should finalize the pending trade
+        let result2 = agg.process_message(&make_trade_msg_no_ts(2, Side::Ask, 100_000_000_000, 50));
+
+        // The pending trade should be returned
+        assert!(result2.is_some());
+        let trade = result2.unwrap();
+        assert_eq!(trade.size, 100); // The first trade, not aggregated with the second
+    }
+
+    #[test]
+    fn test_none_timestamp_prevents_incorrect_aggregation() {
+        // This test verifies the bug fix: before the fix, a None timestamp would be
+        // converted to 0, causing incorrect time_diff calculation that could lead
+        // to inappropriate aggregation.
+        let config = TradeAggregatorConfig::default().with_aggregation_window_ns(1_000_000);
+        let mut agg = TradeAggregator::new(config);
+
+        // Start with a valid timestamp trade
+        agg.process_message(&make_trade_msg(
+            1,
+            Side::Ask,
+            100_000_000_000,
+            100,
+            1_000_000_000,
+        ));
+
+        // Now process a None-timestamp trade at the same price/side
+        // Before the fix: this would incorrectly aggregate due to time_diff calculation bug
+        // After the fix: this should NOT aggregate
+        let result = agg.process_message(&make_trade_msg_no_ts(2, Side::Ask, 100_000_000_000, 50));
+
+        // Should return the first trade (finalized by None timestamp)
+        assert!(result.is_some());
+        let trade = result.unwrap();
+        assert_eq!(
+            trade.size, 100,
+            "First trade should NOT be aggregated with None-timestamp trade"
+        );
+        assert_eq!(trade.num_fills, 1, "First trade should have exactly 1 fill");
+
+        // Flush to get the None-timestamp trade
+        let final_trade = agg.flush();
+        assert!(final_trade.is_some());
+        let none_ts_trade = final_trade.unwrap();
+        assert_eq!(none_ts_trade.size, 50);
+        assert_eq!(
+            none_ts_trade.timestamp, 0,
+            "None timestamp should be stored as 0"
+        );
+    }
+
+    #[test]
+    fn test_reset_clears_missing_timestamp_counter() {
+        let config = TradeAggregatorConfig::default();
+        let mut agg = TradeAggregator::new(config);
+
+        // Accumulate some missing timestamp fills
+        agg.process_message(&make_trade_msg_no_ts(1, Side::Ask, 100_000_000_000, 100));
+        agg.process_message(&make_trade_msg_no_ts(2, Side::Bid, 100_000_000_000, 50));
+
+        assert_eq!(agg.fills_missing_timestamp(), 2);
+
+        // Reset
+        agg.reset();
+
+        assert_eq!(agg.fills_missing_timestamp(), 0);
     }
 }

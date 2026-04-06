@@ -59,6 +59,7 @@
 //! println!("Observed: {}, Inferred: {}", stats.observed_orders, stats.inferred_orders);
 //! ```
 
+use crate::constants::NS_PER_SECOND_F64;
 use crate::types::{Action, MboMessage, Side};
 use ahash::AHashMap;
 use serde::{Deserialize, Serialize};
@@ -69,7 +70,7 @@ use std::collections::VecDeque;
 // ============================================================================
 
 /// Configuration for order lifecycle tracking.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderLifecycleConfig {
     /// Maximum number of completed lifecycles to retain in memory.
     ///
@@ -147,6 +148,16 @@ impl OrderLifecycleConfig {
         self.infer_pre_existing = enabled;
         self
     }
+
+    /// Validate configuration values.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.track_modifications && self.max_modifications_per_order == 0 {
+            return Err(crate::error::TlobError::InvalidConfig(
+                "OrderLifecycleConfig.max_modifications_per_order must be > 0 when track_modifications is enabled".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -171,7 +182,7 @@ pub enum OrderOrigin {
 // ============================================================================
 
 /// A single modification to an order.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderModification {
     /// Timestamp of the modification.
     pub timestamp: i64,
@@ -243,7 +254,7 @@ pub enum TerminalState {
 // ============================================================================
 
 /// Complete lifecycle of a single order.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderLifecycle {
     /// Unique order identifier.
     pub order_id: u64,
@@ -350,7 +361,7 @@ impl OrderLifecycle {
 
     /// Time the order was alive in seconds.
     pub fn time_alive_seconds(&self) -> f64 {
-        self.time_alive_ns() as f64 / 1_000_000_000.0
+        self.time_alive_ns() as f64 / NS_PER_SECOND_F64
     }
 
     /// Check if the order is still active.
@@ -406,7 +417,7 @@ impl OrderLifecycle {
 // ============================================================================
 
 /// Event emitted when a lifecycle changes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LifecycleEvent {
     /// A new order was created.
     Created(OrderLifecycle),
@@ -434,7 +445,7 @@ pub enum LifecycleEvent {
 // ============================================================================
 
 /// Statistics about order lifecycle tracking.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleStats {
     /// Total orders observed (Add messages).
     pub observed_orders: u64,
@@ -471,6 +482,10 @@ pub struct LifecycleStats {
 
     /// Messages skipped (system messages, etc.).
     pub messages_skipped: u64,
+
+    /// Fill messages where msg.size exceeded the order's remaining quantity.
+    /// Indicates data anomaly (aggressor-side reporting, timing, or feed issue).
+    pub overfill_count: u64,
 }
 
 impl LifecycleStats {
@@ -519,6 +534,9 @@ pub struct OrderLifecycleTracker {
 impl OrderLifecycleTracker {
     /// Create a new tracker with the given configuration.
     pub fn new(config: OrderLifecycleConfig) -> Self {
+        config
+            .validate()
+            .expect("OrderLifecycleConfig validation failed");
         Self {
             config,
             active: AHashMap::new(),
@@ -529,8 +547,8 @@ impl OrderLifecycleTracker {
 
     /// Process an MBO message and return any lifecycle event.
     pub fn process_message(&mut self, msg: &MboMessage) -> Option<LifecycleEvent> {
-        // Skip system messages
-        if msg.order_id == 0 || msg.size == 0 || msg.price <= 0 {
+        // Skip system messages (heartbeats, status updates)
+        if msg.is_system_message() {
             self.stats.messages_skipped += 1;
             return None;
         }
@@ -713,12 +731,18 @@ impl OrderLifecycleTracker {
 
         // Update lifecycle
         lifecycle.last_activity_timestamp = ts;
-        lifecycle.total_filled += msg.size as u64;
+
+        // Calculate actual fill quantity (clamp to remaining size)
+        let filled_size = msg.size.min(lifecycle.current_size);
+
+        // Track overfill anomaly per Rule 8 (never silently clamp without diagnostics)
+        if msg.size > lifecycle.current_size {
+            self.stats.overfill_count += 1;
+        }
+
+        lifecycle.total_filled += filled_size as u64;
         lifecycle.fill_count += 1;
         self.stats.total_fills += 1;
-
-        // Calculate remaining size
-        let filled_size = msg.size.min(lifecycle.current_size);
         lifecycle.current_size = lifecycle.current_size.saturating_sub(filled_size);
 
         // Check if fully filled
@@ -877,7 +901,7 @@ impl OrderLifecycleTracker {
 }
 
 /// Aggregate features for active orders.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveOrderFeatures {
     pub total_count: u32,
     pub observed_count: u32,
@@ -928,7 +952,7 @@ impl ActiveOrderFeatures {
 }
 
 /// Statistics for recently completed orders.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CompletionStats {
     pub total: u32,
     pub cancelled: u32,
@@ -1513,5 +1537,101 @@ mod tests {
 
         assert_eq!(tracker.stats().total_orders(), 0);
         assert_eq!(tracker.memory_usage(), (0, 0));
+    }
+
+    #[test]
+    fn test_order_lifecycle_config_validate() {
+        OrderLifecycleConfig::default().validate().unwrap();
+        OrderLifecycleConfig::minimal().validate().unwrap();
+        OrderLifecycleConfig::research().validate().unwrap();
+    }
+
+    #[test]
+    fn test_overfill_clamps_total_filled() {
+        let mut tracker = OrderLifecycleTracker::new(OrderLifecycleConfig::default());
+
+        // Add order with size 100
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            1000,
+        ));
+
+        // Partial fill: 60 of 100
+        tracker.process_message(&make_msg(
+            1,
+            Action::Fill,
+            Side::Bid,
+            100_000_000_000,
+            60,
+            2000,
+        ));
+
+        let lc = tracker.get_active(1).unwrap();
+        assert_eq!(lc.current_size, 40, "60 filled, 40 remaining");
+        assert_eq!(lc.total_filled, 60);
+
+        // Overfill: msg.size=80 but only 40 remaining
+        let event = tracker.process_message(&make_msg(
+            1,
+            Action::Fill,
+            Side::Bid,
+            100_000_000_000,
+            80,
+            3000,
+        ));
+
+        // Order should be completed (current_size reached 0)
+        assert!(matches!(event, Some(LifecycleEvent::Completed(_))));
+        if let Some(LifecycleEvent::Completed(lc)) = event {
+            assert_eq!(
+                lc.total_filled, 100,
+                "total_filled should be 60+40=100, NOT 60+80=140"
+            );
+            assert_eq!(lc.current_size, 0);
+            assert!(
+                (lc.fill_rate() - 1.0).abs() < 0.001,
+                "fill_rate should be 1.0 (100/100), not 1.4 (140/100). Got {}",
+                lc.fill_rate()
+            );
+        }
+
+        // Overfill should be tracked in stats
+        assert_eq!(
+            tracker.stats().overfill_count,
+            1,
+            "One overfill anomaly should be recorded"
+        );
+    }
+
+    #[test]
+    fn test_normal_fill_no_overfill_counted() {
+        let mut tracker = OrderLifecycleTracker::new(OrderLifecycleConfig::default());
+
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Ask,
+            100_000_000_000,
+            100,
+            1000,
+        ));
+        tracker.process_message(&make_msg(
+            1,
+            Action::Fill,
+            Side::Ask,
+            100_000_000_000,
+            100,
+            2000,
+        ));
+
+        assert_eq!(
+            tracker.stats().overfill_count,
+            0,
+            "Exact fill should not count as overfill"
+        );
     }
 }

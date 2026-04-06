@@ -15,7 +15,7 @@ use mbo_lob_reconstructor::{
 use std::path::Path;
 
 const HOT_STORE_DIR: &str = "../data/hot_store";
-const COMPRESSED_DATA_DIR: &str = "../data/NVDA_2025-02-01_to_2025-09-30";
+const COMPRESSED_DATA_DIR: &str = "../data/XNAS_ITCH/NVDA/mbo_2025-02-03_to_2026-01-07";
 
 /// Get a test file path, preferring hot store over compressed.
 fn get_test_file() -> Option<std::path::PathBuf> {

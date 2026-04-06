@@ -1,7 +1,7 @@
 # MBO-LOB-Reconstructor
 
 [![Build Status](https://github.com/nagarx/MBO-LOB-reconstructor/workflows/CI/badge.svg)](https://github.com/nagarx/MBO-LOB-reconstructor/actions)
-[![Rust](https://img.shields.io/badge/rust-1.83%2B-blue.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.82%2B-blue.svg)](https://www.rust-lang.org/)
 
 High-performance MBO to LOB reconstruction and analytics for deep learning preprocessing.
 
@@ -11,17 +11,28 @@ Convert Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshots
 
 - **High Performance**: Process approximately 1M messages/second on modern hardware
 - **MBO to LOB Reconstruction**: Convert order-level events to aggregated price levels
+- **Temporal Fields**: Time delta, triggering action/side for time-sensitive features (FI-2010 u6-u9)
 - **Enriched Analytics**: Microprice, VWAP, depth imbalance, spread metrics
 - **Book Consistency Validation**: Detect and handle crossed/locked quotes
 - **Statistics Tracking**: Per-day statistics with Welford's algorithm for normalization
 - **ML-Ready**: NormalizationParams, DayStats, and feature extraction utilities
 - **Databento Support**: Native support for compressed DBN files (.dbn.zst)
 
+### Composable Tracking Modules
+
+Additional standalone modules that can be used alongside LOB reconstruction:
+
+- **Queue Position Tracking**: FIFO queue position, volume ahead (for execution probability)
+- **Order Lifecycle Tracking**: Track orders through Add→Modify→Cancel/Fill lifecycle
+- **Day Boundary Detection**: Automatic trading day detection for train/test splits
+- **Trade Aggregation**: Aggregate fills into trades with aggressor side detection
+
 ## Feature Flags
 
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `databento` | Yes | Enable Databento DBN file support |
+| `export` | No | Enable Apache Parquet export for raw LOB snapshots and MBO events (+ TOML config for CLI) |
 
 ## Quick Start
 
@@ -29,6 +40,7 @@ Convert Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshots
 
 ```rust
 use mbo_lob_reconstructor::{LobReconstructor, MboMessage, Action, Side};
+use mbo_lob_reconstructor::constants::NANODOLLARS_PER_DOLLAR_F64;
 
 // Create LOB reconstructor with 10 price levels
 let mut lob = LobReconstructor::new(10);
@@ -45,14 +57,14 @@ let msg = MboMessage::new(
 let state = lob.process_message(&msg)?;
 
 // Access LOB state
-println!("Best Bid: ${:.2}", state.best_bid.unwrap() as f64 / 1e9);
-println!("Best Ask: ${:.2}", state.best_ask.unwrap() as f64 / 1e9);
+println!("Best Bid: ${:.2}", state.best_bid.unwrap() as f64 / NANODOLLARS_PER_DOLLAR_F64);
+println!("Best Ask: ${:.2}", state.best_ask.unwrap() as f64 / NANODOLLARS_PER_DOLLAR_F64);
 ```
 
 ### Load from Databento DBN Files
 
 ```rust
-use mbo_lob_reconstructor::{DbnLoader, LobReconstructor, DayStats};
+use mbo_lob_reconstructor::{DbnLoader, LobReconstructor, DayStats, NormalizationParams};
 
 // Load compressed DBN file
 let loader = DbnLoader::new("data/NVDA.mbo.dbn.zst")?
@@ -72,7 +84,9 @@ for msg in loader.iter_messages()? {
     }
 }
 
-// Get normalization parameters for ML
+// Get normalization parameters for ML (standalone usage).
+// Note: feature-extractor-MBO-LOB provides its own NormalizationParams
+// with market_structure_zscore strategy for the full pipeline.
 let norm_params = NormalizationParams::from_day_stats(&day_stats, 10);
 norm_params.save_json("normalization.json")?;
 ```
@@ -188,6 +202,66 @@ println!("Spread: {:.2} bps", metrics.spread_bps);
 println!("Book pressure: {:.4}", metrics.book_pressure());
 ```
 
+## Composable Tracking Modules
+
+These modules are **standalone** - they process `MboMessage` independently and can be used alongside or without LOB reconstruction.
+
+### Queue Position Tracking
+
+```rust
+use mbo_lob_reconstructor::{QueuePositionTracker, QueuePositionConfig};
+
+let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
+
+for msg in messages {
+    tracker.process_message(&msg);
+    
+    if let Some(info) = tracker.queue_position(msg.order_id) {
+        println!("Order {} at position {} with {} volume ahead",
+                 msg.order_id, info.position, info.volume_ahead);
+    }
+}
+```
+
+### Order Lifecycle Tracking
+
+```rust
+use mbo_lob_reconstructor::{OrderLifecycleTracker, OrderLifecycleConfig, LifecycleEvent};
+
+let mut tracker = OrderLifecycleTracker::new(OrderLifecycleConfig::default());
+
+for msg in messages {
+    if let Some(event) = tracker.process_message(&msg) {
+        match event {
+            LifecycleEvent::Created(lc) => println!("New order: {}", lc.order_id),
+            LifecycleEvent::Modified { order_id, .. } => println!("Modified: {}", order_id),
+            LifecycleEvent::PartialFill { order_id, fill_size, .. } => {
+                println!("Partial fill: {} ({} shares)", order_id, fill_size)
+            }
+            LifecycleEvent::Completed(lc) => println!("Order {} done in {:?}", lc.order_id, lc.time_alive_ns()),
+        }
+    }
+}
+```
+
+### Trade Aggregation with Aggressor Detection
+
+```rust
+use mbo_lob_reconstructor::{TradeAggregator, TradeAggregatorConfig};
+
+let mut aggregator = TradeAggregator::new(TradeAggregatorConfig::default());
+
+for msg in messages {
+    if let Some(trade) = aggregator.process_message(&msg) {
+        println!("Trade: {} @ ${:.2} (aggressor: {:?})",
+                 trade.size, trade.price_f64(), trade.aggressor_side);
+    }
+}
+
+// Buy vs sell pressure
+let imbalance = aggregator.trade_imbalance();  // [-1.0, 1.0]
+```
+
 ## Handling Crossed Quotes
 
 ```rust
@@ -204,7 +278,7 @@ let mut lob = LobReconstructor::with_config(config);
 // - Allow: Return crossed state as-is (track in stats)
 // - UseLastValid: Return last valid state when crossed
 // - Error: Return error on crossed quote
-// - SkipUpdate: Skip updates that would cause crossing
+// - SkipUpdate: Return last valid state when crossed (same as UseLastValid)
 ```
 
 ## LOB State Analytics
@@ -223,6 +297,19 @@ The `LobState` struct provides rich analytics:
 | `total_bid_volume()` / `total_ask_volume()` | Total volume per side |
 | `active_bid_levels()` / `active_ask_levels()` | Count of non-empty levels |
 | `check_consistency()` | Book state: Valid, Empty, Crossed, Locked |
+
+### Temporal Fields (FI-2010 u6-u9)
+
+| Field/Method | Description |
+|--------------|-------------|
+| `delta_ns` | Time since last LOB update (nanoseconds) |
+| `delta_seconds()` | Time delta in seconds |
+| `event_intensity()` | Events per second (1/Δt) |
+| `triggering_action` | Action that caused this state (Add, Cancel, Trade, etc.) |
+| `triggering_side` | Side affected (Bid, Ask) |
+| `is_trade_event()` | Check if triggered by Trade/Fill |
+| `is_add_event()` | Check if triggered by Add |
+| `is_cancel_event()` | Check if triggered by Cancel |
 
 ## Statistics for ML Normalization
 
@@ -266,20 +353,97 @@ let normalized = params.normalize(value, feature_idx);
 let denormalized = params.denormalize(normalized, feature_idx);
 ```
 
+## Parquet Export (feature: `export`)
+
+Export raw LOB snapshots and MBO events to Apache Parquet files for downstream
+statistical analysis (e.g., `raw-lob-analyzer`). This captures the unbiased
+LOB state before any feature extraction transforms.
+
+### CLI
+
+```bash
+# Export all days in a directory
+cargo run --release --features export --bin export_to_parquet -- \
+    --input data/XNAS_ITCH/NVDA/mbo_2025-02-03_to_2026-01-07/ \
+    --output data/exports/raw_lob/ \
+    --symbol NVDA --levels 10
+
+# Export with downsampling (every 100th snapshot)
+cargo run --release --features export --bin export_to_parquet -- \
+    --input data/NVDA/ --output data/exports/raw_lob_sampled/ \
+    --symbol NVDA --downsample-every 100
+```
+
+### Programmatic API
+
+```rust
+use mbo_lob_reconstructor::export::{ExportConfig, LobSnapshotWriter, MboEventWriter};
+
+let config = ExportConfig::default();
+let mut lob_writer = LobSnapshotWriter::builder("snapshots.parquet")
+    .levels(10)
+    .include_derived(true)
+    .date("2025-02-03")
+    .symbol("NVDA")
+    .build()?;
+
+// Write each LOB state as it comes from the reconstructor
+lob_writer.write_snapshot(&lob_state)?;
+
+// Finalize (writes Parquet footer)
+let stats = lob_writer.finish()?;
+println!("Wrote {} snapshots", stats.rows_written);
+```
+
+### Output Files (per day)
+
+| File | Description |
+|------|-------------|
+| `{date}_lob_snapshots.parquet` | Full LOB state at each message (~7M rows/day) |
+| `{date}_mbo_events.parquet` | Raw MBO messages (order_id, action, side, price, size) |
+
+### Data Contract
+
+- **Prices**: `Int64` in nanodollars (divide by 1e9 for dollars)
+- **Sizes**: `UInt32` in shares
+- **Timestamps**: `Int64` nanoseconds since epoch
+- **Schema version**: `1.0` (embedded in file metadata)
+
+See `src/export/schema.rs` for the authoritative column definitions.
+
 ## Architecture
 
 ```
 mbo_lob_reconstructor/
+    lib.rs            # Crate root: module declarations, feature gates, re-exports
     types.rs          # Core types: MboMessage, LobState, Action, Side, MAX_LOB_LEVELS
-    error.rs          # Error types and Result alias
+    error.rs          # Error types (TlobError, 12 variants) and Result alias
+    constants.rs      # Domain constants: NANODOLLARS_PER_DOLLAR, NS_PER_SECOND, BASIS_POINTS_PER_UNIT, etc.
     lob/
-        reconstructor.rs  # LobReconstructor, process_message_into()
-        price_level.rs    # PriceLevel with O(1) size caching
-        multi_symbol.rs   # Multi-symbol support
+        mod.rs              # LOB module hub, re-exports
+        reconstructor.rs    # LobReconstructor, process_message_into(), reduce_or_remove_order()
+        price_level.rs      # PriceLevel with O(1) size caching
+        multi_symbol.rs     # Multi-symbol support
+        queue_position.rs   # QueuePositionTracker (FIFO tracking, handle_order_reduction())
+        order_lifecycle.rs  # OrderLifecycleTracker (Add→Modify→Cancel/Fill)
+        day_boundary.rs     # DayBoundaryDetector (trading day detection)
+        trade_aggregator.rs # TradeAggregator (fills→trades, aggressor side)
+    export/               # Parquet export (requires `export` feature)
+        mod.rs            # ExportConfig, DownsampleConfig, re-exports
+        schema.rs         # Arrow schema definitions (LOB + MBO)
+        lob_writer.rs     # LobSnapshotWriter: LobState -> Parquet
+        mbo_writer.rs     # MboEventWriter: MboMessage -> Parquet
+        batch.rs          # Column-oriented row batching
+    source.rs         # MarketDataSource trait, DbnSource, VecSource
     dbn_bridge.rs     # Databento format conversion
     loader.rs         # DBN file streaming (zero-copy message iteration)
+    hotstore.rs       # HotStoreManager: decompressed file cache (~30% faster)
     statistics.rs     # DayStats, RunningStats, NormalizationParams
     analytics.rs      # DepthStats, MarketImpact, LiquidityMetrics
+    warnings.rs       # WarningTracker, WarningCategory, WarningTrackerConfig
+    bin/
+        export_to_parquet.rs      # CLI: export LOB snapshots + MBO events to Parquet
+        decompress_to_hot_store.rs # CLI: pre-decompress .dbn.zst files for faster loading
 ```
 
 ### Key Optimizations
@@ -310,8 +474,14 @@ Benchmarked on real NVIDIA MBO data (17.8M messages):
 ## Testing
 
 ```bash
-# Run all tests
+# Run all tests (default features)
 cargo test
+
+# Run all tests including Parquet export
+cargo test --features export
+
+# Run export tests only
+cargo test --features export --test export_test
 
 # Run with real data (integration tests)
 cargo test --release

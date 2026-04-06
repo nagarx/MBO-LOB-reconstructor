@@ -4,6 +4,7 @@
 //!
 //! Run with: cargo run --example multi_symbol
 
+use mbo_lob_reconstructor::constants::NANODOLLARS_PER_DOLLAR_F64;
 use mbo_lob_reconstructor::{Action, MboMessage, MultiSymbolLob, Side};
 
 fn main() {
@@ -75,8 +76,14 @@ fn main() {
             println!("  Spread (bps): {spread_bps:.2}");
         }
 
-        println!("  Best bid: ${:.2}", state.best_bid.unwrap() as f64 / 1e9);
-        println!("  Best ask: ${:.2}", state.best_ask.unwrap() as f64 / 1e9);
+        println!(
+            "  Best bid: ${:.2}",
+            state.best_bid.unwrap() as f64 / NANODOLLARS_PER_DOLLAR_F64
+        );
+        println!(
+            "  Best ask: ${:.2}",
+            state.best_ask.unwrap() as f64 / NANODOLLARS_PER_DOLLAR_F64
+        );
         println!("  Messages processed: {}", symbol_stats.messages_processed);
         println!();
     }

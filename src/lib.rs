@@ -28,7 +28,7 @@
 //! ### Basic LOB Reconstruction
 //!
 //! ```rust
-//! use mbo_lob_reconstructor::{LobReconstructor, MboMessage, Action, Side};
+//! use mbo_lob_reconstructor::{LobReconstructor, MboMessage, Action, Side, constants::NANODOLLARS_PER_DOLLAR_F64};
 //!
 //! // Create LOB reconstructor with 10 price levels
 //! let mut lob = LobReconstructor::new(10);
@@ -46,7 +46,7 @@
 //!
 //! // Access LOB state
 //! if let Some(bid) = state.best_bid {
-//!     println!("Best Bid: ${:.2}", bid as f64 / 1e9);
+//!     println!("Best Bid: ${:.2}", bid as f64 / NANODOLLARS_PER_DOLLAR_F64);
 //! }
 //! ```
 //!
@@ -141,16 +141,20 @@
 //! | [`loader`] | DBN file loading (requires `databento` feature) |
 //! | [`dbn_bridge`] | Databento format conversion (requires `databento` feature) |
 //! | [`warnings`] | Warning tracking: `WarningTracker`, `Warning`, `WarningCategory` |
+//! | [`constants`] | Domain constants: price/time conversion, financial units, numerical precision |
+//! | [`export`] | Parquet export for raw LOB/MBO data (requires `export` feature) |
 //!
 //! ## Feature Flags
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
 //! | `databento` | ✅ | Enable Databento DBN file support |
+//! | `export` | ❌ | Enable Apache Parquet export for LOB snapshots and MBO events |
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod analytics;
+pub mod constants;
 pub mod error;
 pub mod lob;
 pub mod source;
@@ -169,6 +173,16 @@ pub mod hotstore;
 #[cfg(feature = "databento")]
 #[cfg_attr(docsrs, doc(cfg(feature = "databento")))]
 pub mod loader;
+
+#[cfg(feature = "export")]
+#[cfg_attr(docsrs, doc(cfg(feature = "export")))]
+pub mod export;
+
+// Re-exports - Constants
+pub use constants::{
+    BASIS_POINTS_PER_UNIT, DIVISION_GUARD_EPS, NANODOLLARS_PER_DOLLAR, NANODOLLARS_PER_DOLLAR_F64,
+    NS_PER_DAY, NS_PER_HOUR, NS_PER_MILLISECOND, NS_PER_MINUTE, NS_PER_SECOND, NS_PER_SECOND_F64,
+};
 
 // Re-exports - Core types
 pub use error::{Result, TlobError};
@@ -220,4 +234,9 @@ pub use dbn_bridge::DbnBridge;
 pub use hotstore::{HotStoreConfig, HotStoreManager};
 
 #[cfg(feature = "databento")]
+#[allow(deprecated)]
 pub use loader::{is_valid_order, DbnLoader, LoaderStats, IO_BUFFER_SIZE};
+
+// Re-exports - Parquet export (feature-gated)
+#[cfg(feature = "export")]
+pub use export::{ExportConfig, LobSnapshotWriter, MboEventWriter, ParquetExportStats};

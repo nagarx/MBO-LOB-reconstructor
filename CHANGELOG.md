@@ -93,7 +93,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Stack-Allocated LobState**
   - `LobState` fields changed from `Vec` to `[T; MAX_LOB_LEVELS]`
   - `MAX_LOB_LEVELS = 20` constant for fixed-size arrays
-  - ~520 bytes per snapshot (fits in cache)
+  - ~560 bytes per snapshot (fits in cache)
 
 ### Changed
 

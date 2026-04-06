@@ -1,0 +1,21 @@
+# Full NVIDIA MBO → LOB export configuration.
+#
+# Usage:
+#   cargo run --release --features export --bin export_to_parquet -- \
+#       --config configs/nvda_full_export.toml
+#
+# CLI flags override any value set here.
+
+[export]
+symbol = "NVDA"
+levels = 10
+include_derived = true
+include_mbo = true
+batch_size = 65536
+compression = "zstd"
+
+[input]
+path = "/Volumes/WD_Black/HFT-data/XNAS_ITCH/NVDA/mbo_2025-02-03_to_2026-01-07/"
+
+[output]
+path = "/Volumes/WD_Black/HFT-data/exports/raw_lob_full/"

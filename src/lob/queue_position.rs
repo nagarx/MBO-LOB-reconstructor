@@ -40,6 +40,8 @@
 //! }
 //! ```
 
+use std::collections::VecDeque;
+
 use crate::types::{Action, MboMessage, Side};
 use ahash::AHashMap;
 use indexmap::IndexMap;
@@ -50,14 +52,8 @@ use serde::{Deserialize, Serialize};
 // ============================================================================
 
 /// Configuration for queue position tracking.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuePositionConfig {
-    /// Maximum number of price levels to track per side.
-    ///
-    /// Tracking deep levels uses more memory but provides more information.
-    /// Default: 10 (matches typical LOB depth)
-    pub max_levels_per_side: usize,
-
     /// Whether to track queue position changes as events.
     ///
     /// Enables `recent_position_changes()` queries.
@@ -74,7 +70,6 @@ pub struct QueuePositionConfig {
 impl Default for QueuePositionConfig {
     fn default() -> Self {
         Self {
-            max_levels_per_side: 10,
             track_position_changes: false,
             max_position_changes: 1000,
         }
@@ -82,25 +77,28 @@ impl Default for QueuePositionConfig {
 }
 
 impl QueuePositionConfig {
-    /// Create with custom depth.
-    pub fn with_depth(mut self, depth: usize) -> Self {
-        self.max_levels_per_side = depth;
-        self
-    }
-
     /// Enable position change tracking.
     pub fn with_change_tracking(mut self) -> Self {
         self.track_position_changes = true;
         self
     }
 
-    /// Research preset (full tracking).
+    /// Research preset (full tracking with larger history).
     pub fn research() -> Self {
         Self {
-            max_levels_per_side: 20,
             track_position_changes: true,
             max_position_changes: 10_000,
         }
+    }
+
+    /// Validate configuration values.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.track_position_changes && self.max_position_changes == 0 {
+            return Err(crate::error::TlobError::InvalidConfig(
+                "QueuePositionConfig.max_position_changes must be > 0 when track_position_changes is enabled".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -109,7 +107,7 @@ impl QueuePositionConfig {
 // ============================================================================
 
 /// Position information for a single order.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuePositionInfo {
     /// Order ID.
     pub order_id: u64,
@@ -170,7 +168,7 @@ impl QueuePositionInfo {
 // ============================================================================
 
 /// A change in an order's queue position.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PositionChange {
     /// Order ID affected.
     pub order_id: u64,
@@ -185,6 +183,9 @@ pub struct PositionChange {
     pub new_position: Option<usize>,
 
     /// Change in volume ahead.
+    ///
+    /// Currently always 0. Reserved for future enhancement to track
+    /// volume-ahead deltas when orders are added/removed at a level.
     pub volume_ahead_change: i64,
 
     /// Reason for the position change.
@@ -192,13 +193,16 @@ pub struct PositionChange {
 }
 
 /// Why the queue position changed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PositionChangeReason {
     /// Order was added to queue.
     Added,
     /// Order was removed (cancelled or filled).
     Removed,
     /// Another order ahead was removed, improving our position.
+    ///
+    /// Reserved: not yet emitted. Future enhancement to notify orders
+    /// whose queue position improved when an order ahead was removed.
     ImprovedByRemoval,
     /// Order was modified (price change moves to back of queue).
     ModifiedPrice,
@@ -248,15 +252,48 @@ impl QueueLevel {
     }
 
     /// Reduce order size (partial fill/cancel).
+    ///
+    /// Returns the remaining size after reduction, or None if order not found.
+    /// If remaining size reaches 0, the order is auto-removed from the IndexMap.
+    ///
+    /// NOTE: Unlike `PriceLevel::reduce_order` (which keeps zero-size entries for
+    /// lifecycle tracking), QueueLevel must remove them because zero-size orders
+    /// corrupt FIFO position calculations (queue_length, position_percentile,
+    /// volume_ahead).
     fn reduce_order(&mut self, order_id: u64, delta: u32) -> Option<u32> {
         if let Some(size) = self.orders.get_mut(&order_id) {
             let actual_reduction = delta.min(*size);
             *size = size.saturating_sub(delta);
             self.total_volume = self.total_volume.saturating_sub(actual_reduction as u64);
-            Some(*size)
+            if *size == 0 {
+                self.orders.shift_remove(&order_id);
+                Some(0)
+            } else {
+                Some(*size)
+            }
         } else {
             None
         }
+    }
+
+    /// Update order size in place (for same-price modify).
+    ///
+    /// Returns the old size, or None if order not found.
+    /// Position is preserved (FIFO queue position does not change on size modify).
+    /// If new_size is 0, the order is auto-removed.
+    fn update_order_size(&mut self, order_id: u64, new_size: u32) -> Option<u32> {
+        if new_size == 0 {
+            return self.remove_order(order_id);
+        }
+        let size = self.orders.get_mut(&order_id)?;
+        let old = *size;
+        *size = new_size;
+        if new_size > old {
+            self.total_volume = self.total_volume.saturating_add((new_size - old) as u64);
+        } else {
+            self.total_volume = self.total_volume.saturating_sub((old - new_size) as u64);
+        }
+        Some(old)
     }
 
     /// Get queue position for an order (0 = front).
@@ -307,6 +344,16 @@ impl QueueLevel {
 // Queue Position Tracker
 // ============================================================================
 
+/// The type of order reduction operation (cancel vs fill).
+///
+/// Controls which stat counter is incremented when an order is not found.
+/// Follows the same pattern as `OrderReductionOp` in the reconstructor.
+#[derive(Debug, Clone, Copy)]
+enum ReductionOp {
+    Cancel,
+    Fill,
+}
+
 /// Tracks FIFO queue positions for all orders.
 pub struct QueuePositionTracker {
     config: QueuePositionConfig,
@@ -321,14 +368,14 @@ pub struct QueuePositionTracker {
     order_locations: AHashMap<u64, (Side, i64)>,
 
     /// Recent position changes (if tracking enabled).
-    position_changes: Vec<PositionChange>,
+    position_changes: VecDeque<PositionChange>,
 
     /// Statistics
     stats: QueueStats,
 }
 
 /// Statistics about queue tracking.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueStats {
     /// Total orders tracked.
     pub orders_tracked: u64,
@@ -340,25 +387,34 @@ pub struct QueueStats {
     pub position_changes_recorded: u64,
     /// Messages skipped (system messages).
     pub messages_skipped: u64,
+    /// Number of cancels for orders not being tracked.
+    #[serde(default)]
+    pub cancel_not_found: u64,
+    /// Number of fills for orders not being tracked.
+    #[serde(default)]
+    pub fill_not_found: u64,
 }
 
 impl QueuePositionTracker {
     /// Create a new queue position tracker.
     pub fn new(config: QueuePositionConfig) -> Self {
+        config
+            .validate()
+            .expect("QueuePositionConfig validation failed");
         Self {
             config,
             bids: AHashMap::new(),
             asks: AHashMap::new(),
             order_locations: AHashMap::new(),
-            position_changes: Vec::new(),
+            position_changes: VecDeque::new(),
             stats: QueueStats::default(),
         }
     }
 
     /// Process an MBO message to update queue positions.
     pub fn process_message(&mut self, msg: &MboMessage) {
-        // Skip system messages
-        if msg.order_id == 0 || msg.size == 0 || msg.price <= 0 {
+        // Skip system messages (heartbeats, status updates)
+        if msg.is_system_message() {
             self.stats.messages_skipped += 1;
             return;
         }
@@ -371,8 +427,8 @@ impl QueuePositionTracker {
         match msg.action {
             Action::Add => self.handle_add(msg),
             Action::Modify => self.handle_modify(msg),
-            Action::Cancel => self.handle_cancel(msg),
-            Action::Trade | Action::Fill => self.handle_fill(msg),
+            Action::Cancel => self.handle_order_reduction(msg, ReductionOp::Cancel),
+            Action::Trade | Action::Fill => self.handle_order_reduction(msg, ReductionOp::Fill),
             Action::Clear | Action::None => {
                 self.stats.messages_skipped += 1;
             }
@@ -420,12 +476,16 @@ impl QueuePositionTracker {
                     Side::None => return,
                 };
 
-                if let Some(level) = old_levels.get_mut(&old_price) {
+                let old_position = if let Some(level) = old_levels.get_mut(&old_price) {
+                    let pos = level.get_position(msg.order_id);
                     level.remove_order(msg.order_id);
                     if level.is_empty() {
                         old_levels.remove(&old_price);
                     }
-                }
+                    pos
+                } else {
+                    None
+                };
 
                 // Add to new location
                 let new_levels = match msg.side {
@@ -447,7 +507,7 @@ impl QueuePositionTracker {
                     self.record_change(PositionChange {
                         order_id: msg.order_id,
                         timestamp: msg.timestamp.unwrap_or(0),
-                        old_position: Some(0), // Was somewhere
+                        old_position,
                         new_position,
                         volume_ahead_change: 0,
                         reason: PositionChangeReason::ModifiedPrice,
@@ -462,19 +522,7 @@ impl QueuePositionTracker {
                 };
 
                 if let Some(level) = levels.get_mut(&msg.price) {
-                    // Remove and re-add to update size but keep position
-                    if let Some(_old_size) = level.orders.get_mut(&msg.order_id) {
-                        // Update size in place (preserves position)
-                        let old_size = *level.orders.get(&msg.order_id).unwrap();
-                        if msg.size > old_size {
-                            level.total_volume += (msg.size - old_size) as u64;
-                        } else {
-                            level.total_volume = level
-                                .total_volume
-                                .saturating_sub((old_size - msg.size) as u64);
-                        }
-                        *level.orders.get_mut(&msg.order_id).unwrap() = msg.size;
-                    }
+                    level.update_order_size(msg.order_id, msg.size);
                 }
             }
         } else {
@@ -483,88 +531,82 @@ impl QueuePositionTracker {
         }
     }
 
-    fn handle_cancel(&mut self, msg: &MboMessage) {
-        if let Some(&(side, price)) = self.order_locations.get(&msg.order_id) {
-            let levels = match side {
-                Side::Bid => &mut self.bids,
-                Side::Ask => &mut self.asks,
-                Side::None => return,
-            };
-
-            if let Some(level) = levels.get_mut(&price) {
-                let old_position = level.get_position(msg.order_id);
-                level.remove_order(msg.order_id);
-
-                if level.is_empty() {
-                    levels.remove(&price);
+    /// Unified order reduction: look up order, reduce or remove from queue.
+    ///
+    /// Both cancel and fill follow the same pattern in Databento MBO format:
+    /// `msg.size` is the delta (quantity cancelled/filled). If delta >= current
+    /// size, the order is fully removed. Otherwise, it's a partial reduction.
+    ///
+    /// This unification eliminates the ~90% code duplication between the former
+    /// `handle_cancel` and `handle_fill`, which was the root cause of partial
+    /// cancels being ignored (handle_cancel always did full removal).
+    fn handle_order_reduction(&mut self, msg: &MboMessage, op: ReductionOp) {
+        let &(side, price) = match self.order_locations.get(&msg.order_id) {
+            Some(loc) => loc,
+            None => {
+                match op {
+                    ReductionOp::Cancel => self.stats.cancel_not_found += 1,
+                    ReductionOp::Fill => self.stats.fill_not_found += 1,
                 }
+                return;
+            }
+        };
 
+        let levels = match side {
+            Side::Bid => &mut self.bids,
+            Side::Ask => &mut self.asks,
+            Side::None => return,
+        };
+
+        let Some(level) = levels.get_mut(&price) else {
+            return;
+        };
+
+        let Some(&current_size) = level.orders.get(&msg.order_id) else {
+            return;
+        };
+
+        if msg.size >= current_size {
+            // Full removal
+            let old_position = level.get_position(msg.order_id);
+            level.remove_order(msg.order_id);
+
+            if level.is_empty() {
+                levels.remove(&price);
+            }
+
+            self.order_locations.remove(&msg.order_id);
+            self.stats.orders_removed += 1;
+
+            if self.config.track_position_changes {
+                self.record_change(PositionChange {
+                    order_id: msg.order_id,
+                    timestamp: msg.timestamp.unwrap_or(0),
+                    old_position,
+                    new_position: None,
+                    volume_ahead_change: 0,
+                    reason: PositionChangeReason::Removed,
+                });
+            }
+        } else {
+            // Partial reduction (position unchanged, only size decreases)
+            let remaining = level.reduce_order(msg.order_id, msg.size);
+
+            // Defensive: if reduce_order auto-removed a zero-size ghost, clean up
+            if remaining == Some(0) {
                 self.order_locations.remove(&msg.order_id);
                 self.stats.orders_removed += 1;
-
-                if self.config.track_position_changes {
-                    self.record_change(PositionChange {
-                        order_id: msg.order_id,
-                        timestamp: msg.timestamp.unwrap_or(0),
-                        old_position,
-                        new_position: None,
-                        volume_ahead_change: 0,
-                        reason: PositionChangeReason::Removed,
-                    });
-                }
-            }
-        }
-    }
-
-    fn handle_fill(&mut self, msg: &MboMessage) {
-        if let Some(&(side, price)) = self.order_locations.get(&msg.order_id) {
-            let levels = match side {
-                Side::Bid => &mut self.bids,
-                Side::Ask => &mut self.asks,
-                Side::None => return,
-            };
-
-            if let Some(level) = levels.get_mut(&price) {
-                let old_position = level.get_position(msg.order_id);
-
-                // Get current size
-                if let Some(&current_size) = level.orders.get(&msg.order_id) {
-                    if msg.size >= current_size {
-                        // Full fill: remove order
-                        level.remove_order(msg.order_id);
-                        self.order_locations.remove(&msg.order_id);
-                        self.stats.orders_removed += 1;
-
-                        if level.is_empty() {
-                            levels.remove(&price);
-                        }
-
-                        if self.config.track_position_changes {
-                            self.record_change(PositionChange {
-                                order_id: msg.order_id,
-                                timestamp: msg.timestamp.unwrap_or(0),
-                                old_position,
-                                new_position: None,
-                                volume_ahead_change: 0,
-                                reason: PositionChangeReason::Removed,
-                            });
-                        }
-                    } else {
-                        // Partial fill: reduce size (position unchanged)
-                        level.reduce_order(msg.order_id, msg.size);
-                    }
-                }
             }
         }
     }
 
     fn record_change(&mut self, change: PositionChange) {
-        self.position_changes.push(change);
+        self.position_changes.push_back(change);
         self.stats.position_changes_recorded += 1;
 
-        // Trim if over limit
-        if self.position_changes.len() > self.config.max_position_changes {
-            self.position_changes.remove(0);
+        // Trim if over limit (while, not if — handles config reduction mid-run)
+        while self.position_changes.len() > self.config.max_position_changes {
+            self.position_changes.pop_front();
         }
     }
 
@@ -625,7 +667,7 @@ impl QueuePositionTracker {
     }
 
     /// Get recent position changes.
-    pub fn recent_position_changes(&self) -> &[PositionChange] {
+    pub fn recent_position_changes(&self) -> &VecDeque<PositionChange> {
         &self.position_changes
     }
 
@@ -1249,5 +1291,393 @@ mod tests {
         assert_eq!(changes[1].reason, PositionChangeReason::Removed);
         assert!(changes[1].old_position.is_some());
         assert_eq!(changes[1].new_position, None);
+    }
+
+    // =========================================================================
+    // Same-price modify tests (Fix 2)
+    // =========================================================================
+
+    #[test]
+    fn test_modify_same_price_updates_volume() {
+        let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
+
+        let add = make_msg(1, Action::Add, Side::Bid, 100_000_000_000, 100, 1000);
+        tracker.process_message(&add);
+
+        let add2 = make_msg(2, Action::Add, Side::Bid, 100_000_000_000, 200, 2000);
+        tracker.process_message(&add2);
+
+        // Increase size of order 1 (same price)
+        let modify_up = make_msg(1, Action::Modify, Side::Bid, 100_000_000_000, 300, 3000);
+        tracker.process_message(&modify_up);
+
+        let pos1 = tracker.queue_position(1).unwrap();
+        assert_eq!(pos1.order_size, 300, "order size should be updated to 300");
+        assert_eq!(
+            pos1.total_level_volume, 500,
+            "total volume should be 300+200=500"
+        );
+
+        // Decrease size of order 2 (same price)
+        let modify_down = make_msg(2, Action::Modify, Side::Bid, 100_000_000_000, 50, 4000);
+        tracker.process_message(&modify_down);
+
+        let pos2 = tracker.queue_position(2).unwrap();
+        assert_eq!(pos2.order_size, 50, "order size should be updated to 50");
+        assert_eq!(
+            pos2.total_level_volume, 350,
+            "total volume should be 300+50=350"
+        );
+    }
+
+    #[test]
+    fn test_modify_same_price_preserves_position() {
+        let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
+
+        let add1 = make_msg(1, Action::Add, Side::Ask, 200_000_000_000, 100, 1000);
+        tracker.process_message(&add1);
+
+        let add2 = make_msg(2, Action::Add, Side::Ask, 200_000_000_000, 200, 2000);
+        tracker.process_message(&add2);
+
+        let add3 = make_msg(3, Action::Add, Side::Ask, 200_000_000_000, 300, 3000);
+        tracker.process_message(&add3);
+
+        // Modify order 1 at same price -- FIFO position must not change
+        let modify = make_msg(1, Action::Modify, Side::Ask, 200_000_000_000, 500, 4000);
+        tracker.process_message(&modify);
+
+        let pos1 = tracker.queue_position(1).unwrap();
+        assert_eq!(
+            pos1.position, 0,
+            "FIFO position must be preserved on same-price modify"
+        );
+        assert_eq!(pos1.volume_ahead, 0, "no volume ahead of first order");
+
+        let pos2 = tracker.queue_position(2).unwrap();
+        assert_eq!(pos2.position, 1, "order 2 position unchanged");
+
+        let pos3 = tracker.queue_position(3).unwrap();
+        assert_eq!(pos3.position, 2, "order 3 position unchanged");
+    }
+
+    #[test]
+    fn test_queue_position_config_validate() {
+        QueuePositionConfig::default().validate().unwrap();
+        QueuePositionConfig::research().validate().unwrap();
+    }
+
+    // =========================================================================
+    // Partial Cancel Tests (Fix for BUG #1: handle_cancel ignored partial cancels)
+    // =========================================================================
+
+    #[test]
+    fn test_partial_cancel_reduces_volume() {
+        let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
+
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            1000,
+        ));
+        tracker.process_message(&make_msg(
+            2,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            200,
+            2000,
+        ));
+
+        // Partial cancel of order 1: cancel 30 of 100 shares
+        tracker.process_message(&make_msg(
+            1,
+            Action::Cancel,
+            Side::Bid,
+            100_000_000_000,
+            30,
+            3000,
+        ));
+
+        // Order 1 should still exist with 70 shares
+        let pos1 = tracker.queue_position(1).unwrap();
+        assert_eq!(
+            pos1.order_size, 70,
+            "partial cancel should reduce size to 70"
+        );
+        assert_eq!(pos1.position, 0, "position unchanged after partial cancel");
+
+        // Order 2 should see reduced volume ahead
+        let pos2 = tracker.queue_position(2).unwrap();
+        assert_eq!(
+            pos2.volume_ahead, 70,
+            "volume ahead should be reduced from 100 to 70"
+        );
+    }
+
+    #[test]
+    fn test_partial_cancel_preserves_position() {
+        let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
+
+        // Add 3 orders
+        for i in 1..=3 {
+            tracker.process_message(&make_msg(
+                i,
+                Action::Add,
+                Side::Ask,
+                200_000_000_000,
+                100,
+                i as i64 * 1000,
+            ));
+        }
+
+        // Partial cancel order 2 (middle): cancel 50 of 100
+        tracker.process_message(&make_msg(
+            2,
+            Action::Cancel,
+            Side::Ask,
+            200_000_000_000,
+            50,
+            4000,
+        ));
+
+        // All positions unchanged
+        assert_eq!(
+            tracker.queue_position(1).unwrap().position,
+            0,
+            "order 1 still at front"
+        );
+        assert_eq!(
+            tracker.queue_position(2).unwrap().position,
+            1,
+            "order 2 still in middle"
+        );
+        assert_eq!(
+            tracker.queue_position(3).unwrap().position,
+            2,
+            "order 3 still at back"
+        );
+
+        // But sizes changed
+        assert_eq!(tracker.queue_position(2).unwrap().order_size, 50);
+        assert_eq!(
+            tracker.queue_position(2).unwrap().total_level_volume,
+            250,
+            "total = 100 + 50 + 100"
+        );
+    }
+
+    #[test]
+    fn test_over_cancel_removes_order() {
+        let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
+
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            50,
+            1000,
+        ));
+
+        // Cancel more than exists (100 > 50) — should remove entirely
+        tracker.process_message(&make_msg(
+            1,
+            Action::Cancel,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            2000,
+        ));
+
+        assert!(
+            tracker.queue_position(1).is_none(),
+            "over-cancel should fully remove order"
+        );
+        assert_eq!(tracker.active_orders(), 0);
+    }
+
+    // =========================================================================
+    // Modify old_position Fix (BUG #2: was hardcoded to Some(0))
+    // =========================================================================
+
+    #[test]
+    fn test_modify_price_records_correct_old_position() {
+        let config = QueuePositionConfig::default().with_change_tracking();
+        let mut tracker = QueuePositionTracker::new(config);
+
+        // Add 3 orders at same price
+        for i in 1..=3 {
+            tracker.process_message(&make_msg(
+                i,
+                Action::Add,
+                Side::Bid,
+                100_000_000_000,
+                100,
+                i as i64 * 1000,
+            ));
+        }
+
+        // Modify order 2 (position 1) to a different price
+        tracker.process_message(&make_msg(
+            2,
+            Action::Modify,
+            Side::Bid,
+            101_000_000_000,
+            100,
+            4000,
+        ));
+
+        let changes = tracker.recent_position_changes();
+        // Last change should be the ModifiedPrice event
+        let modify_change = changes
+            .iter()
+            .find(|c| c.order_id == 2 && c.reason == PositionChangeReason::ModifiedPrice)
+            .unwrap();
+
+        assert_eq!(
+            modify_change.old_position,
+            Some(1),
+            "old_position should be 1 (was at position 1 before price change), not Some(0)"
+        );
+        assert_eq!(
+            modify_change.new_position,
+            Some(0),
+            "new_position should be 0 (alone at new price)"
+        );
+    }
+
+    // =========================================================================
+    // Order-not-found Stat Counter Tests (Issue #10)
+    // =========================================================================
+
+    #[test]
+    fn test_cancel_unknown_order_stats() {
+        let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
+
+        tracker.process_message(&make_msg(
+            999,
+            Action::Cancel,
+            Side::Bid,
+            100_000_000_000,
+            50,
+            1000,
+        ));
+
+        assert_eq!(tracker.stats().cancel_not_found, 1);
+        assert_eq!(tracker.stats().fill_not_found, 0);
+    }
+
+    #[test]
+    fn test_fill_unknown_order_stats() {
+        let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
+
+        tracker.process_message(&make_msg(
+            999,
+            Action::Trade,
+            Side::Ask,
+            100_000_000_000,
+            50,
+            1000,
+        ));
+
+        assert_eq!(tracker.stats().fill_not_found, 1);
+        assert_eq!(tracker.stats().cancel_not_found, 0);
+    }
+
+    // =========================================================================
+    // Zero-size ghost order prevention (Issue #7)
+    // =========================================================================
+
+    #[test]
+    fn test_partial_fill_to_zero_auto_cleanup() {
+        let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
+
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Ask,
+            100_000_000_000,
+            100,
+            1000,
+        ));
+        tracker.process_message(&make_msg(
+            2,
+            Action::Add,
+            Side::Ask,
+            100_000_000_000,
+            200,
+            2000,
+        ));
+
+        // Full fill via the >= path (100 >= 100)
+        tracker.process_message(&make_msg(
+            1,
+            Action::Fill,
+            Side::Ask,
+            100_000_000_000,
+            100,
+            3000,
+        ));
+
+        assert!(
+            tracker.queue_position(1).is_none(),
+            "fully filled order should be removed"
+        );
+
+        let pos2 = tracker.queue_position(2).unwrap();
+        assert_eq!(pos2.position, 0, "order 2 moves to front after fill");
+        assert_eq!(pos2.volume_ahead, 0);
+        assert_eq!(pos2.queue_length, 1, "queue should have 1 order, no ghosts");
+    }
+
+    // =========================================================================
+    // Modify side change (untested code path)
+    // =========================================================================
+
+    #[test]
+    fn test_modify_side_change() {
+        let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
+
+        // Add order on bid side
+        tracker.process_message(&make_msg(
+            1,
+            Action::Add,
+            Side::Bid,
+            100_000_000_000,
+            100,
+            1000,
+        ));
+
+        assert_eq!(tracker.queue_length(Side::Bid, 100_000_000_000), 1);
+        assert_eq!(tracker.queue_length(Side::Ask, 100_000_000_000), 0);
+
+        // Modify to ask side (same price, different side)
+        tracker.process_message(&make_msg(
+            1,
+            Action::Modify,
+            Side::Ask,
+            100_000_000_000,
+            100,
+            2000,
+        ));
+
+        assert_eq!(
+            tracker.queue_length(Side::Bid, 100_000_000_000),
+            0,
+            "order removed from bid"
+        );
+        assert_eq!(
+            tracker.queue_length(Side::Ask, 100_000_000_000),
+            1,
+            "order added to ask"
+        );
+
+        let pos = tracker.queue_position(1).unwrap();
+        assert_eq!(pos.side, Side::Ask, "order should be on ask side");
+        assert_eq!(pos.position, 0);
     }
 }

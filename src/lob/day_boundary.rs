@@ -35,21 +35,7 @@
 
 use serde::{Deserialize, Serialize};
 
-// ============================================================================
-// Constants
-// ============================================================================
-
-/// Nanoseconds per second
-const NS_PER_SECOND: i64 = 1_000_000_000;
-
-/// Nanoseconds per minute
-const NS_PER_MINUTE: i64 = 60 * NS_PER_SECOND;
-
-/// Nanoseconds per hour
-const NS_PER_HOUR: i64 = 60 * NS_PER_MINUTE;
-
-/// Nanoseconds per day
-const NS_PER_DAY: i64 = 24 * NS_PER_HOUR;
+use crate::constants::{NS_PER_DAY, NS_PER_HOUR, NS_PER_MINUTE, NS_PER_SECOND};
 
 // ============================================================================
 // Configuration
@@ -62,7 +48,7 @@ const NS_PER_DAY: i64 = 24 * NS_PER_HOUR;
 /// - `us_equity()`: US equity markets (9:30 AM - 4:00 PM ET)
 /// - `us_futures()`: US futures markets (extended hours)
 /// - `crypto()`: 24/7 cryptocurrency markets (midnight UTC boundary)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DayBoundaryConfig {
     /// Market open time as nanoseconds from midnight UTC.
     ///
@@ -171,6 +157,23 @@ impl DayBoundaryConfig {
         self.gap_threshold_ns = hours * NS_PER_HOUR;
         self
     }
+
+    /// Validate configuration values.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.gap_threshold_ns < 0 {
+            return Err(crate::error::TlobError::InvalidConfig(format!(
+                "DayBoundaryConfig.gap_threshold_ns must be non-negative (got {})",
+                self.gap_threshold_ns
+            )));
+        }
+        if !self.use_gap_detection && self.market_open_ns >= self.market_close_ns {
+            return Err(crate::error::TlobError::InvalidConfig(format!(
+                "DayBoundaryConfig: market_open_ns ({}) must be < market_close_ns ({}) for fixed-boundary mode",
+                self.market_open_ns, self.market_close_ns
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl Default for DayBoundaryConfig {
@@ -184,7 +187,7 @@ impl Default for DayBoundaryConfig {
 // ============================================================================
 
 /// Information about a detected day boundary.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DayBoundary {
     /// Timestamp of the last message from the previous day.
     pub previous_day_end_ts: i64,
@@ -225,7 +228,7 @@ impl DayBoundary {
 ///
 /// This tracks basic metrics for each trading day detected by `DayBoundaryDetector`.
 /// For running price/spread statistics, see `mbo_lob_reconstructor::statistics::DayStats`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DayBoundaryStats {
     /// Number of messages processed.
     pub messages: u64,
@@ -336,6 +339,9 @@ pub struct DayBoundaryDetector {
 impl DayBoundaryDetector {
     /// Create a new detector with the given configuration.
     pub fn new(config: DayBoundaryConfig) -> Self {
+        config
+            .validate()
+            .expect("DayBoundaryConfig validation failed");
         Self {
             config,
             last_ts: None,
@@ -577,6 +583,20 @@ mod tests {
         assert_eq!(detector.current_day_index(), 0);
         assert_eq!(detector.boundaries_detected(), 0);
         assert!(detector.last_timestamp().is_none());
+    }
+
+    #[test]
+    fn test_day_boundary_config_validate_presets() {
+        DayBoundaryConfig::us_equity().validate().unwrap();
+        DayBoundaryConfig::us_futures().validate().unwrap();
+        DayBoundaryConfig::crypto().validate().unwrap();
+    }
+
+    #[test]
+    fn test_day_boundary_config_validate_negative_gap() {
+        let mut config = DayBoundaryConfig::us_equity();
+        config.gap_threshold_ns = -1;
+        assert!(config.validate().is_err());
     }
 
     #[test]

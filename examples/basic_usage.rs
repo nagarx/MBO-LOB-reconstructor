@@ -2,6 +2,7 @@
 //!
 //! Run with: cargo run --example basic_usage
 
+use mbo_lob_reconstructor::constants::NANODOLLARS_PER_DOLLAR_F64;
 use mbo_lob_reconstructor::{Action, LobReconstructor, MboMessage, Side};
 
 fn main() {
@@ -30,7 +31,10 @@ fn main() {
     println!("  Order ID: 1001");
     println!("  Price: $100.00");
     println!("  Size: 100 shares");
-    println!("  Best bid: ${:.2}", state.best_bid.unwrap() as f64 / 1e9);
+    println!(
+        "  Best bid: ${:.2}",
+        state.best_bid.unwrap() as f64 / NANODOLLARS_PER_DOLLAR_F64
+    );
     println!();
 
     // Event 2: Add ask order at $100.01
@@ -47,7 +51,10 @@ fn main() {
     println!("  Order ID: 2001");
     println!("  Price: $100.01");
     println!("  Size: 200 shares");
-    println!("  Best ask: ${:.2}", state.best_ask.unwrap() as f64 / 1e9);
+    println!(
+        "  Best ask: ${:.2}",
+        state.best_ask.unwrap() as f64 / NANODOLLARS_PER_DOLLAR_F64
+    );
     println!();
 
     // Event 3: Add another bid at $99.99
@@ -66,7 +73,7 @@ fn main() {
     println!("  Size: 150 shares");
     println!(
         "  Best bid still: ${:.2}",
-        state.best_bid.unwrap() as f64 / 1e9
+        state.best_bid.unwrap() as f64 / NANODOLLARS_PER_DOLLAR_F64
     );
     println!();
 
@@ -115,7 +122,7 @@ fn main() {
     println!("\nBid Side:");
     for i in 0..state.levels {
         if state.bid_prices[i] > 0 {
-            let price = state.bid_prices[i] as f64 / 1e9;
+            let price = state.bid_prices[i] as f64 / NANODOLLARS_PER_DOLLAR_F64;
             let size = state.bid_sizes[i];
             println!("  Level {}: ${:.2} x {} shares", i + 1, price, size);
         }
@@ -124,7 +131,7 @@ fn main() {
     println!("\nAsk Side:");
     for i in 0..state.levels {
         if state.ask_prices[i] > 0 {
-            let price = state.ask_prices[i] as f64 / 1e9;
+            let price = state.ask_prices[i] as f64 / NANODOLLARS_PER_DOLLAR_F64;
             let size = state.ask_sizes[i];
             println!("  Level {}: ${:.2} x {} shares", i + 1, price, size);
         }

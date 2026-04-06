@@ -13,12 +13,12 @@
 //!
 //! # Decompress all files in a directory
 //! cargo run --release --bin decompress_to_hot_store -- \
-//!     --input data/NVDA_2025-02-01_to_2025-09-30/ \
+//!     --input data/XNAS_ITCH/NVDA/mbo_2025-02-03_to_2026-01-07/ \
 //!     --output data/hot/
 //!
 //! # Check space requirements first (dry run)
 //! cargo run --release --bin decompress_to_hot_store -- \
-//!     --input data/NVDA_2025-02-01_to_2025-09-30/ \
+//!     --input data/XNAS_ITCH/NVDA/mbo_2025-02-03_to_2026-01-07/ \
 //!     --output data/hot/ \
 //!     --dry-run
 //! ```

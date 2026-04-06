@@ -235,7 +235,7 @@ Based on July 2025 NVIDIA data (MBO vs MBP-10):
 
 For issues not covered here, please:
 1. Check the test suite: `cargo test -p mbo-lob-reconstructor`
-2. Run validation: `cargo test --test granular_mbo_mbp_validation --release --features databento`
+2. Run validation: `cargo test --test integration_test --release --features databento`
 3. Open an issue with:
    - Data sample (anonymized if needed)
    - Warning counts from `LobStats`

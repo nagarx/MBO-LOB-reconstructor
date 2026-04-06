@@ -1,7 +1,6 @@
 # Rust build artifacts
 /target/
 **/*.rs.bk
-Cargo.lock
 
 # IDE
 .idea/
@@ -26,4 +25,11 @@ Thumbs.db
 *.profraw
 *.profdata
 /coverage/
+
+# AI assistant working files
+CLAUDE.md
+RULE.md
+
+# Stale documentation copies (canonical version in feature-extractor docs/)
+full-data-pipeline.md
 

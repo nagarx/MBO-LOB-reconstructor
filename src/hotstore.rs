@@ -163,10 +163,14 @@ impl HotStoreConfig {
     /// * `Err(...)` - Configuration has issues
     pub fn validate(&self) -> Result<()> {
         if self.hot_store_dir.as_os_str().is_empty() {
-            return Err(TlobError::generic("hot_store_dir cannot be empty"));
+            return Err(TlobError::InvalidConfig(
+                "HotStoreConfig.hot_store_dir cannot be empty".into(),
+            ));
         }
         if self.compressed_ext.is_empty() {
-            return Err(TlobError::generic("compressed_ext cannot be empty"));
+            return Err(TlobError::InvalidConfig(
+                "HotStoreConfig.compressed_ext cannot be empty".into(),
+            ));
         }
         Ok(())
     }
