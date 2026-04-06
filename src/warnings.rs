@@ -116,7 +116,7 @@ impl WarningCategory {
 }
 
 /// A single warning record.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Warning {
     /// Unique warning ID (auto-incremented)
     pub id: u64,
@@ -209,7 +209,7 @@ impl Warning {
 }
 
 /// Summary statistics for warnings.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WarningSummary {
     /// Total number of warnings
     pub total: u64,
@@ -231,7 +231,7 @@ pub struct WarningSummary {
 }
 
 /// Configuration for warning tracker.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WarningTrackerConfig {
     /// Maximum number of warnings to keep in memory
     pub max_warnings: usize,
@@ -249,6 +249,18 @@ pub struct WarningTrackerConfig {
     pub dedupe_window_ns: u64,
 }
 
+impl WarningTrackerConfig {
+    /// Validate configuration values.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.max_warnings == 0 {
+            return Err(crate::error::TlobError::InvalidConfig(
+                "WarningTrackerConfig.max_warnings must be > 0".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for WarningTrackerConfig {
     fn default() -> Self {
         Self {
@@ -256,7 +268,7 @@ impl Default for WarningTrackerConfig {
             log_to_stderr: true,
             min_log_severity: 1,
             deduplicate: true,
-            dedupe_window_ns: 1_000_000_000, // 1 second
+            dedupe_window_ns: crate::constants::NS_PER_SECOND as u64, // 1 second
         }
     }
 }
@@ -290,6 +302,9 @@ impl WarningTracker {
 
     /// Create a new warning tracker with custom configuration.
     pub fn with_config(config: WarningTrackerConfig) -> Self {
+        config
+            .validate()
+            .expect("WarningTrackerConfig validation failed");
         Self {
             config,
             warnings: Vec::new(),
@@ -568,6 +583,15 @@ mod tests {
     }
 
     #[test]
+    fn test_warning_tracker_config_validate() {
+        WarningTrackerConfig::default().validate().unwrap();
+
+        let mut config = WarningTrackerConfig::default();
+        config.max_warnings = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn test_warning_tracker_deduplication() {
         let mut config = WarningTrackerConfig::default();
         config.deduplicate = true;
@@ -659,8 +683,8 @@ mod tests {
         tracker.export_to_file(&path).unwrap();
 
         let json_str = std::fs::read_to_string(&path).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str)
-            .expect("export_to_file must produce valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json_str).expect("export_to_file must produce valid JSON");
 
         assert_eq!(parsed["summary"]["total"], 2);
         assert_eq!(parsed["warnings"].as_array().unwrap().len(), 2);
@@ -682,8 +706,8 @@ mod tests {
         tracker.export_to_file(&path).unwrap();
 
         let json_str = std::fs::read_to_string(&path).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str)
-            .expect("empty export must produce valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json_str).expect("empty export must produce valid JSON");
 
         assert_eq!(parsed["summary"]["total"], 0);
         assert_eq!(parsed["warnings"].as_array().unwrap().len(), 0);

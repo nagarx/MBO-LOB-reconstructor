@@ -23,6 +23,7 @@
 //! println!("Slippage: {:.2} bps", impact.slippage_bps);
 //! ```
 
+use crate::constants::{BASIS_POINTS_PER_UNIT, NANODOLLARS_PER_DOLLAR_F64};
 use crate::types::{LobState, Side};
 use serde::{Deserialize, Serialize};
 
@@ -116,7 +117,7 @@ impl DepthStats {
             .iter()
             .zip(sizes.iter())
             .filter(|(&price, &size)| price > 0 && size > 0)
-            .map(|(&price, &size)| (price as f64 / 1e9, size as u64))
+            .map(|(&price, &size)| (price as f64 / NANODOLLARS_PER_DOLLAR_F64, size as u64))
             .collect();
 
         if active_levels.is_empty() {
@@ -328,7 +329,7 @@ impl MarketImpact {
                 continue;
             }
 
-            let price = price_raw as f64 / 1e9;
+            let price = price_raw as f64 / NANODOLLARS_PER_DOLLAR_F64;
             total_available += size as u64;
 
             // Track best price (first valid level)
@@ -364,7 +365,7 @@ impl MarketImpact {
         };
 
         let slippage_bps = if best_price > 0.0 {
-            (slippage / best_price) * 10_000.0
+            (slippage / best_price) * BASIS_POINTS_PER_UNIT
         } else {
             0.0
         };

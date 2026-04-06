@@ -83,8 +83,7 @@ impl LobBatch {
 
     /// Append a single `LobState` snapshot to the batch.
     pub(crate) fn push(&mut self, state: &LobState) {
-        self.timestamp_ns
-            .push(state.timestamp.unwrap_or(0));
+        self.timestamp_ns.push(state.timestamp.unwrap_or(0));
         self.sequence.push(state.sequence);
         self.level_count.push(state.levels as u8);
         self.best_bid.push(state.best_bid);
@@ -143,7 +142,9 @@ impl LobBatch {
             build_fixed_list_i64(std::mem::take(&mut self.ask_prices), n, row_count)?,
             build_fixed_list_u32(std::mem::take(&mut self.ask_sizes), n, row_count)?,
             Arc::new(UInt64Array::from(std::mem::take(&mut self.delta_ns))),
-            Arc::new(nullable_u8_array(std::mem::take(&mut self.triggering_action))),
+            Arc::new(nullable_u8_array(std::mem::take(
+                &mut self.triggering_action,
+            ))),
             Arc::new(nullable_u8_array(std::mem::take(&mut self.triggering_side))),
         ];
 
@@ -153,9 +154,15 @@ impl LobBatch {
                 Arc::new(nullable_f64_array(std::mem::take(&mut self.spread))),
                 Arc::new(nullable_f64_array(std::mem::take(&mut self.spread_bps))),
                 Arc::new(nullable_f64_array(std::mem::take(&mut self.microprice))),
-                Arc::new(UInt64Array::from(std::mem::take(&mut self.total_bid_volume))),
-                Arc::new(UInt64Array::from(std::mem::take(&mut self.total_ask_volume))),
-                Arc::new(nullable_f64_array(std::mem::take(&mut self.depth_imbalance))),
+                Arc::new(UInt64Array::from(std::mem::take(
+                    &mut self.total_bid_volume,
+                ))),
+                Arc::new(UInt64Array::from(std::mem::take(
+                    &mut self.total_ask_volume,
+                ))),
+                Arc::new(nullable_f64_array(std::mem::take(
+                    &mut self.depth_imbalance,
+                ))),
                 Arc::new(UInt8Array::from(std::mem::take(&mut self.book_consistency))),
             ]);
         }
@@ -291,7 +298,11 @@ fn build_fixed_list_i64(flat: Vec<i64>, list_size: i32, row_count: usize) -> Res
         "flat i64 length mismatch"
     );
     let values = Arc::new(Int64Array::from(flat));
-    let field = Arc::new(arrow::datatypes::Field::new("item", arrow::datatypes::DataType::Int64, false));
+    let field = Arc::new(arrow::datatypes::Field::new(
+        "item",
+        arrow::datatypes::DataType::Int64,
+        false,
+    ));
     FixedSizeListArray::try_new(field, list_size, values, None)
         .map(|a| Arc::new(a) as ArrayRef)
         .map_err(|e| TlobError::Generic(format!("FixedSizeList<Int64> error: {e}")))
@@ -305,7 +316,11 @@ fn build_fixed_list_u32(flat: Vec<u32>, list_size: i32, row_count: usize) -> Res
         "flat u32 length mismatch"
     );
     let values = Arc::new(UInt32Array::from(flat));
-    let field = Arc::new(arrow::datatypes::Field::new("item", arrow::datatypes::DataType::UInt32, false));
+    let field = Arc::new(arrow::datatypes::Field::new(
+        "item",
+        arrow::datatypes::DataType::UInt32,
+        false,
+    ));
     FixedSizeListArray::try_new(field, list_size, values, None)
         .map(|a| Arc::new(a) as ArrayRef)
         .map_err(|e| TlobError::Generic(format!("FixedSizeList<UInt32> error: {e}")))

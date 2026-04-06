@@ -86,6 +86,28 @@ impl ExportConfig {
     pub fn effective_levels(&self) -> usize {
         self.levels.min(MAX_LOB_LEVELS)
     }
+
+    /// Validate configuration values.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.levels == 0 {
+            return Err(crate::error::TlobError::InvalidConfig(
+                "ExportConfig.levels must be at least 1".into(),
+            ));
+        }
+        if self.levels > crate::types::MAX_LOB_LEVELS {
+            return Err(crate::error::TlobError::InvalidConfig(format!(
+                "ExportConfig.levels must be <= {} (got {})",
+                crate::types::MAX_LOB_LEVELS,
+                self.levels
+            )));
+        }
+        if self.batch_size == 0 {
+            return Err(crate::error::TlobError::InvalidConfig(
+                "ExportConfig.batch_size must be > 0".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Downsampling configuration for LOB snapshot export.
@@ -114,4 +136,48 @@ pub struct ParquetExportStats {
     pub rows_seen: u64,
     /// Number of row groups flushed.
     pub row_groups: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_export_config_validate_valid() {
+        ExportConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn test_export_config_validate_zero_levels() {
+        let mut config = ExportConfig::default();
+        config.levels = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("at least 1"));
+    }
+
+    #[test]
+    fn test_export_config_validate_excessive_levels() {
+        let mut config = ExportConfig::default();
+        config.levels = crate::types::MAX_LOB_LEVELS + 1;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must be <="));
+    }
+
+    #[test]
+    fn test_export_config_validate_zero_batch_size() {
+        let mut config = ExportConfig::default();
+        config.batch_size = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("batch_size"));
+    }
+
+    #[test]
+    fn test_export_config_validate_max_levels_boundary() {
+        let mut config = ExportConfig::default();
+        config.levels = crate::types::MAX_LOB_LEVELS;
+        config.validate().unwrap(); // MAX_LOB_LEVELS is valid
+    }
 }

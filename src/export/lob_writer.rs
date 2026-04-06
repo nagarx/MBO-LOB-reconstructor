@@ -59,6 +59,7 @@ impl LobSnapshotWriter {
         config: &ExportConfig,
         extra_metadata: HashMap<String, String>,
     ) -> Result<Self> {
+        config.validate()?;
         let levels = config.effective_levels();
         let mut schema = lob_snapshot_schema(levels, config.include_derived);
 
@@ -150,9 +151,9 @@ impl LobSnapshotWriter {
 
     fn flush_batch(&mut self) -> Result<()> {
         let record_batch = self.batch.flush(&self.schema)?;
-        self.writer.write(&record_batch).map_err(|e| {
-            TlobError::Generic(format!("Failed to write row group: {e}"))
-        })?;
+        self.writer
+            .write(&record_batch)
+            .map_err(|e| TlobError::Generic(format!("Failed to write row group: {e}")))?;
         self.row_groups += 1;
         Ok(())
     }

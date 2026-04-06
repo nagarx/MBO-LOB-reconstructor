@@ -261,14 +261,11 @@ fn parse_args() -> std::result::Result<Args, String> {
         include_derived: cli_include_derived
             .or(toml_export.include_derived)
             .unwrap_or(true),
-        include_mbo: cli_include_mbo
-            .or(toml_export.include_mbo)
-            .unwrap_or(true),
+        include_mbo: cli_include_mbo.or(toml_export.include_mbo).unwrap_or(true),
         batch_size: cli_batch_size.or(toml_export.batch_size).unwrap_or(65_536),
         compression,
         downsample_every: cli_downsample_every.or(toml_export.downsample_every),
-        downsample_interval_ns: cli_downsample_interval_ns
-            .or(toml_export.downsample_interval_ns),
+        downsample_interval_ns: cli_downsample_interval_ns.or(toml_export.downsample_interval_ns),
         hot_store: cli_hot_store.or_else(|| toml_input.hot_store.map(PathBuf::from)),
         verbose,
     })
@@ -427,9 +424,7 @@ fn process_day(
     // Persist reconstruction stats for provenance auditing
     let stats_path = output_dir.join(format!("{date}_reconstruction_stats.json"));
     if let Err(e) = lob.stats().export_to_file(&stats_path) {
-        eprintln!(
-            "Warning: failed to write stats for {date}: {e}"
-        );
+        eprintln!("Warning: failed to write stats for {date}: {e}");
     }
 
     let elapsed_secs = day_start.elapsed().as_secs_f64();
@@ -517,9 +512,8 @@ fn main() {
     };
 
     let input_path = if let Some(ref hs) = args.hot_store {
-        let mgr = HotStoreManager::new(
-            mbo_lob_reconstructor::hotstore::HotStoreConfig::dbn_defaults(hs),
-        );
+        let mgr =
+            HotStoreManager::new(mbo_lob_reconstructor::hotstore::HotStoreConfig::dbn_defaults(hs));
         let decompressed = mgr.decompressed_path_for(&args.input);
         if decompressed.exists() {
             decompressed
@@ -603,12 +597,10 @@ fn main() {
                 total_messages += result.messages;
                 day_times.push(result.elapsed_secs);
 
-                let throughput =
-                    result.messages as f64 / result.elapsed_secs.max(0.001);
+                let throughput = result.messages as f64 / result.elapsed_secs.max(0.001);
 
                 if args.verbose {
-                    let avg_day_secs: f64 =
-                        day_times.iter().sum::<f64>() / day_times.len() as f64;
+                    let avg_day_secs: f64 = day_times.iter().sum::<f64>() / day_times.len() as f64;
                     let remaining = (total_days - day_num) as f64 * avg_day_secs;
 
                     eprintln!(
@@ -622,8 +614,7 @@ fn main() {
                         eta = format_eta(remaining),
                     );
                 } else {
-                    let avg_day_secs: f64 =
-                        day_times.iter().sum::<f64>() / day_times.len() as f64;
+                    let avg_day_secs: f64 = day_times.iter().sum::<f64>() / day_times.len() as f64;
                     let remaining = (total_days - day_num) as f64 * avg_day_secs;
 
                     eprint!(

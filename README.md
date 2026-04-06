@@ -1,7 +1,7 @@
 # MBO-LOB-Reconstructor
 
 [![Build Status](https://github.com/nagarx/MBO-LOB-reconstructor/workflows/CI/badge.svg)](https://github.com/nagarx/MBO-LOB-reconstructor/actions)
-[![Rust](https://img.shields.io/badge/rust-1.83%2B-blue.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.82%2B-blue.svg)](https://www.rust-lang.org/)
 
 High-performance MBO to LOB reconstruction and analytics for deep learning preprocessing.
 
@@ -32,7 +32,7 @@ Additional standalone modules that can be used alongside LOB reconstruction:
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `databento` | Yes | Enable Databento DBN file support |
-| `export` | No | Enable Apache Parquet export for raw LOB snapshots and MBO events |
+| `export` | No | Enable Apache Parquet export for raw LOB snapshots and MBO events (+ TOML config for CLI) |
 
 ## Quick Start
 
@@ -40,6 +40,7 @@ Additional standalone modules that can be used alongside LOB reconstruction:
 
 ```rust
 use mbo_lob_reconstructor::{LobReconstructor, MboMessage, Action, Side};
+use mbo_lob_reconstructor::constants::NANODOLLARS_PER_DOLLAR_F64;
 
 // Create LOB reconstructor with 10 price levels
 let mut lob = LobReconstructor::new(10);
@@ -56,14 +57,14 @@ let msg = MboMessage::new(
 let state = lob.process_message(&msg)?;
 
 // Access LOB state
-println!("Best Bid: ${:.2}", state.best_bid.unwrap() as f64 / 1e9);
-println!("Best Ask: ${:.2}", state.best_ask.unwrap() as f64 / 1e9);
+println!("Best Bid: ${:.2}", state.best_bid.unwrap() as f64 / NANODOLLARS_PER_DOLLAR_F64);
+println!("Best Ask: ${:.2}", state.best_ask.unwrap() as f64 / NANODOLLARS_PER_DOLLAR_F64);
 ```
 
 ### Load from Databento DBN Files
 
 ```rust
-use mbo_lob_reconstructor::{DbnLoader, LobReconstructor, DayStats};
+use mbo_lob_reconstructor::{DbnLoader, LobReconstructor, DayStats, NormalizationParams};
 
 // Load compressed DBN file
 let loader = DbnLoader::new("data/NVDA.mbo.dbn.zst")?
@@ -83,7 +84,9 @@ for msg in loader.iter_messages()? {
     }
 }
 
-// Get normalization parameters for ML
+// Get normalization parameters for ML (standalone usage).
+// Note: feature-extractor-MBO-LOB provides its own NormalizationParams
+// with market_structure_zscore strategy for the full pipeline.
 let norm_params = NormalizationParams::from_day_stats(&day_stats, 10);
 norm_params.save_json("normalization.json")?;
 ```
@@ -231,8 +234,11 @@ for msg in messages {
     if let Some(event) = tracker.process_message(&msg) {
         match event {
             LifecycleEvent::Created(lc) => println!("New order: {}", lc.order_id),
+            LifecycleEvent::Modified { order_id, .. } => println!("Modified: {}", order_id),
+            LifecycleEvent::PartialFill { order_id, fill_size, .. } => {
+                println!("Partial fill: {} ({} shares)", order_id, fill_size)
+            }
             LifecycleEvent::Completed(lc) => println!("Order {} done in {:?}", lc.order_id, lc.time_alive_ns()),
-            _ => {}
         }
     }
 }
@@ -248,7 +254,7 @@ let mut aggregator = TradeAggregator::new(TradeAggregatorConfig::default());
 for msg in messages {
     if let Some(trade) = aggregator.process_message(&msg) {
         println!("Trade: {} @ ${:.2} (aggressor: {:?})",
-                 trade.size, trade.price as f64 / 1e9, trade.aggressor_side);
+                 trade.size, trade.price_f64(), trade.aggressor_side);
     }
 }
 
@@ -272,7 +278,7 @@ let mut lob = LobReconstructor::with_config(config);
 // - Allow: Return crossed state as-is (track in stats)
 // - UseLastValid: Return last valid state when crossed
 // - Error: Return error on crossed quote
-// - SkipUpdate: Skip updates that would cause crossing
+// - SkipUpdate: Return last valid state when crossed (same as UseLastValid)
 ```
 
 ## LOB State Analytics
@@ -358,7 +364,7 @@ LOB state before any feature extraction transforms.
 ```bash
 # Export all days in a directory
 cargo run --release --features export --bin export_to_parquet -- \
-    --input data/NVDA_2025-02-03_to_2026-01-07/ \
+    --input data/XNAS_ITCH/NVDA/mbo_2025-02-03_to_2026-01-07/ \
     --output data/exports/raw_lob/ \
     --symbol NVDA --levels 10
 
@@ -409,13 +415,16 @@ See `src/export/schema.rs` for the authoritative column definitions.
 
 ```
 mbo_lob_reconstructor/
+    lib.rs            # Crate root: module declarations, feature gates, re-exports
     types.rs          # Core types: MboMessage, LobState, Action, Side, MAX_LOB_LEVELS
-    error.rs          # Error types and Result alias
+    error.rs          # Error types (TlobError, 12 variants) and Result alias
+    constants.rs      # Domain constants: NANODOLLARS_PER_DOLLAR, NS_PER_SECOND, BASIS_POINTS_PER_UNIT, etc.
     lob/
-        reconstructor.rs    # LobReconstructor, process_message_into()
+        mod.rs              # LOB module hub, re-exports
+        reconstructor.rs    # LobReconstructor, process_message_into(), reduce_or_remove_order()
         price_level.rs      # PriceLevel with O(1) size caching
         multi_symbol.rs     # Multi-symbol support
-        queue_position.rs   # QueuePositionTracker (FIFO tracking)
+        queue_position.rs   # QueuePositionTracker (FIFO tracking, handle_order_reduction())
         order_lifecycle.rs  # OrderLifecycleTracker (Add→Modify→Cancel/Fill)
         day_boundary.rs     # DayBoundaryDetector (trading day detection)
         trade_aggregator.rs # TradeAggregator (fills→trades, aggressor side)
@@ -428,9 +437,13 @@ mbo_lob_reconstructor/
     source.rs         # MarketDataSource trait, DbnSource, VecSource
     dbn_bridge.rs     # Databento format conversion
     loader.rs         # DBN file streaming (zero-copy message iteration)
+    hotstore.rs       # HotStoreManager: decompressed file cache (~30% faster)
     statistics.rs     # DayStats, RunningStats, NormalizationParams
     analytics.rs      # DepthStats, MarketImpact, LiquidityMetrics
-    warnings.rs       # WarningTracker, WarningCategory
+    warnings.rs       # WarningTracker, WarningCategory, WarningTrackerConfig
+    bin/
+        export_to_parquet.rs      # CLI: export LOB snapshots + MBO events to Parquet
+        decompress_to_hot_store.rs # CLI: pre-decompress .dbn.zst files for faster loading
 ```
 
 ### Key Optimizations

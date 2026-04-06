@@ -36,6 +36,7 @@
 //! println!("Buy pressure: {:.2}%", (imbalance + 1.0) / 2.0 * 100.0);
 //! ```
 
+use crate::constants::NANODOLLARS_PER_DOLLAR_F64;
 use crate::types::{Action, MboMessage, Side};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -45,7 +46,7 @@ use std::collections::VecDeque;
 // ============================================================================
 
 /// Configuration for the trade aggregator.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TradeAggregatorConfig {
     /// Maximum number of recent trades to keep in memory.
     ///
@@ -94,6 +95,22 @@ impl TradeAggregatorConfig {
         self.track_fills = true;
         self
     }
+
+    /// Validate configuration values.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.aggregation_window_ns < 0 {
+            return Err(crate::error::TlobError::InvalidConfig(format!(
+                "TradeAggregatorConfig.aggregation_window_ns must be non-negative (got {})",
+                self.aggregation_window_ns
+            )));
+        }
+        if self.max_recent_trades == 0 {
+            return Err(crate::error::TlobError::InvalidConfig(
+                "TradeAggregatorConfig.max_recent_trades must be > 0".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -101,7 +118,7 @@ impl TradeAggregatorConfig {
 // ============================================================================
 
 /// A completed trade (potentially aggregating multiple fills).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trade {
     /// Trade timestamp (from the first fill).
     pub timestamp: i64,
@@ -135,7 +152,7 @@ pub struct Trade {
 impl Trade {
     /// Get the price as f64 (dollars).
     pub fn price_f64(&self) -> f64 {
-        self.price as f64 / 1_000_000_000.0
+        self.price as f64 / NANODOLLARS_PER_DOLLAR_F64
     }
 
     /// Check if this was a buyer-initiated trade.
@@ -150,7 +167,7 @@ impl Trade {
 }
 
 /// An individual fill within a trade.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fill {
     /// Fill timestamp.
     pub timestamp: i64,
@@ -206,6 +223,9 @@ struct PendingTrade {
 impl TradeAggregator {
     /// Create a new trade aggregator.
     pub fn new(config: TradeAggregatorConfig) -> Self {
+        config
+            .validate()
+            .expect("TradeAggregatorConfig validation failed");
         Self {
             config,
             recent_trades: VecDeque::new(),
@@ -269,7 +289,11 @@ impl TradeAggregator {
             let same_price = pending.price == price;
             let same_aggressor = pending.aggressor_side == aggressor_side;
 
-            if same_price && same_aggressor && time_diff >= 0 && time_diff <= self.config.aggregation_window_ns {
+            if same_price
+                && same_aggressor
+                && time_diff >= 0
+                && time_diff <= self.config.aggregation_window_ns
+            {
                 // Aggregate into pending trade
                 pending.size += size as u64;
                 pending.num_fills += 1;
@@ -538,6 +562,19 @@ mod tests {
         assert_eq!(config.max_recent_trades, 1000);
         assert_eq!(config.aggregation_window_ns, 1_000_000);
         assert!(!config.track_fills);
+    }
+
+    #[test]
+    fn test_trade_aggregator_config_validate() {
+        TradeAggregatorConfig::default().validate().unwrap();
+
+        let mut config = TradeAggregatorConfig::default();
+        config.aggregation_window_ns = -1;
+        assert!(config.validate().is_err());
+
+        let mut config = TradeAggregatorConfig::default();
+        config.max_recent_trades = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -832,7 +869,8 @@ mod tests {
         let mut agg = TradeAggregator::new(config);
 
         // Start a pending trade with valid timestamp
-        let result1 = agg.process_message(&make_trade_msg(1, Side::Ask, 100_000_000_000, 100, 1000));
+        let result1 =
+            agg.process_message(&make_trade_msg(1, Side::Ask, 100_000_000_000, 100, 1000));
         assert!(result1.is_none()); // Becomes pending
 
         // Process a fill with None timestamp - should finalize the pending trade
@@ -853,7 +891,13 @@ mod tests {
         let mut agg = TradeAggregator::new(config);
 
         // Start with a valid timestamp trade
-        agg.process_message(&make_trade_msg(1, Side::Ask, 100_000_000_000, 100, 1_000_000_000));
+        agg.process_message(&make_trade_msg(
+            1,
+            Side::Ask,
+            100_000_000_000,
+            100,
+            1_000_000_000,
+        ));
 
         // Now process a None-timestamp trade at the same price/side
         // Before the fix: this would incorrectly aggregate due to time_diff calculation bug
@@ -863,7 +907,10 @@ mod tests {
         // Should return the first trade (finalized by None timestamp)
         assert!(result.is_some());
         let trade = result.unwrap();
-        assert_eq!(trade.size, 100, "First trade should NOT be aggregated with None-timestamp trade");
+        assert_eq!(
+            trade.size, 100,
+            "First trade should NOT be aggregated with None-timestamp trade"
+        );
         assert_eq!(trade.num_fills, 1, "First trade should have exactly 1 fill");
 
         // Flush to get the None-timestamp trade
@@ -871,7 +918,10 @@ mod tests {
         assert!(final_trade.is_some());
         let none_ts_trade = final_trade.unwrap();
         assert_eq!(none_ts_trade.size, 50);
-        assert_eq!(none_ts_trade.timestamp, 0, "None timestamp should be stored as 0");
+        assert_eq!(
+            none_ts_trade.timestamp, 0,
+            "None timestamp should be stored as 0"
+        );
     }
 
     #[test]

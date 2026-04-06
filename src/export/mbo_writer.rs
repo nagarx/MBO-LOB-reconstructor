@@ -55,6 +55,7 @@ impl MboEventWriter {
         config: &ExportConfig,
         extra_metadata: HashMap<String, String>,
     ) -> Result<Self> {
+        config.validate()?;
         let mut schema = mbo_event_schema();
 
         let mut merged_meta = schema.metadata().clone();
@@ -127,9 +128,9 @@ impl MboEventWriter {
 
     fn flush_batch(&mut self) -> Result<()> {
         let record_batch = self.batch.flush(&self.schema)?;
-        self.writer.write(&record_batch).map_err(|e| {
-            TlobError::Generic(format!("Failed to write MBO row group: {e}"))
-        })?;
+        self.writer
+            .write(&record_batch)
+            .map_err(|e| TlobError::Generic(format!("Failed to write MBO row group: {e}")))?;
         self.row_groups += 1;
         Ok(())
     }

@@ -51,6 +51,7 @@
 //! }
 //! ```
 
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
@@ -73,7 +74,7 @@ use std::io::BufReader;
 ///
 /// Provides information about the data being processed, useful for
 /// logging, validation, and organizing output files.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceMetadata {
     /// Trading symbol (e.g., "NVDA", "AAPL")
     pub symbol: Option<String>,
@@ -561,8 +562,8 @@ mod tests {
             let test_file = std::env::var("TEST_DBN_FILE").unwrap_or_else(|_| {
                 // Try common test file locations
                 let candidates = [
-                    "../data/NVDA_2025-02-01_to_2025-09-30/NVDA_2025-02-03.mbo.dbn.zst",
-                    "../../data/NVDA_2025-02-01_to_2025-09-30/NVDA_2025-02-03.mbo.dbn.zst",
+                    "../data/XNAS_ITCH/NVDA/mbo_2025-02-03_to_2026-01-07/xnas-itch-20250203.mbo.dbn.zst",
+                    "../../data/XNAS_ITCH/NVDA/mbo_2025-02-03_to_2026-01-07/xnas-itch-20250203.mbo.dbn.zst",
                 ];
                 for path in candidates {
                     if std::path::Path::new(path).exists() {

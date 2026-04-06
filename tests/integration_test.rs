@@ -24,7 +24,8 @@ use mbo_lob_reconstructor::{
 };
 
 /// Path to the test data file (first day of NVDA data)
-const TEST_DATA_PATH: &str = "data/NVDA_2025-02-01_to_2025-09-30/xnas-itch-20250203.mbo.dbn.zst";
+const TEST_DATA_PATH: &str =
+    "data/XNAS_ITCH/NVDA/mbo_2025-02-03_to_2026-01-07/xnas-itch-20250203.mbo.dbn.zst";
 
 /// Check if test data is available
 fn test_data_available() -> bool {

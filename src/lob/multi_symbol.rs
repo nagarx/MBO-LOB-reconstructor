@@ -63,6 +63,11 @@ impl MultiSymbolLob {
     /// # Arguments
     /// * `levels` - Number of price levels for each symbol
     pub fn new(levels: usize) -> Self {
+        // Validate levels
+        let config = super::reconstructor::LobConfig::new(levels);
+        config
+            .validate()
+            .expect("MultiSymbolLob: LobConfig validation failed");
         Self {
             levels,
             lobs: AHashMap::new(),
@@ -158,7 +163,7 @@ impl MultiSymbolLob {
     /// Reset all symbols.
     pub fn reset_all(&mut self) {
         for lob in self.lobs.values_mut() {
-            lob.reset();
+            lob.full_reset();
         }
 
         self.stats.total_messages = 0;

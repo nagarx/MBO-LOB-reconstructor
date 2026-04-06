@@ -50,6 +50,10 @@ pub enum TlobError {
     #[error("Locked quote detected: best_bid={0} == best_ask={1}")]
     LockedQuote(i64, i64),
 
+    /// Invalid configuration parameter
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+
     /// Generic error with context
     #[error("Error: {0}")]
     Generic(String),

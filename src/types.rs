@@ -12,6 +12,7 @@
 //! heap allocations in the hot path. This provides significant throughput improvements
 //! (~30-50% faster) for high-frequency LOB reconstruction.
 
+use crate::constants::{BASIS_POINTS_PER_UNIT, NANODOLLARS_PER_DOLLAR_F64, NS_PER_SECOND_F64};
 use serde::{Deserialize, Serialize};
 
 /// Maximum supported LOB levels (compile-time constant).
@@ -159,10 +160,29 @@ impl MboMessage {
     /// Get price as floating point dollars.
     #[inline]
     pub fn price_as_f64(&self) -> f64 {
-        self.price as f64 / 1e9
+        self.price as f64 / NANODOLLARS_PER_DOLLAR_F64
+    }
+
+    /// Returns `true` if this message represents a system event (heartbeat,
+    /// status update, metadata) rather than a valid order.
+    ///
+    /// System messages are identified by any of:
+    /// - `order_id == 0` (no associated order)
+    /// - `size == 0` (no quantity)
+    /// - `price <= 0` (no valid price)
+    ///
+    /// These messages are common in Databento MBO data (~10-15% of messages)
+    /// and should typically be filtered before LOB reconstruction.
+    #[inline]
+    pub fn is_system_message(&self) -> bool {
+        self.order_id == 0 || self.size == 0 || self.price <= 0
     }
 
     /// Validate the message fields.
+    ///
+    /// Unlike [`is_system_message()`], this method checks whether a message
+    /// that *should* represent a valid order actually has valid field values.
+    /// System messages (heartbeats, status) should be filtered first.
     pub fn validate(&self) -> crate::error::Result<()> {
         use crate::error::TlobError;
 
@@ -185,7 +205,7 @@ impl MboMessage {
 /// Order information stored in LOB.
 ///
 /// Minimal representation to save memory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Order {
     pub side: Side,
     pub price: i64,
@@ -193,7 +213,7 @@ pub struct Order {
 }
 
 /// Book consistency status after validation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BookConsistency {
     /// Book is valid: best_bid < best_ask
     Valid,
@@ -260,7 +280,7 @@ impl BookConsistency {
 /// - `delta_ns`: Time since last LOB update (for dP/dt, dV/dt)
 /// - `triggering_action`: What caused this state change
 /// - `triggering_side`: Which side was affected
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LobState {
     /// Bid prices in nanodollars (highest to lowest).
     /// Index 0 = best bid (highest price), increasing index = deeper levels.
@@ -377,7 +397,7 @@ impl LobState {
     #[inline]
     pub fn delta_seconds(&self) -> Option<f64> {
         if self.delta_ns > 0 {
-            Some(self.delta_ns as f64 / 1e9)
+            Some(self.delta_ns as f64 / NS_PER_SECOND_F64)
         } else {
             None
         }
@@ -393,7 +413,7 @@ impl LobState {
     #[inline]
     pub fn event_intensity(&self) -> Option<f64> {
         if self.delta_ns > 0 {
-            Some(1e9 / self.delta_ns as f64)
+            Some(NS_PER_SECOND_F64 / self.delta_ns as f64)
         } else {
             None
         }
@@ -521,8 +541,8 @@ impl LobState {
     pub fn mid_price(&self) -> Option<f64> {
         match (self.best_bid, self.best_ask) {
             (Some(bid), Some(ask)) => {
-                let bid_f = bid as f64 / 1e9;
-                let ask_f = ask as f64 / 1e9;
+                let bid_f = bid as f64 / NANODOLLARS_PER_DOLLAR_F64;
+                let ask_f = ask as f64 / NANODOLLARS_PER_DOLLAR_F64;
                 Some((bid_f + ask_f) / 2.0)
             }
             _ => None,
@@ -534,8 +554,8 @@ impl LobState {
     pub fn spread(&self) -> Option<f64> {
         match (self.best_bid, self.best_ask) {
             (Some(bid), Some(ask)) => {
-                let bid_f = bid as f64 / 1e9;
-                let ask_f = ask as f64 / 1e9;
+                let bid_f = bid as f64 / NANODOLLARS_PER_DOLLAR_F64;
+                let ask_f = ask as f64 / NANODOLLARS_PER_DOLLAR_F64;
                 Some(ask_f - bid_f)
             }
             _ => None,
@@ -552,7 +572,7 @@ impl LobState {
     #[inline]
     pub fn spread_bps(&self) -> Option<f64> {
         match (self.mid_price(), self.spread()) {
-            (Some(mid), Some(spread)) if mid > 0.0 => Some((spread / mid) * 10000.0),
+            (Some(mid), Some(spread)) if mid > 0.0 => Some((spread / mid) * BASIS_POINTS_PER_UNIT),
             _ => None,
         }
     }
@@ -580,8 +600,8 @@ impl LobState {
                 let total_size = bid_size + ask_size;
 
                 if total_size > 0.0 {
-                    let bid_f = bid as f64 / 1e9;
-                    let ask_f = ask as f64 / 1e9;
+                    let bid_f = bid as f64 / NANODOLLARS_PER_DOLLAR_F64;
+                    let ask_f = ask as f64 / NANODOLLARS_PER_DOLLAR_F64;
                     Some((bid_f * ask_size + ask_f * bid_size) / total_size)
                 } else {
                     None
@@ -654,7 +674,7 @@ impl LobState {
             let price = self.bid_prices[i];
             let size = self.bid_sizes[i] as u64;
             if price > 0 && size > 0 {
-                total_value += (price as f64 / 1e9) * (size as f64);
+                total_value += (price as f64 / NANODOLLARS_PER_DOLLAR_F64) * (size as f64);
                 total_size += size;
             }
         }
@@ -686,7 +706,7 @@ impl LobState {
             let price = self.ask_prices[i];
             let size = self.ask_sizes[i] as u64;
             if price > 0 && size > 0 {
-                total_value += (price as f64 / 1e9) * (size as f64);
+                total_value += (price as f64 / NANODOLLARS_PER_DOLLAR_F64) * (size as f64);
                 total_size += size;
             }
         }

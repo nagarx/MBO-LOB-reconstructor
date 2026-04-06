@@ -24,6 +24,7 @@
 //! println!("Price mean: {}, std: {}", summary.price_mean, summary.price_std);
 //! ```
 
+use crate::constants::{DIVISION_GUARD_EPS, NANODOLLARS_PER_DOLLAR_F64, NS_PER_SECOND_F64};
 use crate::types::LobState;
 use serde::{Deserialize, Serialize};
 
@@ -35,7 +36,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Uses Welford's algorithm for numerical stability with large datasets.
 /// This avoids the need to store all values in memory.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RunningStats {
     /// Number of observations
     pub count: u64,
@@ -161,7 +162,7 @@ impl RunningStats {
 /// - Spread statistics
 /// - Volume statistics
 /// - Data quality metrics
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DayStats {
     /// Identifier for this day (e.g., "2025-02-03")
     pub date: String,
@@ -301,12 +302,14 @@ impl DayStats {
 
         // Best bid price
         if let Some(bid) = state.best_bid {
-            self.best_bid_price.update(bid as f64 / 1e9);
+            self.best_bid_price
+                .update(bid as f64 / NANODOLLARS_PER_DOLLAR_F64);
         }
 
         // Best ask price
         if let Some(ask) = state.best_ask {
-            self.best_ask_price.update(ask as f64 / 1e9);
+            self.best_ask_price
+                .update(ask as f64 / NANODOLLARS_PER_DOLLAR_F64);
         }
 
         // Best bid size
@@ -363,7 +366,7 @@ impl DayStats {
     /// Get the duration of the trading session in seconds.
     pub fn duration_seconds(&self) -> Option<f64> {
         match (self.first_timestamp, self.last_timestamp) {
-            (Some(first), Some(last)) => Some((last - first) as f64 / 1e9),
+            (Some(first), Some(last)) => Some((last - first) as f64 / NS_PER_SECOND_F64),
             _ => None,
         }
     }
@@ -450,7 +453,7 @@ impl DayStats {
 ///
 /// These can be saved and loaded to ensure consistent normalization
 /// across training and inference.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NormalizationParams {
     /// Mean for each feature
     pub means: Vec<f64>,
@@ -509,9 +512,10 @@ impl NormalizationParams {
         // For now, use best bid/ask statistics for all levels
         // In practice, you'd want per-level statistics
         let price_mean = stats.mid_price.mean;
-        let price_std = stats.mid_price.std().max(1e-8); // Avoid division by zero
+        let price_std = stats.mid_price.std().max(DIVISION_GUARD_EPS); // Avoid division by zero
         let size_mean = (stats.best_bid_size.mean + stats.best_ask_size.mean) / 2.0;
-        let size_std = ((stats.best_bid_size.std() + stats.best_ask_size.std()) / 2.0).max(1e-8);
+        let size_std =
+            ((stats.best_bid_size.std() + stats.best_ask_size.std()) / 2.0).max(DIVISION_GUARD_EPS);
 
         for i in 0..levels {
             // Ask price

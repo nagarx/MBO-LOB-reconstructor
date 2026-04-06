@@ -64,34 +64,22 @@ pub fn lob_snapshot_schema(levels: usize, include_derived: bool) -> Schema {
         Field::new("best_ask", DataType::Int64, true),
         Field::new(
             "bid_prices",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Int64, false)),
-                n,
-            ),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int64, false)), n),
             false,
         ),
         Field::new(
             "bid_sizes",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::UInt32, false)),
-                n,
-            ),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt32, false)), n),
             false,
         ),
         Field::new(
             "ask_prices",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Int64, false)),
-                n,
-            ),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int64, false)), n),
             false,
         ),
         Field::new(
             "ask_sizes",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::UInt32, false)),
-                n,
-            ),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt32, false)), n),
             false,
         ),
         Field::new("delta_ns", DataType::UInt64, false),
@@ -299,7 +287,14 @@ mod tests {
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(
             names,
-            vec!["timestamp_ns", "order_id", "action", "side", "price", "size"]
+            vec![
+                "timestamp_ns",
+                "order_id",
+                "action",
+                "side",
+                "price",
+                "size"
+            ]
         );
     }
 
@@ -315,11 +310,30 @@ mod tests {
     #[test]
     fn test_lob_schema_nullability() {
         let schema = lob_snapshot_schema(10, true);
-        let nullable_fields = ["best_bid", "best_ask", "triggering_action", "triggering_side",
-                               "mid_price", "spread", "spread_bps", "microprice", "depth_imbalance"];
-        let non_nullable_fields = ["timestamp_ns", "sequence", "levels", "bid_prices", "bid_sizes",
-                                   "ask_prices", "ask_sizes", "delta_ns",
-                                   "total_bid_volume", "total_ask_volume", "book_consistency"];
+        let nullable_fields = [
+            "best_bid",
+            "best_ask",
+            "triggering_action",
+            "triggering_side",
+            "mid_price",
+            "spread",
+            "spread_bps",
+            "microprice",
+            "depth_imbalance",
+        ];
+        let non_nullable_fields = [
+            "timestamp_ns",
+            "sequence",
+            "levels",
+            "bid_prices",
+            "bid_sizes",
+            "ask_prices",
+            "ask_sizes",
+            "delta_ns",
+            "total_bid_volume",
+            "total_ask_volume",
+            "book_consistency",
+        ];
 
         for name in nullable_fields {
             let field = schema.field_with_name(name).unwrap();

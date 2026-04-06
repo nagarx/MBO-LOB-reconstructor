@@ -402,7 +402,11 @@ mod tests {
 
         let result = level.update_order_size(&999, 50);
         assert_eq!(result, None);
-        assert_eq!(level.total_size(), 100, "total_size must not change on nonexistent order");
+        assert_eq!(
+            level.total_size(),
+            100,
+            "total_size must not change on nonexistent order"
+        );
         assert_eq!(level.compute_actual_total(), level.total_size());
     }
 
@@ -415,7 +419,11 @@ mod tests {
         let old = level.update_order_size(&1, 0);
         assert_eq!(old, Some(100));
         assert_eq!(level.total_size(), 200);
-        assert_eq!(level.order_count(), 2, "order must remain in map even at size 0");
+        assert_eq!(
+            level.order_count(),
+            2,
+            "order must remain in map even at size 0"
+        );
         assert_eq!(level.get(&1), Some(&0));
         assert_eq!(level.compute_actual_total(), level.total_size());
     }

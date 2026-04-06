@@ -14,9 +14,10 @@
 //! Example:
 //! ```bash
 //! cargo run --release --example process_nvda_single_day \
-//!   /Users/nigo/local/databento/data/NVDA_2025-02-01_to_2025-09-30/xnas-itch-20250203.mbo.dbn.zst
+//!   ../data/XNAS_ITCH/NVDA/mbo_2025-02-03_to_2026-01-07/xnas-itch-20250203.mbo.dbn.zst
 //! ```
 
+use mbo_lob_reconstructor::constants::{NANODOLLARS_PER_DOLLAR_F64, NS_PER_SECOND_F64};
 use mbo_lob_reconstructor::{DbnLoader, LobReconstructor};
 use std::env;
 use std::time::Instant;
@@ -70,14 +71,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for mbo_msg in loader.iter_messages()? {
         // Skip invalid messages (system messages, metadata, etc.)
         // Common patterns: order_id=0, size=0, invalid price
-        if mbo_msg.order_id == 0 || mbo_msg.size == 0 || mbo_msg.price <= 0 {
+        if mbo_msg.is_system_message() {
             skipped_invalid_count += 1;
             if skipped_invalid_count <= 10 {
                 // Log first few skipped messages for debugging
                 log::debug!(
                     "Skipping invalid message #{}: order_id={}, action={:?}, side={:?}, price={}, size={}",
                     skipped_invalid_count, mbo_msg.order_id, mbo_msg.action, mbo_msg.side,
-                    mbo_msg.price as f64 / 1e9, mbo_msg.size
+                    mbo_msg.price as f64 / NANODOLLARS_PER_DOLLAR_F64, mbo_msg.size
                 );
             }
             continue;
@@ -93,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 log::error!(
                     "LOB processing error at message {}: order_id={}, action={:?}, side={:?}, price={}, size={}, error={}",
                     message_count, mbo_msg.order_id, mbo_msg.action, mbo_msg.side,
-                    mbo_msg.price as f64 / 1e9, mbo_msg.size, e
+                    mbo_msg.price as f64 / NANODOLLARS_PER_DOLLAR_F64, mbo_msg.size, e
                 );
 
                 // Skip LOB errors instead of failing - more resilient
@@ -212,7 +213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  BID SIDE:");
     for i in 0..5.min(final_state.levels) {
         if final_state.bid_prices[i] > 0 {
-            let price = final_state.bid_prices[i] as f64 / 1e9;
+            let price = final_state.bid_prices[i] as f64 / NANODOLLARS_PER_DOLLAR_F64;
             let size = final_state.bid_sizes[i];
             println!(
                 "    Level {}: ${:>10.4} × {:>8} shares",
@@ -226,7 +227,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  ASK SIDE:");
     for i in 0..5.min(final_state.levels) {
         if final_state.ask_prices[i] > 0 {
-            let price = final_state.ask_prices[i] as f64 / 1e9;
+            let price = final_state.ask_prices[i] as f64 / NANODOLLARS_PER_DOLLAR_F64;
             let size = final_state.ask_sizes[i];
             println!(
                 "    Level {}: ${:>10.4} × {:>8} shares",
@@ -239,7 +240,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // Efficiency metrics
-    let ns_per_msg = (total_time * 1_000_000_000.0) / message_count as f64;
+    let ns_per_msg = (total_time * NS_PER_SECOND_F64) / message_count as f64;
     let speedup_vs_python = throughput / 20_000.0; // Assuming Python does ~20K msg/s
 
     println!("🎯 EFFICIENCY METRICS:");

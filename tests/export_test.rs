@@ -37,7 +37,8 @@ struct TempDir(std::path::PathBuf);
 
 impl TempDir {
     fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("lob_export_test_{name}_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("lob_export_test_{name}_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         Self(dir)
     }
@@ -127,7 +128,10 @@ fn test_schema_metadata_keys() {
     assert_eq!(meta.get("source").unwrap(), "mbo-lob-reconstructor");
     assert_eq!(meta.get("price_unit").unwrap(), "nanodollars");
     assert_eq!(meta.get("size_unit").unwrap(), "shares");
-    assert_eq!(meta.get("timestamp_unit").unwrap(), "nanoseconds_since_epoch");
+    assert_eq!(
+        meta.get("timestamp_unit").unwrap(),
+        "nanoseconds_since_epoch"
+    );
     assert!(meta.get("reconstructor_version").is_some());
 }
 
@@ -245,7 +249,10 @@ fn test_lob_single_snapshot_roundtrip() {
     // Derived: book_consistency
     let bc = batch.column_by_name("book_consistency").unwrap();
     let bc_arr = bc.as_any().downcast_ref::<UInt8Array>().unwrap();
-    assert_eq!(bc_arr.value(0), book_consistency_to_u8(BookConsistency::Valid));
+    assert_eq!(
+        bc_arr.value(0),
+        book_consistency_to_u8(BookConsistency::Valid)
+    );
 }
 
 #[test]
@@ -283,7 +290,10 @@ fn test_lob_fixed_size_list_values() {
     let batch = reader.into_iter().next().unwrap().unwrap();
 
     let bid_prices = batch.column_by_name("bid_prices").unwrap();
-    let fsl = bid_prices.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+    let fsl = bid_prices
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .unwrap();
     let inner = fsl.value(0);
     let inner_arr = inner.as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(inner_arr.value(0), 100_000_000_000);
@@ -291,7 +301,10 @@ fn test_lob_fixed_size_list_values() {
     assert_eq!(inner_arr.value(2), 98_000_000_000);
 
     let bid_sizes = batch.column_by_name("bid_sizes").unwrap();
-    let fsl_s = bid_sizes.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+    let fsl_s = bid_sizes
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .unwrap();
     let inner_s = fsl_s.value(0);
     let inner_s_arr = inner_s.as_any().downcast_ref::<UInt32Array>().unwrap();
     assert_eq!(inner_s_arr.value(0), 100);
@@ -299,7 +312,10 @@ fn test_lob_fixed_size_list_values() {
     assert_eq!(inner_s_arr.value(2), 300);
 
     let ask_sizes = batch.column_by_name("ask_sizes").unwrap();
-    let fsl_as = ask_sizes.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+    let fsl_as = ask_sizes
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .unwrap();
     let inner_as = fsl_as.value(0);
     let inner_as_arr = inner_as.as_any().downcast_ref::<UInt32Array>().unwrap();
     assert_eq!(inner_as_arr.value(2), 0, "Unused level should be zero");
@@ -341,7 +357,10 @@ fn test_lob_empty_book() {
     // book_consistency should be Empty (1)
     let bc = batch.column_by_name("book_consistency").unwrap();
     let bc_arr = bc.as_any().downcast_ref::<UInt8Array>().unwrap();
-    assert_eq!(bc_arr.value(0), book_consistency_to_u8(BookConsistency::Empty));
+    assert_eq!(
+        bc_arr.value(0),
+        book_consistency_to_u8(BookConsistency::Empty)
+    );
 }
 
 #[test]
@@ -372,7 +391,10 @@ fn test_lob_crossed_book() {
 
     let bc = batch.column_by_name("book_consistency").unwrap();
     let bc_arr = bc.as_any().downcast_ref::<UInt8Array>().unwrap();
-    assert_eq!(bc_arr.value(0), book_consistency_to_u8(BookConsistency::Crossed));
+    assert_eq!(
+        bc_arr.value(0),
+        book_consistency_to_u8(BookConsistency::Crossed)
+    );
 }
 
 #[test]
@@ -403,7 +425,10 @@ fn test_lob_locked_book() {
 
     let bc = batch.column_by_name("book_consistency").unwrap();
     let bc_arr = bc.as_any().downcast_ref::<UInt8Array>().unwrap();
-    assert_eq!(bc_arr.value(0), book_consistency_to_u8(BookConsistency::Locked));
+    assert_eq!(
+        bc_arr.value(0),
+        book_consistency_to_u8(BookConsistency::Locked)
+    );
 }
 
 #[test]
@@ -635,16 +660,36 @@ fn test_mbo_roundtrip_fidelity() {
         .unwrap();
     let batch = reader.into_iter().next().unwrap().unwrap();
 
-    let ts = batch.column_by_name("timestamp_ns").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+    let ts = batch
+        .column_by_name("timestamp_ns")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     assert_eq!(ts.value(0), 987_654_321_000_000_000);
 
-    let oid = batch.column_by_name("order_id").unwrap().as_any().downcast_ref::<UInt64Array>().unwrap();
+    let oid = batch
+        .column_by_name("order_id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
     assert_eq!(oid.value(0), 9999);
 
-    let price = batch.column_by_name("price").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+    let price = batch
+        .column_by_name("price")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     assert_eq!(price.value(0), 123_456_789_000);
 
-    let size = batch.column_by_name("size").unwrap().as_any().downcast_ref::<UInt32Array>().unwrap();
+    let size = batch
+        .column_by_name("size")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap();
     assert_eq!(size.value(0), 42);
 }
 
@@ -668,7 +713,12 @@ fn test_mbo_null_timestamp() {
         .unwrap();
     let batch = reader.into_iter().next().unwrap().unwrap();
 
-    let ts = batch.column_by_name("timestamp_ns").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+    let ts = batch
+        .column_by_name("timestamp_ns")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     assert!(ts.is_null(0), "None timestamp should be null in Parquet");
 }
 
@@ -827,7 +877,10 @@ fn test_downsample_none_strategy() {
     }
     let stats = writer.finish().unwrap();
 
-    assert_eq!(stats.rows_written, 7, "DownsampleStrategy::None should export all");
+    assert_eq!(
+        stats.rows_written, 7,
+        "DownsampleStrategy::None should export all"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -904,10 +957,10 @@ fn test_price_nanodollar_roundtrip() {
 
     let mut state = LobState::new(2);
     let prices: [i64; 4] = [
-        100_000_000_000,   // $100.00
-        100_005_000_000,   // $100.005
-        99_999_999_999,    // $99.999999999 (maximum precision)
-        1,                 // $0.000000001 (minimum representable)
+        100_000_000_000, // $100.00
+        100_005_000_000, // $100.005
+        99_999_999_999,  // $99.999999999 (maximum precision)
+        1,               // $0.000000001 (minimum representable)
     ];
 
     for &price in &prices {
@@ -933,7 +986,8 @@ fn test_price_nanodollar_roundtrip() {
         let bb = batch.column_by_name("best_bid").unwrap();
         let bb_arr = bb.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(
-            bb_arr.value(0), price,
+            bb_arr.value(0),
+            price,
             "Price {price} should round-trip exactly through Parquet i64"
         );
     }
@@ -965,28 +1019,64 @@ fn test_derived_values_match_lobstate_methods() {
         .unwrap();
     let batch = reader.into_iter().next().unwrap().unwrap();
 
-    let mp = batch.column_by_name("mid_price").unwrap().as_any().downcast_ref::<Float64Array>().unwrap();
+    let mp = batch
+        .column_by_name("mid_price")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
     assert!(
         (mp.value(0) - expected_mid).abs() < 1e-10,
-        "mid_price: got {} expected {expected_mid}", mp.value(0)
+        "mid_price: got {} expected {expected_mid}",
+        mp.value(0)
     );
 
-    let sp = batch.column_by_name("spread").unwrap().as_any().downcast_ref::<Float64Array>().unwrap();
+    let sp = batch
+        .column_by_name("spread")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
     assert!((sp.value(0) - expected_spread).abs() < 1e-10);
 
-    let bps = batch.column_by_name("spread_bps").unwrap().as_any().downcast_ref::<Float64Array>().unwrap();
+    let bps = batch
+        .column_by_name("spread_bps")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
     assert!((bps.value(0) - expected_bps).abs() < 1e-6);
 
-    let micro = batch.column_by_name("microprice").unwrap().as_any().downcast_ref::<Float64Array>().unwrap();
+    let micro = batch
+        .column_by_name("microprice")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
     assert!((micro.value(0) - expected_micro).abs() < 1e-10);
 
-    let bv = batch.column_by_name("total_bid_volume").unwrap().as_any().downcast_ref::<UInt64Array>().unwrap();
+    let bv = batch
+        .column_by_name("total_bid_volume")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
     assert_eq!(bv.value(0), expected_bid_vol);
 
-    let av = batch.column_by_name("total_ask_volume").unwrap().as_any().downcast_ref::<UInt64Array>().unwrap();
+    let av = batch
+        .column_by_name("total_ask_volume")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
     assert_eq!(av.value(0), expected_ask_vol);
 
-    let di = batch.column_by_name("depth_imbalance").unwrap().as_any().downcast_ref::<Float64Array>().unwrap();
+    let di = batch
+        .column_by_name("depth_imbalance")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
     assert!((di.value(0) - expected_imbalance).abs() < 1e-10);
 }
 
@@ -1056,12 +1146,7 @@ fn test_lob_multi_row_varying_states() {
 
     let mut writer = LobSnapshotWriter::new(&path, &config, HashMap::new()).unwrap();
 
-    let actions = [
-        Action::Add,
-        Action::Trade,
-        Action::Cancel,
-        Action::Modify,
-    ];
+    let actions = [Action::Add, Action::Trade, Action::Cancel, Action::Modify];
 
     for (i, action) in actions.iter().enumerate() {
         let mut state = make_test_state(2);
@@ -1085,7 +1170,12 @@ fn test_lob_multi_row_varying_states() {
     assert_eq!(total, 4);
 
     let batch = &batches[0];
-    let seq = batch.column_by_name("sequence").unwrap().as_any().downcast_ref::<UInt64Array>().unwrap();
+    let seq = batch
+        .column_by_name("sequence")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
     for i in 0..4 {
         assert_eq!(seq.value(i), i as u64, "Sequence should match row index");
     }

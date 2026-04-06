@@ -73,6 +73,7 @@ src/
 ├── hotstore.rs         # HotStoreConfig, HotStoreManager
 ├── loader.rs           # DbnLoader for file I/O (auto-detects compression)
 ├── dbn_bridge.rs       # Databento format conversion
+├── constants.rs        # Domain constants: NANODOLLARS_PER_DOLLAR, NS_PER_SECOND, BASIS_POINTS_PER_UNIT, DIVISION_GUARD_EPS (10 total)
 ├── statistics.rs       # RunningStats, DayStats, NormalizationParams
 ├── analytics.rs        # DepthStats, MarketImpact, LiquidityMetrics
 ├── warnings.rs         # WarningTracker, WarningCategory
@@ -100,8 +101,8 @@ src/
          │              │              │
          ▼              ▼              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                      types.rs + error.rs                         │
-│              (MboMessage, LobState, TlobError)                   │
+│                types.rs + error.rs + constants.rs                 │
+│        (MboMessage, LobState, TlobError, domain constants)       │
 └─────────────────────────────────────────────────────────────────┘
          ▲
          │ (feature-gated: databento)
@@ -115,22 +116,24 @@ src/
 
 | Module | Responsibility | Key Types |
 |--------|---------------|-----------|
-| `types` | Data structures, no logic | `MboMessage`, `LobState`, `Action`, `Side`, `MAX_LOB_LEVELS` |
-| `error` | Error definitions | `TlobError`, `Result<T>` |
-| `lob/reconstructor` | Core LOB reconstruction | `LobReconstructor`, `LobConfig`, `LobStats` |
+| `types` | Data structures, no logic | `MboMessage`, `LobState`, `Action`, `Side`, `Order`, `BookConsistency`, `MAX_LOB_LEVELS` |
+| `constants` | Domain constants (10 total: prices, time, precision) | `NANODOLLARS_PER_DOLLAR`, `NANODOLLARS_PER_DOLLAR_F64`, `BASIS_POINTS_PER_UNIT`, `DIVISION_GUARD_EPS`, `NS_PER_MILLISECOND`, `NS_PER_SECOND`, `NS_PER_SECOND_F64`, `NS_PER_MINUTE`, `NS_PER_HOUR`, `NS_PER_DAY` |
+| `error` | Error definitions (12 variants) | `TlobError`, `Result<T>` |
+| `lob/reconstructor` | Core LOB reconstruction | `LobReconstructor`, `LobConfig`, `LobStats`, `CrossedQuotePolicy` |
 | `lob/price_level` | Price level with cached size | `PriceLevel` (O(1) aggregate size) |
-| `lob/multi_symbol` | Multi-stock management | `MultiSymbolLob`, `MultiSymbolStats` |
-| `lob/queue_position` | FIFO queue position tracking | `QueuePositionTracker`, `QueuePositionConfig`, `QueuePositionInfo` |
-| `lob/order_lifecycle` | Order lifecycle tracking | `OrderLifecycleTracker`, `OrderLifecycle`, `LifecycleEvent` |
-| `lob/day_boundary` | Trading day detection | `DayBoundaryDetector`, `DayBoundaryConfig`, `DayBoundary` |
+| `lob/multi_symbol` | Multi-stock management | `MultiSymbolLob` |
+| `lob/queue_position` | FIFO queue position tracking | `QueuePositionTracker`, `QueuePositionConfig`, `QueuePositionInfo`, `QueueStats` |
+| `lob/order_lifecycle` | Order lifecycle tracking | `OrderLifecycleTracker`, `OrderLifecycle`, `LifecycleEvent`, `LifecycleStats`, `ActiveOrderFeatures` |
+| `lob/day_boundary` | Trading day detection | `DayBoundaryDetector`, `DayBoundaryConfig`, `DayBoundary`, `DayBoundaryStats` |
 | `lob/trade_aggregator` | Trade aggregation | `TradeAggregator`, `Trade`, `Fill` |
-| `source` | Provider abstraction | `MarketDataSource`, `DbnSource`, `VecSource` |
+| `source` | Provider abstraction | `MarketDataSource`, `SourceMetadata`, `DbnSource`, `VecSource` |
 | `hotstore` | Decompressed data caching | `HotStoreConfig`, `HotStoreManager` |
-| `loader` | DBN file streaming | `DbnLoader`, `MessageIterator`, `DynDecoder` |
+| `loader` | DBN file streaming | `DbnLoader`, `MessageIterator`, `LoaderStats` |
 | `dbn_bridge` | DBN → internal conversion | `DbnBridge` |
 | `statistics` | ML statistics | `RunningStats`, `DayStats`, `NormalizationParams` |
 | `analytics` | Market microstructure | `DepthStats`, `MarketImpact`, `LiquidityMetrics` |
-| `warnings` | Issue tracking | `WarningTracker`, `Warning`, `WarningCategory` |
+| `warnings` | Issue tracking | `WarningTracker`, `WarningTrackerConfig`, `Warning`, `WarningCategory`, `WarningSummary` |
+| `export` | Parquet export (feature-gated) | `ExportConfig`, `LobSnapshotWriter`, `MboEventWriter`, `ParquetExportStats` |
 
 ---
 
@@ -145,13 +148,13 @@ pub struct MboMessage {
     pub order_id: u64,        // Unique order identifier (0 = system message)
     pub action: Action,       // Add, Modify, Cancel, Trade, Fill, Clear, None
     pub side: Side,           // Bid, Ask, None
-    pub price: i64,           // Fixed-point: divide by 1e9 for dollars
+    pub price: i64,           // Fixed-point nanodollars (divide by NANODOLLARS_PER_DOLLAR_F64 for dollars)
     pub size: u32,            // Shares/contracts
     pub timestamp: Option<i64>, // Nanoseconds since epoch
 }
 ```
 
-**Critical**: Messages with `order_id=0`, `size=0`, or `price<=0` are **system messages** (heartbeats, status updates), not valid orders.
+**Critical**: Messages with `order_id=0`, `size=0`, or `price<=0` are **system messages** (heartbeats, status updates), not valid orders. Use `msg.is_system_message()` to check (replaces the deprecated `is_valid_order()` free function).
 
 ### Action Enum
 
@@ -419,10 +422,12 @@ pub struct LobConfig {
 ```rust
 pub enum CrossedQuotePolicy {
     Allow,        // Return crossed state as-is (default)
-    UseLastValid, // Return last known valid state
-    Error,        // Return Err(TlobError::CrossedQuote)
-    SkipUpdate,   // Don't update book, return last valid
+    UseLastValid, // Return last valid state (book IS mutated internally)
+    Error,        // Return Err(CrossedQuote) or Err(LockedQuote)
+    SkipUpdate,   // Same as UseLastValid (book IS mutated, returns last valid state)
 }
+// Note: SkipUpdate and UseLastValid share the same code path.
+// Both allow internal book mutations; only the returned LobState is affected.
 ```
 
 ### Configuration Pattern
@@ -441,14 +446,13 @@ let mut lob = LobReconstructor::with_config(config);
 
 ```rust
 pub struct QueuePositionConfig {
-    pub max_levels_per_side: usize,      // Default: 10
     pub track_position_changes: bool,    // Default: false (saves memory)
     pub max_position_changes: usize,     // Default: 1000
 }
 
 // Presets
 QueuePositionConfig::default()      // Standard tracking
-QueuePositionConfig::research()     // Full tracking (20 levels, changes enabled)
+QueuePositionConfig::research()     // Full tracking (changes enabled, 10K history)
 ```
 
 ### OrderLifecycleConfig (src/lob/order_lifecycle.rs)
@@ -466,16 +470,17 @@ pub struct OrderLifecycleConfig {
 
 ```rust
 pub struct DayBoundaryConfig {
-    pub market_open_ns: i64,       // Nanoseconds from midnight UTC
-    pub market_close_ns: i64,      // Nanoseconds from midnight UTC
-    pub gap_threshold_ns: i64,     // Default: 4 hours (overnight detection)
+    pub market_open_ns: i64,        // Nanoseconds from midnight UTC
+    pub market_close_ns: i64,       // Nanoseconds from midnight UTC
+    pub gap_threshold_ns: i64,      // Default: 4 hours (overnight detection)
     pub timezone_offset_hours: i32, // Default: -5 (EST)
+    pub use_gap_detection: bool,    // Default: true. If false, uses fixed midnight boundary
 }
 
 // Presets
-DayBoundaryConfig::us_equity()  // 9:30 AM - 4:00 PM ET
-DayBoundaryConfig::us_futures() // Extended hours
-DayBoundaryConfig::crypto()     // 24/7, midnight UTC boundary
+DayBoundaryConfig::us_equity()  // 9:30 AM - 4:00 PM ET, gap detection
+DayBoundaryConfig::us_futures() // Extended hours, gap detection
+DayBoundaryConfig::crypto()     // 24/7, fixed midnight UTC boundary (use_gap_detection=false)
 ```
 
 ### TradeAggregatorConfig (src/lob/trade_aggregator.rs)
@@ -486,6 +491,33 @@ pub struct TradeAggregatorConfig {
     pub aggregation_window_ns: i64,    // Default: 1_000_000 (1ms)
     pub track_fills: bool,             // Default: false
 }
+```
+
+### WarningTrackerConfig (src/warnings.rs)
+
+```rust
+pub struct WarningTrackerConfig {
+    pub max_warnings: usize,       // Default: 100_000 (cap on stored warnings)
+    pub log_to_stderr: bool,       // Default: true
+    pub min_log_severity: u8,      // Default: 1 (log all severities)
+    pub deduplicate: bool,         // Default: true (hash-based dedup within time window)
+    pub dedupe_window_ns: u64,     // Default: 1 second (NS_PER_SECOND)
+}
+```
+
+### HotStoreConfig (src/hotstore.rs)
+
+```rust
+pub struct HotStoreConfig {
+    pub hot_store_dir: PathBuf,       // Directory for decompressed files
+    pub prefer_decompressed: bool,    // Default: true (use hot store if available)
+    pub compressed_ext: String,       // Default: ".zst" (or ".dbn.zst" with dbn_defaults)
+    pub decompressed_ext: String,     // Default: "" (or ".dbn" with dbn_defaults)
+}
+
+// Factory methods
+HotStoreConfig::new(dir)           // Generic defaults (.zst → "")
+HotStoreConfig::dbn_defaults(dir)  // DBN defaults (.dbn.zst → .dbn)
 ```
 
 ---
@@ -504,8 +536,9 @@ pub enum TlobError {
     InvalidSide(u8),           // Unknown side byte
     SymbolNotFound(String),    // Multi-symbol: unknown symbol
     InconsistentState(String), // Generic state error
-    CrossedQuote(i64, i64),    // bid >= ask (if Error policy)
+    CrossedQuote(i64, i64),    // bid > ask (if Error policy)
     LockedQuote(i64, i64),     // bid == ask (if Error policy)
+    InvalidConfig(String),     // Config validation failure
     Generic(String),           // Catch-all
 }
 ```
@@ -591,7 +624,7 @@ fn create_test_message(
     price_dollars: f64,
     size: u32,
 ) -> MboMessage {
-    MboMessage::new(order_id, action, side, (price_dollars * 1e9) as i64, size)
+    MboMessage::new(order_id, action, side, (price_dollars * NANODOLLARS_PER_DOLLAR_F64) as i64, size)
 }
 ```
 
@@ -888,13 +921,22 @@ for msg in messages {
 
 // Aggregate statistics
 let stats = tracker.stats();
-println!("Average queue depth: {:.2}", stats.avg_queue_depth());
+println!("Orders tracked: {}, removed: {}", stats.orders_tracked, stats.orders_removed);
+println!("Cancel not found: {}, Fill not found: {}", stats.cancel_not_found, stats.fill_not_found);
 ```
 
 **Key Methods:**
-- `queue_position(order_id) -> Option<QueuePositionInfo>`
-- `queue_at_price(price, side) -> Option<&IndexMap<u64, u32>>`
-- `recent_position_changes() -> &[PositionChange]` (if tracking enabled)
+- `queue_position(order_id) -> Option<QueuePositionInfo>` — FIFO position, volume ahead, queue length
+- `volume_ahead(order_id) -> Option<u64>` — volume ahead of specific order
+- `queue_length(side, price) -> usize` — orders at a price level
+- `level_volume(side, price) -> u64` — total volume at a price level
+- `active_orders() -> usize` — total tracked orders
+- `best_level_imbalance() -> Option<(f64, u64, u64)>` — BBO queue imbalance
+- `multi_level_imbalance(levels) -> Option<(f64, u64, u64)>` — multi-level imbalance
+- `average_queue_position(side) -> Option<f64>` — average position across all levels
+- `recent_position_changes() -> &VecDeque<PositionChange>` — if tracking enabled
+- `stats() -> &QueueStats` — tracking statistics
+- `reset()` — clear all state
 
 ### OrderLifecycleTracker
 
@@ -910,10 +952,13 @@ for msg in messages {
     if let Some(event) = tracker.process_message(&msg) {
         match event {
             LifecycleEvent::Created(lc) => {
-                println!("New order {} at ${:.2}", lc.order_id, lc.initial_price as f64 / 1e9);
+                println!("New order {} at ${:.2}", lc.order_id, lc.original_price as f64 / NANODOLLARS_PER_DOLLAR_F64);
             }
             LifecycleEvent::Modified { order_id, modification } => {
                 println!("Order {} modified: {:?}", order_id, modification);
+            }
+            LifecycleEvent::PartialFill { order_id, fill_size, .. } => {
+                println!("Order {} partial fill: {} shares", order_id, fill_size);
             }
             LifecycleEvent::Completed(lc) => {
                 println!("Order {} completed in {:?}", lc.order_id, lc.time_alive_ns());
@@ -922,13 +967,19 @@ for msg in messages {
     }
 }
 
+// Query active order by ID
+if let Some(lifecycle) = tracker.get_active(order_id) {
+    println!("Order {} alive for {:?} ns", lifecycle.order_id, lifecycle.time_alive_ns());
+}
+
 // Statistics
 let stats = tracker.stats();
 println!("Observed: {}, Inferred: {}", stats.observed_orders, stats.inferred_orders);
+println!("Overfills detected: {}", stats.overfill_count);
 
 // Active order features (for ML)
 let features = tracker.active_order_features();
-println!("Active orders: {}, Avg age: {:?}", features.count, features.avg_age_ns);
+println!("Active orders: {}, Avg age: {:?}", features.total_count, features.avg_age_ns);
 ```
 
 **Key Insight**: Handles mid-session data starts by inferring lifecycles for pre-existing orders (marked with `OrderOrigin::Inferred`).
@@ -959,8 +1010,10 @@ for msg in messages {
 }
 
 // Query current day info
-let stats = detector.stats();
-println!("Day {}: {} messages", stats.current_day_index, stats.messages_in_current_day);
+let day_idx = detector.current_day_index();
+let day_stats = detector.current_day_stats();
+println!("Day {}: {} messages, {} trades", day_idx, day_stats.messages, day_stats.trades);
+println!("Boundaries detected so far: {}", detector.boundaries_detected());
 ```
 
 ### TradeAggregator
@@ -975,8 +1028,13 @@ let mut aggregator = TradeAggregator::new(TradeAggregatorConfig::default());
 for msg in messages {
     if let Some(trade) = aggregator.process_message(&msg) {
         println!("Trade: {} shares @ ${:.2} (aggressor: {:?})",
-                 trade.size, trade.price as f64 / 1e9, trade.aggressor_side);
+                 trade.size, trade.price_f64(), trade.aggressor_side);
     }
+}
+
+// IMPORTANT: flush() to get the last pending trade (aggregation window may hold one)
+if let Some(last_trade) = aggregator.flush() {
+    println!("Final trade: {} shares", last_trade.size);
 }
 
 // Trade imbalance (buy pressure vs sell pressure)
@@ -1030,7 +1088,7 @@ for msg in messages {
     // Now you have:
     // - state: LobState with temporal fields
     // - queue_tracker.queue_position(order_id): Queue position info
-    // - lifecycle_tracker.get_lifecycle(order_id): Order lifecycle
+    // - lifecycle_tracker.get_active(order_id): Order lifecycle
     // - trade_aggregator.trade_imbalance(): Buy/sell pressure
 }
 ```
@@ -1049,7 +1107,10 @@ use mbo_lob_reconstructor::{LobReconstructor, MboMessage, LobState, Action, Side
 use mbo_lob_reconstructor::{LobReconstructor, LobConfig, CrossedQuotePolicy};
 
 // File loading (requires "databento" feature)
-use mbo_lob_reconstructor::{DbnLoader, is_valid_order};
+use mbo_lob_reconstructor::DbnLoader;
+
+// Constants
+use mbo_lob_reconstructor::constants::{NANODOLLARS_PER_DOLLAR_F64, NS_PER_SECOND_F64};
 
 // Statistics
 use mbo_lob_reconstructor::{DayStats, RunningStats, NormalizationParams};
@@ -1076,11 +1137,13 @@ use mbo_lob_reconstructor::{TradeAggregator, TradeAggregatorConfig, Trade, Fill}
 ### Price Conversion
 
 ```rust
+use mbo_lob_reconstructor::constants::{NANODOLLARS_PER_DOLLAR, NANODOLLARS_PER_DOLLAR_F64};
+
 // Dollars to fixed-point
-let price_fixed: i64 = (price_dollars * 1e9) as i64;
+let price_fixed: i64 = (price_dollars * NANODOLLARS_PER_DOLLAR_F64) as i64;
 
 // Fixed-point to dollars
-let price_dollars: f64 = price_fixed as f64 / 1e9;
+let price_dollars: f64 = price_fixed as f64 / NANODOLLARS_PER_DOLLAR_F64;
 ```
 
 ### Checking Book Health
