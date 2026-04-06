@@ -180,7 +180,7 @@ impl MboMessage {
 
     /// Validate the message fields.
     ///
-    /// Unlike [`is_system_message()`], this method checks whether a message
+    /// Unlike [`Self::is_system_message()`], this method checks whether a message
     /// that *should* represent a valid order actually has valid field values.
     /// System messages (heartbeats, status) should be filtered first.
     pub fn validate(&self) -> crate::error::Result<()> {

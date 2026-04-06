@@ -8,7 +8,7 @@
 //! - Prices: `Int64` in nanodollars (divide by 1e9 for dollars)
 //! - Sizes: `UInt32` in shares
 //! - Timestamps: `Int64` nanoseconds since epoch
-//! - Enums: `UInt8` byte representation (see [`Action::to_byte`], [`Side::to_byte`])
+//! - Enums: `UInt8` byte representation (see [`crate::Action::to_byte`], [`crate::Side::to_byte`])
 //! - Arrays: `FixedSizeList` for price/size level data
 
 use std::collections::HashMap;

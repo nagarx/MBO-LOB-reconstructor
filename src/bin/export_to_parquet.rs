@@ -442,30 +442,33 @@ fn process_day(
 // Export summary
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn write_export_summary(
-    output_dir: &Path,
-    symbol: &str,
+/// Summary of an export run, used for provenance JSON output.
+struct ExportSummary<'a> {
+    output_dir: &'a Path,
+    symbol: &'a str,
     days_ok: usize,
     days_err: usize,
     total_lob: u64,
     total_mbo: u64,
     total_messages: u64,
     elapsed_secs: f64,
-) {
+}
+
+fn write_export_summary(s: &ExportSummary<'_>) {
     let summary = serde_json::json!({
-        "symbol": symbol,
-        "days_processed": days_ok,
-        "days_failed": days_err,
-        "total_lob_snapshots": total_lob,
-        "total_mbo_events": total_mbo,
-        "total_messages": total_messages,
-        "elapsed_seconds": elapsed_secs,
-        "avg_messages_per_sec": if elapsed_secs > 0.0 { total_messages as f64 / elapsed_secs } else { 0.0 },
+        "symbol": s.symbol,
+        "days_processed": s.days_ok,
+        "days_failed": s.days_err,
+        "total_lob_snapshots": s.total_lob,
+        "total_mbo_events": s.total_mbo,
+        "total_messages": s.total_messages,
+        "elapsed_seconds": s.elapsed_secs,
+        "avg_messages_per_sec": if s.elapsed_secs > 0.0 { s.total_messages as f64 / s.elapsed_secs } else { 0.0 },
         "source": "mbo-lob-reconstructor",
         "version": env!("CARGO_PKG_VERSION"),
     });
 
-    let path = output_dir.join("_export_summary.json");
+    let path = s.output_dir.join("_export_summary.json");
     match fs::File::create(&path) {
         Ok(f) => {
             let _ = serde_json::to_writer_pretty(std::io::BufWriter::new(f), &summary);
@@ -646,16 +649,16 @@ fn main() {
     println!("  Throughput:     {overall_throughput:.0} msg/s");
     println!("  Output:         {}", args.output.display());
 
-    write_export_summary(
-        &args.output,
-        &args.symbol,
-        files.len() - errors,
-        errors,
+    write_export_summary(&ExportSummary {
+        output_dir: &args.output,
+        symbol: &args.symbol,
+        days_ok: files.len() - errors,
+        days_err: errors,
         total_lob,
         total_mbo,
         total_messages,
-        elapsed,
-    );
+        elapsed_secs: elapsed,
+    });
 
     if errors > 0 {
         std::process::exit(1);
