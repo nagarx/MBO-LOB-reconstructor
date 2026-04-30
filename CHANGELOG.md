@@ -7,6 +7,166 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-04-30
+
+Phase M REV 3 — Boundary Discipline Cycle. Closes 12 findings sharing
+the root cause "silent failure at boundary" (per the
+`BACKBONE_AUDIT_VALIDATED_2026_04.md` validated cluster F-002/F-003/
+F-007/F-008/F-010/F-013/F-021/F-023/F-024/F-031/F-034 + DESIGN-1).
+
+### Added
+
+- **`BoundaryError` peer enum** (`src/loader/error.rs`) — typed error
+  domain for the loader yield path. Variants `Decode(String)` +
+  `Convert(TlobError)`. `#[derive(Error, Debug, Clone)]` +
+  `#[non_exhaustive]`. (M.A.1)
+
+- **`CountingReader<R>`** (`src/loader/mod.rs`) — `Read + BufRead`
+  wrapper that tracks bytes consumed via `Arc<AtomicU64>`. Closes
+  F-008: pre-M.A.2, `LoaderStats::bytes_read` was always 0 and
+  `progress()` returned 0.0 in production logs. Single-thread-per-
+  iterator scope (Decision 17 — never crosses Rayon boundary). (M.A.2)
+
+- **`TypedMessageIterator`** + `iter_messages_typed()` API
+  (`src/loader/mod.rs`) — `Iterator<Item = Result<MboMessage,
+  BoundaryError>>` with compile-time error handling. Closes F-002 +
+  F-003 + F-024 (silent decode/convert error swallow + clean-EOF vs
+  torn-EOF disambiguation). Adds `LoaderStats::mid_record_eof: u64`
+  counter (Decision 5b) + `is_clean_eof()` helper. Adds `finalize(self)
+  -> LoaderStats` (Decision 5c — caller-decides abort/warn policy).
+  (M.A.3)
+
+- **`legacy-iterator-api` cargo feature** (default-on) — gates the
+  legacy `iter_messages()` API with `#[deprecated(...)]` for
+  transition. Removable in next MAJOR (calendar 2026-10-29). (M.A.3)
+
+- **`LobStats::modify_order_not_found` + `add_order_id_collision`
+  counters** (`src/lob/reconstructor.rs`) — closes F-013: silent
+  modify-of-missing fall-through to add(msg) and silent
+  add-of-existing fall-through to modify(msg) now have observability
+  counters incremented BEFORE the recovery semantic. Recovery
+  preserved bit-for-bit; only the silence is closed. (M.A.4)
+
+- **`LobStatsExportEnvelope`** (`src/lob/reconstructor.rs`) — on-disk
+  envelope wrapping `LobStats` with a `schema_version` field.
+  `pub const LOB_STATS_SCHEMA_VERSION: &str = "2.0.0"`. Exposed at
+  crate root via `pub use lob::reconstructor::{
+  LobStatsExportEnvelope, LOB_STATS_SCHEMA_VERSION }`. (M.A.5)
+
+- **`TlobError::InvalidTimestamp(i64)` variant** (`src/error.rs`) —
+  closes F-023: pre-M.A.6 `DbnBridge::convert` silently coerced
+  `ts_event == 0` (Databento sentinel) and u64 → i64 overflow into
+  `Some(<wrong-value>)`. Now fail-loud per hft-rules §2 + §8.
+  Wrapped by typed iterator as `BoundaryError::Convert(TlobError::
+  InvalidTimestamp(_))`. (M.A.6)
+
+- **5 anomaly counters in parquet binary**
+  (`src/bin/export_to_parquet.rs::DayResult`) — closes F-021: pre-
+  M.A.6 `is_ok() && is_valid()` silent dual-drop. Per-day counters
+  `rows_skipped_crossed`, `rows_skipped_invalid_price`,
+  `rows_skipped_other`, `rows_skipped_invalid_state`,
+  `rows_skipped_decode_or_convert` aggregated into
+  `_export_summary.json::rows_skipped` block. Default error policy
+  `WarnAndContinue` (Decision 6a). (M.A.6)
+
+- **`LoaderStats::system_messages_seen: u64` field** (`src/loader/
+  mod.rs`) — closes F-010: producer-side counter incremented at the
+  loader on every yielded message matching `is_system_message()`.
+  Pre-M.A.7, `LobStats::system_messages_skipped` was permanently
+  shadowed at zero by consumer-side pre-filtering. Loader now yields
+  the message regardless; downstream consumer policy preserved. (M.A.7)
+
+- **`#[non_exhaustive]` on `LobStats`** — additive-only future
+  evolution. External crates can no longer construct via struct
+  literal; in-crate construction exempt. Documented at struct + in
+  cycle commit messages. (M.A.4 Decision 18)
+
+### Changed
+
+- **Atomic write for `_reconstruction_stats.json`** — replaced plain
+  `BufWriter + serde_json::to_writer_pretty` with `tempfile::
+  NamedTempFile::new_in(parent_dir)` → `to_writer_pretty` →
+  `sync_all` → `persist`. POSIX-atomic. Fallback to direct write +
+  fsync + WARN log on tempfile-creation/persist failure (NFS
+  EROFS/EXDEV edge cases). SSoT-deferred consolidation onto
+  `hft_statistics::io::atomic_write_json` documented inline. (M.A.5)
+
+- **Dual-format read for `LobStats::load_from_file`** — accepts BOTH
+  envelope shape (post-M.A.5) AND legacy flat shape (pre-M.A.5).
+  Explicit `serde_json::Value`-peek dispatch (post-validation
+  hardening — replaces an earlier `#[serde(untagged)]` enum that had
+  silent-acceptance failure modes for malformed envelopes). Legacy
+  branch logs WARN per call with calendar 2026-10-29 removal note.
+  (M.A.5 + post-validation hardening)
+
+- **`process_day` migration to `iter_messages_typed()`** — closes
+  F-021 by surfacing decode/convert errors per-message into the
+  binary's structured-match path. `skip_invalid(true)` REMOVED so
+  errors aren't swallowed at the iterator level (M.A.6 post-validation
+  hardening). (M.A.6 + M.A.7)
+
+- **`DownsampleStrategy::EveryN(0)` rejected at config-validation
+  time** — closes F-034: pre-M.A.4 `EveryN(0)` was silently
+  reinterpreted as "no downsample" via a latent fall-through at
+  `LobSnapshotWriter::should_write`. Now rejected with
+  `TlobError::InvalidConfig`. Use `DownsampleStrategy::None` for
+  no-downsampling explicitly. (M.A.4)
+
+### Removed
+
+- **`LobStats::errors: u64` field** — closes F-007: declared but
+  NEVER incremented (verified zero genuine increment sites pre-
+  implementation gate). Per Decision 10b: REMOVE the dead field
+  rather than wire it to an arbitrary path. Specific anomaly
+  counters now expose the silent fall-through behavior:
+  `modify_order_not_found`, `add_order_id_collision`,
+  `cancel_order_not_found` (existing), `cancel_price_level_missing`
+  (existing), etc. (M.A.4)
+
+### Deferred
+
+- **F-031** (`BatchProcessor` empty-input silent Ok) — pre-
+  implementation gate verified `BatchProcessor` does NOT exist
+  anywhere in the reconstructor crate. Plan-cited site
+  `src/lib.rs::BatchProcessor` is a phantom reference. Closure
+  deferred to a follow-up commit pending clarification of the actual
+  target site. Documented in M.A.4 commit message.
+
+### Migration notes
+
+- **Schema version 1.0 → 2.0** for `_reconstruction_stats.json`. The
+  envelope wrapper `{schema_version, stats}` is a structural
+  breaking change. `load_from_file` accepts BOTH shapes for
+  back-compat; legacy-shape reads emit a one-time-per-call WARN
+  log. Calendar removal: 2026-10-29 (aligned with
+  `legacy-iterator-api` deprecation).
+- **Crate version 0.1.0 → 0.2.0** (M.A.3). MINOR bump per
+  Cargo.toml; `iter_messages_typed()` is the new preferred API
+  (yields `Result<MboMessage, BoundaryError>`); legacy
+  `iter_messages()` retained behind default-on
+  `legacy-iterator-api` feature with `#[deprecated]` annotation.
+- **`#[non_exhaustive]` on `LobStats`** — external crates that
+  constructed `LobStats { errors: 3, ... }` via struct literal will
+  break at compile time. Migration: use `LobStats::default()` +
+  struct-update syntax `..Default::default()`.
+- **`ErrorMode::FailFast` semantic change** for downstream
+  consumers — pre-Phase-M, torn DBN silently completed. Post-Phase-M
+  under default `FailFast`, a single torn-DBN day surfaces at the
+  iterator's `finalize().mid_record_eof` counter. The reconstructor
+  itself takes WARN-and-continue policy (analytical batch tool); the
+  feature-extractor M.B cycle will land contract-change docs +
+  operator-communication recommending `processing.error_mode =
+  "collect_errors"` for resilient batch processing.
+
+### Test count
+
+- **Library tests: 271 → 278** (+7 net across Phase M REV 3
+  cumulative); plus 3 doctests + ~31 ignored doctests via
+  `--include-ignored`. 240 (no-default-features). External
+  integration tests at `tests/loader_typed_iterator.rs` +
+  `tests/lob_stats_counters.rs` add additional regression-lock
+  coverage (+~20 tests).
+
 ### Added
 
 - **LobState Temporal Fields** (`src/types.rs`)
