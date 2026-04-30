@@ -209,15 +209,27 @@ F-007/F-008/F-010/F-013/F-021/F-023/F-024/F-031/F-034 + DESIGN-1).
 
 ### Test count
 
-- **Library tests: 271 → 280** (+9 net across Phase M REV 3
-  cumulative — M.A.4 +1, M.A.5 +2, M.A.5 hardening +1, M.A.6 +3,
-  M.A.7 +1, M.A.9 +2, then M.A.10 polish unchanged at lib level).
-  Plus 3 doctests + ~31 ignored doctests via `--include-ignored`.
-  240 (no-default-features). External integration tests at
-  `tests/loader_typed_iterator.rs` (7) + `tests/lob_stats_counters.rs`
-  (8) add 15 additional regression-lock tests; pre-existing 21
-  in `tests/integration_test.rs` + 5 + 8 across other suites
-  bring total integration to 41.
+- **Library tests: 271 → 285** (+14 net across Phase M REV 3
+  cumulative). Per-commit deltas: M.A.4 +1, M.A.5 +2, M.A.5
+  hardening +1, M.A.6 +3, M.A.7 +1, M.A.9 +2, M.A.11 +5 (M.A.10
+  + M.A.12 unchanged at lib level — pure attribute / feature-gate
+  changes). Plus 3 doctests + ~31 ignored doctests via
+  `--include-ignored`. **240 lib** under `--no-default-features`.
+  **282 lib** under the new combo `--features "databento"
+  --no-default-features` (M.A.12 enabled this combo; was
+  uncompilable pre-M.A.12 with 24+ E0599 errors).
+- **Integration tests: 41 total** under `--features
+  legacy-iterator-api` = `tests/integration_test.rs` (21) +
+  `tests/loader_typed_iterator.rs` (7, NEW M.A.8) +
+  `tests/lob_stats_counters.rs` (8, NEW M.A.8) +
+  `tests/queue_position_nvidia_test.rs` (5). Plus 35 in
+  `tests/export_test.rs` when `--features "databento export"` is
+  enabled, bringing total to 76 with full-feature build.
+- Caveat per hft-rules §11 ("Numeric facts that vary with code
+  state... MUST NOT be hand-typed in cross-pipeline documentation"):
+  these counts are HAND-TYPED here; the authoritative source is
+  `cargo test 2>&1 | grep "test result"`. Cited counts will drift
+  with future commits.
 
 ### Added
 

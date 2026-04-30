@@ -1,12 +1,12 @@
 # ARCHITECTURE.md -- MBO-LOB-Reconstructor
 
-Primary technical reference for LLM coders. Every claim verified against source code as of 2026-04-04.
+Primary technical reference for LLM coders. Every claim verified against source code as of 2026-04-30 (post Phase M REV 3 — Boundary Discipline cycle).
 
 ---
 
 ## 1. Overview
 
-**mbo-lob-reconstructor** v0.1.0 (Rust edition 2021, MSRV 1.82) converts Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshots. It is the foundation of the HFT pipeline, consumed directly by `feature-extractor-MBO-LOB` (which depends on it via `.cargo/config.toml` path override).
+**mbo-lob-reconstructor** v0.2.0 (Rust edition 2021, MSRV 1.82) converts Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshots. It is the foundation of the HFT pipeline, consumed directly by `feature-extractor-MBO-LOB` (which depends on it via `.cargo/config.toml` path override).
 
 The crate provides:
 
@@ -41,7 +41,9 @@ Both CLIs require `databento`; `export_to_parquet` additionally requires `export
 .dbn.zst (compressed Databento MBO)
     |
     v
-DbnLoader (src/loader.rs)              -- Streaming reader, 1MB I/O buffer
+DbnLoader (src/loader/mod.rs)          -- Streaming reader, 1MB I/O buffer
+                                          Post Phase M REV 3: prefer iter_messages_typed()
+                                          yielding Result<MboMessage, BoundaryError>
     |                                      Auto-detects compression via DynDecoder
     |  (optional) HotStoreManager          Resolves to decompressed .dbn if available
     |             (src/hotstore.rs)
@@ -126,8 +128,9 @@ All trackers are composable: each consumes `MboMessage` independently and can be
 
 | File | Lines | Purpose | Key Public Types |
 |------|-------|---------|-----------------|
-| `src/dbn_bridge.rs` | 287 | `dbn::MboMsg` to `MboMessage` conversion | `DbnBridge` |
-| `src/loader.rs` | 574 | Streaming DBN file reader with 1MB I/O buffer | `DbnLoader`, `MessageIterator`, `LoaderStats`, `IO_BUFFER_SIZE` |
+| `src/dbn_bridge.rs` | 481 | `dbn::MboMsg` to `MboMessage` conversion (3-case timestamp dispatch — M.A.6/M.A.9 F-023 fold) | `DbnBridge` |
+| `src/loader/mod.rs` | 1183 | Streaming DBN file reader with 1MB I/O buffer + typed iterator API (M.A.3) + bytes_read counting (M.A.2 F-008) + mid_record_eof counter (M.A.3 F-024) + system_messages_seen producer counter (M.A.7 F-010) | `DbnLoader`, `TypedMessageIterator`, `MessageIterator` (legacy, gated `legacy-iterator-api`), `LoaderStats` (`#[non_exhaustive]`), `IO_BUFFER_SIZE` |
+| `src/loader/error.rs` | 132 | BoundaryError peer enum — typed-error-domain for the loader yield path (M.A.1) | `BoundaryError` (`#[non_exhaustive]`, Clone-derived: `Decode(String)`, `Convert(TlobError)`) |
 | `src/hotstore.rs` | 857 | Decompressed file management for fast I/O | `HotStoreManager`, `HotStoreConfig` |
 
 ### Export System (`export` feature)
@@ -658,7 +661,7 @@ When `UseLastValid` or `SkipUpdate` returns a last-valid snapshot, temporal fiel
 | `NS_PER_HOUR` | `i64` | `3_600_000_000_000` | Time conversion |
 | `NS_PER_DAY` | `i64` | `86_400_000_000_000` | Time conversion |
 
-Additionally, from `src/loader.rs`: `IO_BUFFER_SIZE: usize = 1_048_576` (1 MB).
+Additionally, from `src/loader/mod.rs`: `IO_BUFFER_SIZE: usize = 1_048_576` (1 MB).
 
 From `src/types.rs`: `MAX_LOB_LEVELS: usize = 20`.
 
