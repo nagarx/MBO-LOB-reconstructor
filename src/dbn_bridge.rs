@@ -51,27 +51,63 @@ impl DbnBridge {
         // Convert side (DBN uses i8, we convert to u8)
         let side = Self::convert_side(msg.side as u8)?;
 
-        // Phase M M.A.6 (REV 3 F-023 closure): DBN stores `ts_event` as `u64`
-        // nanoseconds. Two failure modes that pre-M.A.6 silently propagated:
-        //   1. `ts_event == 0` — Databento sentinel for "no timestamp"
-        //      (session-control / metadata messages). Pre-M.A.6 became
-        //      `Some(0)` indistinguishable from a legit epoch-zero timestamp.
-        //   2. `ts_event > i64::MAX` — `as i64` cast wraps to negative
-        //      silently. Per hft-rules §2 (zero precision errors) and §8
-        //      (no silent coercion), reject both as `InvalidTimestamp`.
+        // Phase M M.A.6 (REV 3 F-023 closure) + M.A.9 (post-validation
+        // F-010 ↔ F-023 cross-cascade fix). DBN stores `ts_event` as `u64`
+        // nanoseconds. Three cases:
+        //
+        // 1. `ts_event > i64::MAX` (cast wraps to negative). Per hft-rules
+        //    §2 (zero precision errors): always corrupt; fail-loud as
+        //    `InvalidTimestamp`. This branch fires regardless of system-
+        //    message status — overflow is genuine corruption.
+        //
+        // 2. `ts_event == 0` AND message IS a system message (heartbeat /
+        //    metadata / session-control with `order_id == 0`, `size == 0`,
+        //    or `price <= 0`). Databento uses ts_event=0 as a sentinel for
+        //    "no timestamp" on these messages. Pre-M.A.9 the M.A.6 F-023
+        //    fix rejected ALL ts_event=0 as `InvalidTimestamp`, which
+        //    silently shadowed the M.A.7 F-010 `system_messages_seen`
+        //    counter at the typed iterator (system messages with ts_event=0
+        //    flowed through the `BoundaryError::Convert` arm and inflated
+        //    `rows_skipped_decode_or_convert` instead of counting as
+        //    expected heartbeats). Post-M.A.9 we yield these system
+        //    messages with `timestamp: None` so they reach the iterator's
+        //    is_system_message() check and increment `system_messages_seen`
+        //    correctly.
+        //
+        // 3. `ts_event == 0` AND message is NOT a system message (genuine
+        //    real-order-data with no timestamp). Per hft-rules §8 — corrupt
+        //    feed; fail-loud as `InvalidTimestamp`. This is the core F-023
+        //    fail-loud surface that M.A.6 introduced.
         let ts_signed = msg.hd.ts_event as i64;
-        if msg.hd.ts_event == 0 || ts_signed < 0 {
+        if ts_signed < 0 {
+            // Case 1: u64 overflow → always corrupt.
             return Err(TlobError::InvalidTimestamp(ts_signed));
         }
+        let timestamp = if msg.hd.ts_event == 0 {
+            // Determine system-message status from raw fields (price > 0 is
+            // a non-system-message signal). Mirrors `MboMessage::is_system_message`.
+            let is_system = msg.order_id == 0 || msg.size == 0 || msg.price <= 0;
+            if is_system {
+                // Case 2: legitimate Databento sentinel on a heartbeat /
+                // metadata message → preserve as `None` so downstream
+                // observability (F-010 counter) sees the system message.
+                None
+            } else {
+                // Case 3: genuine corrupt feed — order data with no
+                // timestamp violates the F-023 fail-loud surface.
+                return Err(TlobError::InvalidTimestamp(0));
+            }
+        } else {
+            Some(ts_signed)
+        };
 
-        // Create MboMessage
         Ok(MboMessage {
             order_id: msg.order_id,
             action,
             side,
             price: msg.price,
             size: msg.size,
-            timestamp: Some(ts_signed),
+            timestamp,
         })
     }
 
@@ -347,6 +383,77 @@ mod tests {
         assert!(
             matches!(result, Err(TlobError::InvalidTimestamp(t)) if t < 0),
             "u64 ts_event overflow must fail-loud per F-023; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_convert_accepts_system_message_with_zero_timestamp() {
+        // Phase M M.A.9 (post-validation F-010 ↔ F-023 cross-cascade fix):
+        // Databento heartbeat / metadata / session-control messages carry
+        // BOTH `order_id == 0` (system-message marker) AND `ts_event == 0`
+        // (no-timestamp sentinel). Pre-M.A.9, M.A.6 F-023 rejected ALL
+        // ts_event=0 as `InvalidTimestamp`, which silently shadowed the
+        // M.A.7 F-010 `system_messages_seen` counter at the typed iterator
+        // (these messages flowed through `BoundaryError::Convert` and
+        // inflated `rows_skipped_decode_or_convert` instead of counting
+        // as expected heartbeats). Post-M.A.9 they convert cleanly with
+        // `timestamp: None` so they reach `is_system_message()` correctly.
+        let dbn_msg = dbn::MboMsg {
+            hd: dbn::RecordHeader::new::<dbn::MboMsg>(0, 0, 0, 0), // ts_event = 0
+            order_id: 0,                                           // system-message marker
+            price: 100_000_000_000,
+            size: 100,
+            flags: dbn::FlagSet::empty(),
+            channel_id: 0,
+            action: b'A' as i8,
+            side: b'B' as i8,
+            ts_recv: 0,
+            ts_in_delta: 0,
+            sequence: 0,
+        };
+
+        let mbo_msg = DbnBridge::convert(&dbn_msg)
+            .expect("system message with ts_event=0 must convert cleanly per M.A.9");
+        // timestamp must be None — Databento sentinel preserved as no-timestamp.
+        assert_eq!(
+            mbo_msg.timestamp, None,
+            "system message with ts_event=0 must yield timestamp=None"
+        );
+        // Resulting MboMessage MUST self-classify as a system message via
+        // is_system_message(), so the typed iterator's F-010 counter
+        // increments for it.
+        assert!(
+            mbo_msg.is_system_message(),
+            "converted message must self-identify as system message for F-010 counter to fire"
+        );
+    }
+
+    #[test]
+    fn test_convert_rejects_zero_timestamp_for_non_system_message() {
+        // Phase M M.A.9 (post-validation F-010 ↔ F-023 cross-cascade fix):
+        // The post-M.A.9 policy reserves `InvalidTimestamp(0)` for the
+        // genuine corruption case — order data (non-system-message) with
+        // ts_event=0. The earlier `test_convert_rejects_zero_timestamp`
+        // exercises this same surface (order_id=12345, non-system); this
+        // test makes the policy rationale explicit.
+        let dbn_msg = dbn::MboMsg {
+            hd: dbn::RecordHeader::new::<dbn::MboMsg>(0, 0, 0, 0), // ts_event = 0
+            order_id: 99999,                                       // NOT a system message
+            price: 100_000_000_000,
+            size: 100,
+            flags: dbn::FlagSet::empty(),
+            channel_id: 0,
+            action: b'A' as i8,
+            side: b'B' as i8,
+            ts_recv: 0,
+            ts_in_delta: 0,
+            sequence: 0,
+        };
+
+        let result = DbnBridge::convert(&dbn_msg);
+        assert!(
+            matches!(result, Err(TlobError::InvalidTimestamp(0))),
+            "non-system-message with ts_event=0 must fail-loud per F-023; got: {result:?}"
         );
     }
 
