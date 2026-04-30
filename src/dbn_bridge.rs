@@ -51,16 +51,27 @@ impl DbnBridge {
         // Convert side (DBN uses i8, we convert to u8)
         let side = Self::convert_side(msg.side as u8)?;
 
+        // Phase M M.A.6 (REV 3 F-023 closure): DBN stores `ts_event` as `u64`
+        // nanoseconds. Two failure modes that pre-M.A.6 silently propagated:
+        //   1. `ts_event == 0` — Databento sentinel for "no timestamp"
+        //      (session-control / metadata messages). Pre-M.A.6 became
+        //      `Some(0)` indistinguishable from a legit epoch-zero timestamp.
+        //   2. `ts_event > i64::MAX` — `as i64` cast wraps to negative
+        //      silently. Per hft-rules §2 (zero precision errors) and §8
+        //      (no silent coercion), reject both as `InvalidTimestamp`.
+        let ts_signed = msg.hd.ts_event as i64;
+        if msg.hd.ts_event == 0 || ts_signed < 0 {
+            return Err(TlobError::InvalidTimestamp(ts_signed));
+        }
+
         // Create MboMessage
-        // Note: DBN stores timestamp in the header (RecordHeader)
-        // DBN uses u64 for timestamps, we use i64
         Ok(MboMessage {
             order_id: msg.order_id,
             action,
             side,
             price: msg.price,
             size: msg.size,
-            timestamp: Some(msg.hd.ts_event as i64),
+            timestamp: Some(ts_signed),
         })
     }
 
@@ -283,5 +294,81 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].order_id, 1);
         assert_eq!(result[1].order_id, 3);
+    }
+
+    #[test]
+    fn test_convert_rejects_zero_timestamp() {
+        // Phase M M.A.6 (REV 3 F-023 closure): ts_event == 0 is the Databento
+        // sentinel for "no timestamp" on session-control / metadata messages.
+        // Pre-M.A.6 this silently coerced to `Some(0)`. Post-M.A.6 it must
+        // fail-loud as `TlobError::InvalidTimestamp(0)`.
+        let dbn_msg = dbn::MboMsg {
+            hd: dbn::RecordHeader::new::<dbn::MboMsg>(0, 0, 0, 0), // ts_event = 0
+            order_id: 12345,
+            price: 100_000_000_000,
+            size: 100,
+            flags: dbn::FlagSet::empty(),
+            channel_id: 0,
+            action: b'A' as i8,
+            side: b'B' as i8,
+            ts_recv: 0,
+            ts_in_delta: 0,
+            sequence: 0,
+        };
+
+        let result = DbnBridge::convert(&dbn_msg);
+        assert!(
+            matches!(result, Err(TlobError::InvalidTimestamp(0))),
+            "ts_event == 0 must fail-loud per F-023; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_convert_rejects_overflow_timestamp() {
+        // Phase M M.A.6 (REV 3 F-023 closure): u64 ts_event > i64::MAX wraps
+        // negative on `as i64` cast — silent precision loss per hft-rules §2.
+        // Post-M.A.6 the negative-cast result is rejected as InvalidTimestamp.
+        let overflow_value = (i64::MAX as u64) + 1; // First u64 that wraps to negative
+        let dbn_msg = dbn::MboMsg {
+            hd: dbn::RecordHeader::new::<dbn::MboMsg>(0, 0, 0, overflow_value),
+            order_id: 12345,
+            price: 100_000_000_000,
+            size: 100,
+            flags: dbn::FlagSet::empty(),
+            channel_id: 0,
+            action: b'A' as i8,
+            side: b'B' as i8,
+            ts_recv: 0,
+            ts_in_delta: 0,
+            sequence: 0,
+        };
+
+        let result = DbnBridge::convert(&dbn_msg);
+        assert!(
+            matches!(result, Err(TlobError::InvalidTimestamp(t)) if t < 0),
+            "u64 ts_event overflow must fail-loud per F-023; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_convert_accepts_minimum_valid_timestamp() {
+        // Boundary check: ts_event == 1 is the minimum valid (non-sentinel)
+        // value. Both this and i64::MAX should round-trip cleanly.
+        let dbn_msg = dbn::MboMsg {
+            hd: dbn::RecordHeader::new::<dbn::MboMsg>(0, 0, 0, 1), // ts_event = 1
+            order_id: 12345,
+            price: 100_000_000_000,
+            size: 100,
+            flags: dbn::FlagSet::empty(),
+            channel_id: 0,
+            action: b'A' as i8,
+            side: b'B' as i8,
+            ts_recv: 0,
+            ts_in_delta: 0,
+            sequence: 0,
+        };
+
+        let mbo_msg = DbnBridge::convert(&dbn_msg).expect("ts_event=1 must convert cleanly");
+        assert_eq!(mbo_msg.timestamp, Some(1));
     }
 }

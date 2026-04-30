@@ -26,6 +26,19 @@ pub enum TlobError {
     #[error("Invalid size: {0}")]
     InvalidSize(u32),
 
+    /// Invalid timestamp (zero, negative, or u64→i64 overflow).
+    ///
+    /// Phase M M.A.6 (REV 3 F-023 closure): Databento DBN feeds occasionally
+    /// emit `hd.ts_event = 0` as a sentinel for "no timestamp" (e.g., on
+    /// session-control messages). Pre-M.A.6, [`crate::dbn_bridge::DbnBridge::convert`]
+    /// silently coerced this to `Some(0)`, propagating the sentinel as if it
+    /// were a real wall-clock timestamp. Post-M.A.6 the conversion fails-loud
+    /// with this variant, which the `TypedMessageIterator` then wraps as
+    /// [`crate::loader::BoundaryError::Convert`]. Per hft-rules §8 — never
+    /// silently coerce; surface the anomaly so consumers can decide policy.
+    #[error("Invalid timestamp: {0}")]
+    InvalidTimestamp(i64),
+
     /// Invalid action type
     #[error("Invalid action: {0}")]
     InvalidAction(u8),

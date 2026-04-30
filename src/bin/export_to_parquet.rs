@@ -319,6 +319,31 @@ struct DayResult {
     lob_rows: u64,
     mbo_rows: u64,
     elapsed_secs: f64,
+
+    // Phase M M.A.6 (REV 3 F-021 closure): structured per-row anomaly
+    // observability replacing the pre-M.A.6 silent `is_ok() &&` swallow.
+    // Default error_policy = WarnAndContinue (Decision 6a) — these counters
+    // record what we skipped so operators can audit data quality post-export.
+    /// Snapshots skipped because `lob.process_message_into` returned
+    /// `Err(CrossedQuote | LockedQuote)`.
+    rows_skipped_crossed: u64,
+    /// Snapshots skipped because `lob.process_message_into` returned
+    /// `Err(InvalidPrice)`. WARN-logged per occurrence.
+    rows_skipped_invalid_price: u64,
+    /// Snapshots skipped because `lob.process_message_into` returned ANY
+    /// other `Err(_)` variant. WARN-logged per occurrence.
+    rows_skipped_other: u64,
+    /// Snapshots skipped because `lob.process_message_into` returned `Ok(())`
+    /// BUT `lob_state.is_valid() == false` (Decision 6b — separate counter
+    /// per Agent 5 REV 1 NEW-FRESH-8). Pre-M.A.6 this case was indistinguishable
+    /// from CrossedQuote/etc.; now tracked separately as its own anomaly class.
+    rows_skipped_invalid_state: u64,
+    /// Messages skipped because the typed iterator yielded
+    /// `Some(Err(BoundaryError::Decode | Convert))`. WARN-logged per occurrence.
+    /// Pre-M.A.6, decode/convert errors were silently swallowed by the legacy
+    /// `iter_messages()` API or skipped via `skip_invalid(true)`; the typed
+    /// iterator surfaces them per-message so we can count them here.
+    rows_skipped_decode_or_convert: u64,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -400,22 +425,75 @@ fn process_day(
     };
 
     let mut msg_count: u64 = 0;
+    let mut rows_skipped_crossed: u64 = 0;
+    let mut rows_skipped_invalid_price: u64 = 0;
+    let mut rows_skipped_other: u64 = 0;
+    let mut rows_skipped_invalid_state: u64 = 0;
+    let mut rows_skipped_decode_or_convert: u64 = 0;
 
-    // Phase M M.A.3: legacy iter_messages() is deprecated; M.A.6 will migrate
-    // this binary to iter_messages_typed() alongside the F-021 structured-match
-    // fix at line 411 below. Suppressed for now to keep M.A.3 surgical.
-    #[allow(deprecated)]
-    for msg in loader.iter_messages()? {
+    // Phase M M.A.6 (REV 3 F-021 closure): migrated from legacy
+    // `iter_messages()` to `iter_messages_typed()` so decode/convert errors
+    // surface per-message instead of being silently swallowed by the loader.
+    // Combined with the structured `match` below replacing the old
+    // `is_ok() && is_valid() {}` swallow, every per-row outcome is now
+    // counted. Default error_policy = WarnAndContinue (Decision 6a).
+    let mut messages = loader.iter_messages_typed()?;
+    for msg_result in messages.by_ref() {
+        let msg = match msg_result {
+            Ok(m) => m,
+            Err(boundary_err) => {
+                rows_skipped_decode_or_convert += 1;
+                log::warn!(
+                    "[{date}] decode/convert error at msg #{}: {boundary_err}",
+                    msg_count + 1
+                );
+                continue;
+            }
+        };
         msg_count += 1;
 
         if let Some(ref mut mw) = mbo_writer {
             mw.write_event(&msg)?;
         }
 
-        if lob.process_message_into(&msg, &mut lob_state).is_ok() && lob_state.is_valid() {
-            lob_writer.write_snapshot(&lob_state)?;
+        // Phase M M.A.6 (F-021 closure): structured-match replaces
+        // `is_ok() && is_valid() { write }`. Five outcomes:
+        //   1. Ok(()) + valid → write snapshot.
+        //   2. Ok(()) + !valid → rows_skipped_invalid_state (Decision 6b).
+        //   3. Err(CrossedQuote | LockedQuote) → rows_skipped_crossed.
+        //   4. Err(InvalidPrice) → rows_skipped_invalid_price + WARN.
+        //   5. Err(_) other variants → rows_skipped_other + WARN.
+        match lob.process_message_into(&msg, &mut lob_state) {
+            Ok(()) => {
+                if lob_state.is_valid() {
+                    lob_writer.write_snapshot(&lob_state)?;
+                } else {
+                    rows_skipped_invalid_state += 1;
+                }
+            }
+            Err(TlobError::CrossedQuote(_, _)) | Err(TlobError::LockedQuote(_, _)) => {
+                rows_skipped_crossed += 1;
+            }
+            Err(TlobError::InvalidPrice(p)) => {
+                rows_skipped_invalid_price += 1;
+                log::warn!(
+                    "[{date}] InvalidPrice({p}) at msg #{msg_count}: order_id={}",
+                    msg.order_id
+                );
+            }
+            Err(other) => {
+                rows_skipped_other += 1;
+                log::warn!(
+                    "[{date}] LOB error at msg #{msg_count}: {other}; order_id={}, action={:?}",
+                    msg.order_id,
+                    msg.action,
+                );
+            }
         }
     }
+
+    // Phase M M.A.3 finalize() — distinguishes clean EOF from truncated DBN.
+    let _loader_stats = messages.finalize();
 
     let lob_export_stats = lob_writer.finish()?;
     let mbo_rows = if let Some(mw) = mbo_writer {
@@ -439,6 +517,11 @@ fn process_day(
         lob_rows: lob_export_stats.rows_written,
         mbo_rows,
         elapsed_secs,
+        rows_skipped_crossed,
+        rows_skipped_invalid_price,
+        rows_skipped_other,
+        rows_skipped_invalid_state,
+        rows_skipped_decode_or_convert,
     })
 }
 
@@ -456,6 +539,16 @@ struct ExportSummary<'a> {
     total_mbo: u64,
     total_messages: u64,
     elapsed_secs: f64,
+
+    // Phase M M.A.6 (REV 3 F-021 closure): aggregate per-row anomaly counters
+    // summed across all days. Surface in `_export_summary.json` so post-export
+    // auditing can detect data-quality drift (e.g., a sudden spike in
+    // `rows_skipped_decode_or_convert` indicates upstream feed corruption).
+    total_rows_skipped_crossed: u64,
+    total_rows_skipped_invalid_price: u64,
+    total_rows_skipped_other: u64,
+    total_rows_skipped_invalid_state: u64,
+    total_rows_skipped_decode_or_convert: u64,
 }
 
 fn write_export_summary(s: &ExportSummary<'_>) {
@@ -468,6 +561,15 @@ fn write_export_summary(s: &ExportSummary<'_>) {
         "total_messages": s.total_messages,
         "elapsed_seconds": s.elapsed_secs,
         "avg_messages_per_sec": if s.elapsed_secs > 0.0 { s.total_messages as f64 / s.elapsed_secs } else { 0.0 },
+        // Phase M M.A.6 anomaly observability — fail-loud counts of skipped
+        // rows by category. Per hft-rules §8: never silently drop data.
+        "rows_skipped": {
+            "crossed_or_locked_quote": s.total_rows_skipped_crossed,
+            "invalid_price": s.total_rows_skipped_invalid_price,
+            "other_lob_error": s.total_rows_skipped_other,
+            "invalid_state_after_ok": s.total_rows_skipped_invalid_state,
+            "decode_or_convert_error": s.total_rows_skipped_decode_or_convert,
+        },
         "source": "mbo-lob-reconstructor",
         "version": env!("CARGO_PKG_VERSION"),
     });
@@ -579,6 +681,14 @@ fn main() {
     let mut errors: usize = 0;
     let mut day_times: Vec<f64> = Vec::new();
 
+    // Phase M M.A.6 anomaly accumulators (aggregated across all days into
+    // _export_summary.json). See DayResult per-day fields.
+    let mut total_rows_skipped_crossed: u64 = 0;
+    let mut total_rows_skipped_invalid_price: u64 = 0;
+    let mut total_rows_skipped_other: u64 = 0;
+    let mut total_rows_skipped_invalid_state: u64 = 0;
+    let mut total_rows_skipped_decode_or_convert: u64 = 0;
+
     for (i, file) in files.iter().enumerate() {
         let day_num = i + 1;
         let total_days = files.len();
@@ -602,6 +712,11 @@ fn main() {
                 total_lob += result.lob_rows;
                 total_mbo += result.mbo_rows;
                 total_messages += result.messages;
+                total_rows_skipped_crossed += result.rows_skipped_crossed;
+                total_rows_skipped_invalid_price += result.rows_skipped_invalid_price;
+                total_rows_skipped_other += result.rows_skipped_other;
+                total_rows_skipped_invalid_state += result.rows_skipped_invalid_state;
+                total_rows_skipped_decode_or_convert += result.rows_skipped_decode_or_convert;
                 day_times.push(result.elapsed_secs);
 
                 let throughput = result.messages as f64 / result.elapsed_secs.max(0.001);
@@ -662,6 +777,11 @@ fn main() {
         total_mbo,
         total_messages,
         elapsed_secs: elapsed,
+        total_rows_skipped_crossed,
+        total_rows_skipped_invalid_price,
+        total_rows_skipped_other,
+        total_rows_skipped_invalid_state,
+        total_rows_skipped_decode_or_convert,
     });
 
     if errors > 0 {
