@@ -163,19 +163,65 @@ impl<R: BufRead> BufRead for CountingReader<R> {
 }
 
 /// Statistics for DBN file loading.
+///
+/// Phase M M.A.3 (REV 3): added `mid_record_eof` counter (Decision 5b —
+/// observability-tier "stream did not end where expected"; surfaces via
+/// [`LoaderStats::is_clean_eof()`] post-iteration).
 #[derive(Debug, Clone, Default)]
 pub struct LoaderStats {
-    /// Total messages successfully read
+    /// Total messages successfully read.
     pub messages_read: u64,
 
-    /// Messages skipped due to decode/conversion errors
+    /// Messages skipped due to decode/conversion errors (when `skip_invalid=true`).
     pub messages_skipped: u64,
 
-    /// Total bytes read from file
+    /// Total bytes consumed from file.
+    ///
+    /// Phase M M.A.2: now correctly populated via [`CountingReader`]
+    /// (closes F-008 — pre-M.A.2 was always 0).
     pub bytes_read: u64,
 
-    /// File size in bytes
+    /// File size in bytes (populated at constructor from `metadata.len()`).
     pub file_size: u64,
+
+    /// Number of mid-record EOFs observed during iteration (Phase M M.A.3
+    /// Decision 5b).
+    ///
+    /// Increments when the underlying decoder returns
+    /// `dbn::Error::Io(UnexpectedEof)` mid-stream — distinguished from clean
+    /// EOF (where the iterator returns `None` cleanly).
+    ///
+    /// Surfaced via [`LoaderStats::is_clean_eof()`] for caller-decided
+    /// abort/warn policy. The typed iterator returns `None` on both clean
+    /// EOF and mid-record EOF; callers MUST check `is_clean_eof()` after
+    /// iteration to detect torn streams.
+    pub mid_record_eof: u64,
+}
+
+impl LoaderStats {
+    /// Returns `true` if no mid-record EOF was observed during iteration.
+    ///
+    /// Phase M M.A.3 (REV 3 Decision 5b): caller-decides abort/warn discipline.
+    ///
+    /// # Usage
+    ///
+    /// ```ignore
+    /// let mut iter = loader.iter_messages_typed()?;
+    /// for msg_result in &mut iter {
+    ///     let msg = msg_result?;
+    ///     // ... process ...
+    /// }
+    /// let stats = iter.finalize();
+    /// if !stats.is_clean_eof() {
+    ///     // torn record detected; production callers should propagate Err,
+    ///     // analytical callers should WARN + continue
+    ///     log::warn!("Torn DBN record: mid_record_eof={}", stats.mid_record_eof);
+    /// }
+    /// ```
+    #[inline]
+    pub fn is_clean_eof(&self) -> bool {
+        self.mid_record_eof == 0
+    }
 }
 
 /// DBN file loader.
@@ -362,9 +408,11 @@ impl DbnLoader {
         Ok((decoder, bytes_read_handle))
     }
 
-    /// Iterate over all MBO messages in the file.
+    /// Iterate over all MBO messages in the file (legacy untyped API).
     ///
-    /// Returns an iterator that yields `MboMessage`s.
+    /// **DEPRECATED** since 0.2.0. Use [`Self::iter_messages_typed`] for the
+    /// new typed iterator API that distinguishes Decode/Convert errors at
+    /// compile time.
     ///
     /// # Returns
     ///
@@ -379,6 +427,13 @@ impl DbnLoader {
     ///     println!("Order {}: {:?}", msg.order_id, msg.action);
     /// }
     /// ```
+    #[cfg(feature = "legacy-iterator-api")]
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use iter_messages_typed instead (Item = Result<MboMessage, BoundaryError>). \
+                This legacy API will be removed in 0.3.0 (calendar 2026-10-29) per \
+                Phase M REV 3 Decision 2."
+    )]
     pub fn iter_messages(self) -> Result<MessageIterator<DbnFileDecoder>> {
         let (decoder, bytes_read_handle) = self.open_decoder()?;
 
@@ -390,18 +445,73 @@ impl DbnLoader {
         })
     }
 
-    /// Read all messages into a Vec.
+    /// Iterate over all MBO messages in the file (typed API, preferred).
     ///
-    /// **Warning**: This loads all messages into memory at once.
-    /// For large files, use `iter_messages()` instead.
+    /// Phase M M.A.3 (REV 3 Decision 1): typed iterator yielding
+    /// `Result<MboMessage, BoundaryError>` for compile-time error handling.
     ///
     /// # Returns
     ///
-    /// * `Ok(Vec<MboMessage>)` - All messages
-    /// * `Err(TlobError)` - Failed to read or decode
+    /// * `Ok(TypedMessageIterator)` - Iterator yielding `Result<MboMessage, BoundaryError>`
+    /// * `Err(TlobError)` - Failed to open file or initialize decoder
+    ///
+    /// # Mid-record EOF handling (Decision 5b)
+    ///
+    /// - Clean EOF → iterator returns `None`
+    /// - Mid-record EOF (`UnexpectedEof` from decoder) → counter
+    ///   `LoaderStats::mid_record_eof` increments AND iterator returns `None`
+    /// - Decode/Convert errors → `Some(Err(BoundaryError::*))` propagates via `?`
+    ///   (or, with `skip_invalid=true`, are logged + counted in `messages_skipped`)
+    ///
+    /// Callers MUST call [`TypedMessageIterator::finalize`] post-iteration
+    /// (or check `iter.stats().is_clean_eof()`) to detect torn streams.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let loader = DbnLoader::new("data.dbn.zst")?;
+    /// let mut iter = loader.iter_messages_typed()?;
+    /// for msg_result in &mut iter {
+    ///     let msg = msg_result?;  // BoundaryError::Decode/Convert propagates
+    ///     // ... process msg ...
+    /// }
+    /// let stats = iter.finalize();
+    /// if !stats.is_clean_eof() {
+    ///     return Err(BoundaryError::Decode(format!(
+    ///         "torn DBN: mid_record_eof={}", stats.mid_record_eof
+    ///     )).into());
+    /// }
+    /// ```
+    pub fn iter_messages_typed(self) -> Result<TypedMessageIterator<DbnFileDecoder>> {
+        let (decoder, bytes_read_handle) = self.open_decoder()?;
+
+        Ok(TypedMessageIterator {
+            decoder,
+            stats: self.stats,
+            skip_invalid: self.skip_invalid,
+            bytes_read_handle,
+        })
+    }
+
+    /// Read all messages into a Vec (legacy untyped API).
+    ///
+    /// **DEPRECATED** — uses the legacy [`Self::iter_messages`] internally.
+    /// Migrate to a manual loop over [`Self::iter_messages_typed`] for
+    /// typed-error handling.
+    ///
+    /// **Warning**: This loads all messages into memory at once.
+    /// For large files, use `iter_messages_typed()` directly instead.
+    #[cfg(feature = "legacy-iterator-api")]
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use a manual loop over iter_messages_typed() for typed-error handling. \
+                This convenience helper depends on legacy-iterator-api which is \
+                scheduled for removal in 0.3.0 (calendar 2026-10-29)."
+    )]
     pub fn read_all(self) -> Result<Vec<MboMessage>> {
         let mut messages = Vec::new();
 
+        #[allow(deprecated)] // intentional internal use of legacy iter_messages
         for msg in self.iter_messages()? {
             messages.push(msg);
         }
@@ -409,17 +519,21 @@ impl DbnLoader {
         Ok(messages)
     }
 
-    /// Count total messages in the file without allocating memory.
+    /// Count total messages in the file (legacy untyped API).
     ///
-    /// Useful for progress bars and memory planning.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(u64)` - Total message count
-    /// * `Err(TlobError)` - Failed to read file
+    /// **DEPRECATED** — uses the legacy [`Self::iter_messages`] internally.
+    /// Migrate to a manual count over [`Self::iter_messages_typed`].
+    #[cfg(feature = "legacy-iterator-api")]
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use a manual loop over iter_messages_typed() for typed-error handling. \
+                This convenience helper depends on legacy-iterator-api which is \
+                scheduled for removal in 0.3.0 (calendar 2026-10-29)."
+    )]
     pub fn count_messages(self) -> Result<u64> {
         let mut count = 0u64;
 
+        #[allow(deprecated)] // intentional internal use of legacy iter_messages
         for _ in self.iter_messages()? {
             count += 1;
         }
@@ -428,7 +542,15 @@ impl DbnLoader {
     }
 }
 
-/// Iterator over MBO messages in a DBN file.
+/// Iterator over MBO messages in a DBN file (legacy untyped API).
+///
+/// **DEPRECATED** since 0.2.0. Use [`TypedMessageIterator`] for the new typed
+/// iterator API with `Item = Result<MboMessage, BoundaryError>`.
+///
+/// Gated under the `legacy-iterator-api` feature flag (default-on for
+/// transition; will be removed in 0.3.0 / calendar 2026-10-29 per Phase M
+/// REV 3 Decision 2).
+#[cfg(feature = "legacy-iterator-api")]
 pub struct MessageIterator<D: DecodeRecord> {
     decoder: D,
     stats: LoaderStats,
@@ -440,6 +562,7 @@ pub struct MessageIterator<D: DecodeRecord> {
     bytes_read_handle: Arc<AtomicU64>,
 }
 
+#[cfg(feature = "legacy-iterator-api")]
 impl<D: DecodeRecord> Iterator for MessageIterator<D> {
     type Item = MboMessage;
 
@@ -493,6 +616,7 @@ impl<D: DecodeRecord> Iterator for MessageIterator<D> {
     }
 }
 
+#[cfg(feature = "legacy-iterator-api")]
 impl<D: DecodeRecord> MessageIterator<D> {
     /// Get current statistics.
     pub fn stats(&self) -> &LoaderStats {
@@ -508,6 +632,174 @@ impl<D: DecodeRecord> MessageIterator<D> {
         }
 
         (self.stats.bytes_read as f64 / self.stats.file_size as f64) * 100.0
+    }
+}
+
+// ============================================================================
+// Phase M M.A.3 (REV 3): TypedMessageIterator with mid_record_eof + finalize
+// ============================================================================
+
+/// Typed iterator over MBO messages yielding `Result<MboMessage, BoundaryError>`.
+///
+/// Phase M M.A.3 (REV 3 Decision 1): compile-time-enforced error handling at
+/// the DBN-loader iterator boundary. Replaces the legacy [`MessageIterator`]
+/// (deprecated, gated under `legacy-iterator-api`).
+///
+/// # EOF semantics (Decision 5b)
+///
+/// - **Clean EOF** → iterator returns `None`; `is_clean_eof()` is `true`.
+/// - **Mid-record EOF** (decoder hits `UnexpectedEof` mid-stream) → iterator
+///   returns `None` AND increments `LoaderStats::mid_record_eof` counter;
+///   callers MUST check `is_clean_eof()` post-iteration to detect torn streams.
+/// - **Decode error** → `Some(Err(BoundaryError::Decode(_)))` (when
+///   `skip_invalid=false`); with `skip_invalid=true`, error is logged + counted
+///   in `messages_skipped` and iteration continues.
+/// - **Convert error** → `Some(Err(BoundaryError::Convert(TlobError)))` (when
+///   `skip_invalid=false`); with `skip_invalid=true`, error is logged + counted
+///   in `messages_skipped` and iteration continues.
+///
+/// # finalize() — caller-decided abort/warn
+///
+/// Call [`Self::finalize`] (consumes the iterator) to retrieve the final
+/// `LoaderStats` for `is_clean_eof()` check + observability. Production
+/// pipelines (`feature-extractor`) should propagate `Err(...)` on torn streams;
+/// analytical callers (`mbo-statistical-profiler`) may WARN + continue.
+///
+/// # `Arc<AtomicU64>` scope (Decision 17)
+///
+/// The internal `bytes_read_handle: Arc<AtomicU64>` is single-thread-per-iterator
+/// by construction. NEVER share across `Rayon::par_iter` thread boundaries —
+/// each parallel-day worker owns its own iterator + its own counter.
+///
+/// # Example
+///
+/// ```ignore
+/// let loader = DbnLoader::new("data.dbn.zst")?;
+/// let mut iter = loader.iter_messages_typed()?;
+/// for msg_result in &mut iter {
+///     let msg = msg_result?;
+///     // ... process ...
+/// }
+/// let stats = iter.finalize();
+/// if !stats.is_clean_eof() {
+///     return Err(BoundaryError::Decode(format!(
+///         "torn DBN: mid_record_eof={}", stats.mid_record_eof
+///     )).into());
+/// }
+/// ```
+pub struct TypedMessageIterator<D: DecodeRecord> {
+    decoder: D,
+    stats: LoaderStats,
+    skip_invalid: bool,
+    /// Phase M M.A.2: shared `Arc<AtomicU64>` with the inner [`CountingReader`].
+    /// Decision 17: single-thread-per-iterator scope.
+    bytes_read_handle: Arc<AtomicU64>,
+}
+
+impl<D: DecodeRecord> Iterator for TypedMessageIterator<D> {
+    type Item = std::result::Result<MboMessage, BoundaryError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // Sync bytes_read from CountingReader on every call (closes F-008).
+            self.stats.bytes_read = self.bytes_read_handle.load(Ordering::Relaxed);
+
+            let dbn_msg_ref = match self.decoder.decode_record::<dbn::MboMsg>() {
+                Ok(Some(msg)) => msg,
+                Ok(None) => return None, // Clean EOF
+                Err(e) => {
+                    // Phase M Decision 5b: distinguish mid-record EOF from
+                    // generic decode error. dbn::Error::Io is a struct variant
+                    // with named field `source: io::Error`.
+                    let mid_record_eof = matches!(
+                        &e,
+                        dbn::Error::Io { source, .. }
+                            if source.kind() == std::io::ErrorKind::UnexpectedEof
+                    );
+
+                    if mid_record_eof {
+                        // Stream truncated mid-record. Signal EOF to caller
+                        // (returns None) but increment counter so caller can
+                        // distinguish via `is_clean_eof()` at finalize() time.
+                        self.stats.mid_record_eof += 1;
+                        log::warn!(
+                            "Mid-record EOF detected: {} (caller should check is_clean_eof)",
+                            e
+                        );
+                        return None;
+                    }
+
+                    if self.skip_invalid {
+                        log::warn!("Failed to decode DBN record: {e}");
+                        self.stats.messages_skipped += 1;
+                        continue;
+                    }
+
+                    return Some(Err(BoundaryError::Decode(e.to_string())));
+                }
+            };
+
+            match DbnBridge::convert(dbn_msg_ref) {
+                Ok(mbo_msg) => {
+                    self.stats.messages_read += 1;
+                    return Some(Ok(mbo_msg));
+                }
+                Err(e) => {
+                    if self.skip_invalid {
+                        log::warn!("Skipping invalid message: {e}");
+                        self.stats.messages_skipped += 1;
+                        continue;
+                    }
+
+                    return Some(Err(BoundaryError::Convert(e)));
+                }
+            }
+        }
+    }
+}
+
+impl<D: DecodeRecord> TypedMessageIterator<D> {
+    /// Get a reference to the current statistics (live; updated on each `next()`).
+    pub fn stats(&self) -> &LoaderStats {
+        &self.stats
+    }
+
+    /// Get progress as a percentage (0.0 to 100.0).
+    ///
+    /// Phase M M.A.2: now correctly populated via [`CountingReader`]
+    /// (closes F-008 — pre-M.A.2 always returned 0.0 due to `bytes_read=0`).
+    pub fn progress(&self) -> f64 {
+        if self.stats.file_size == 0 {
+            return 100.0;
+        }
+
+        (self.stats.bytes_read as f64 / self.stats.file_size as f64) * 100.0
+    }
+
+    /// Consume the iterator and return the final [`LoaderStats`].
+    ///
+    /// Phase M M.A.3 (REV 3 Decision 5c): caller-decides abort/warn.
+    ///
+    /// After exhausting the iterator (via `for` loop or manual `next()`),
+    /// call this method to retrieve the final stats including
+    /// `mid_record_eof` counter. Use `LoaderStats::is_clean_eof()` to
+    /// distinguish clean EOF from torn-record EOF.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut iter = loader.iter_messages_typed()?;
+    /// for msg_result in &mut iter {
+    ///     let msg = msg_result?;
+    ///     // ... process ...
+    /// }
+    /// let stats = iter.finalize();
+    /// if !stats.is_clean_eof() { /* torn stream */ }
+    /// ```
+    pub fn finalize(mut self) -> LoaderStats {
+        // Sync the final bytes_read snapshot one last time before returning.
+        self.stats.bytes_read = self.bytes_read_handle.load(Ordering::Relaxed);
+        self.stats
     }
 }
 

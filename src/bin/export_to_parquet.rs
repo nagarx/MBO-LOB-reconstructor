@@ -401,6 +401,10 @@ fn process_day(
 
     let mut msg_count: u64 = 0;
 
+    // Phase M M.A.3: legacy iter_messages() is deprecated; M.A.6 will migrate
+    // this binary to iter_messages_typed() alongside the F-021 structured-match
+    // fix at line 411 below. Suppressed for now to keep M.A.3 surgical.
+    #[allow(deprecated)]
     for msg in loader.iter_messages()? {
         msg_count += 1;
 

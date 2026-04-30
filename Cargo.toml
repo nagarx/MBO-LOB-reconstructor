@@ -1,6 +1,6 @@
 [package]
 name = "mbo-lob-reconstructor"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.82"
 authors = ["nagarx"]
@@ -19,9 +19,14 @@ name = "mbo_lob_reconstructor"
 path = "src/lib.rs"
 
 [features]
-default = ["databento"]
+default = ["databento", "legacy-iterator-api"]
 databento = ["dbn", "zstd"]
 export = ["dep:arrow", "dep:parquet", "dep:toml"]
+# Phase M M.A.3 (REV 3): legacy `Iterator<Item = MboMessage>` API.
+# Default-ON for transition; `iter_messages_typed()` is the new preferred API
+# (`Iterator<Item = Result<MboMessage, BoundaryError>>`).
+# Removable in next MAJOR release (0.3.0). Calendar removal: 2026-10-29.
+legacy-iterator-api = ["databento"]
 
 [dependencies]
 # DBN decoding (optional, enabled by default)

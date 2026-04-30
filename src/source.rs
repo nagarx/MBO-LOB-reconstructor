@@ -60,7 +60,9 @@ use crate::types::MboMessage;
 #[cfg(feature = "databento")]
 use crate::hotstore::HotStoreManager;
 #[cfg(feature = "databento")]
-use crate::loader::{DbnLoader, MessageIterator};
+use crate::loader::DbnLoader;
+#[cfg(feature = "legacy-iterator-api")]
+use crate::loader::MessageIterator;
 #[cfg(feature = "databento")]
 use std::fs::File;
 #[cfg(feature = "databento")]
@@ -425,16 +427,22 @@ impl DbnSource {
 ///
 /// Phase M M.A.2: inner reader is wrapped in [`CountingReader`] for byte-tracking
 /// observability (closes F-008 — `LoaderStats::bytes_read` now correctly populated).
-#[cfg(feature = "databento")]
+///
+/// **DEPRECATED in 0.2.0** — uses legacy `MessageIterator` (gated under
+/// `legacy-iterator-api` feature). The `MarketDataSource` trait integration
+/// will migrate to [`TypedMessageIterator`] in a follow-up cycle once the
+/// trait is updated to support `Item = Result<MboMessage, BoundaryError>`.
+#[cfg(all(feature = "databento", feature = "legacy-iterator-api"))]
 type DbnMessageIterator = MessageIterator<
     dbn::decode::DynDecoder<'static, crate::loader::CountingReader<BufReader<File>>>,
 >;
 
-#[cfg(feature = "databento")]
+#[cfg(all(feature = "databento", feature = "legacy-iterator-api"))]
 impl MarketDataSource for DbnSource {
     type MessageIter = DbnMessageIterator;
 
     fn messages(self) -> Result<Self::MessageIter> {
+        #[allow(deprecated)] // intentional bridge to MarketDataSource trait
         self.loader.iter_messages()
     }
 
