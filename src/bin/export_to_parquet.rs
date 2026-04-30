@@ -406,7 +406,16 @@ fn process_day(
     let date = extract_date(dbn_path);
     let day_start = Instant::now();
 
-    let loader = DbnLoader::new(dbn_path)?.skip_invalid(true);
+    // Phase M M.A.6 hardening (post-validation Agent 1 CRITICAL):
+    // `skip_invalid(true)` would silently route decode/convert errors into
+    // `LoaderStats::messages_skipped` and `continue` inside the typed iterator,
+    // so they would NEVER reach the `Some(Err(_))` arm of the structured
+    // match below — defeating F-021 + F-023 observability. We disable it
+    // here (default = false) so the typed iterator surfaces every error to
+    // the binary's structured-match path. Operator-facing behavior is
+    // unchanged (skip + WARN-log + continue), but `rows_skipped_decode_or_convert`
+    // now actually tracks the count.
+    let loader = DbnLoader::new(dbn_path)?;
     let mut lob = LobReconstructor::new(levels);
     let mut lob_state = LobState::new(levels);
 
@@ -493,7 +502,17 @@ fn process_day(
     }
 
     // Phase M M.A.3 finalize() — distinguishes clean EOF from truncated DBN.
-    let _loader_stats = messages.finalize();
+    // Phase M M.A.6 hardening (post-validation Agent 1 HIGH): the parquet
+    // binary's policy is WARN-and-continue on torn DBN streams (analytical
+    // batch tool, not production fail-fast). Surface the anomaly via WARN
+    // so operators can correlate truncated days against feed-availability.
+    let loader_stats = messages.finalize();
+    if !loader_stats.is_clean_eof() {
+        log::warn!(
+            "[{date}] mid-record EOF: {} torn record(s) — DBN stream truncated",
+            loader_stats.mid_record_eof
+        );
+    }
 
     let lob_export_stats = lob_writer.finish()?;
     let mbo_rows = if let Some(mw) = mbo_writer {

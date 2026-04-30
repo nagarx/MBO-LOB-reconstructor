@@ -196,6 +196,27 @@ pub struct LoaderStats {
     /// EOF and mid-record EOF; callers MUST check `is_clean_eof()` after
     /// iteration to detect torn streams.
     pub mid_record_eof: u64,
+
+    /// Number of system messages (heartbeats / metadata / session-control)
+    /// **observed** by the loader (not filtered).
+    ///
+    /// Phase M M.A.7 (REV 3 F-010 closure): producer-side counter. Pre-M.A.7,
+    /// downstream consumers pre-filtered system messages (e.g.,
+    /// `if msg.is_system_message() { continue; }` at the consumer site)
+    /// BEFORE they reached `LobReconstructor`, so
+    /// `LobStats::system_messages_skipped` was permanently shadowed at zero.
+    /// The producer-side counter at the loader is the SSoT for "how many
+    /// system messages the underlying DBN file contained" regardless of
+    /// downstream filtering policy.
+    ///
+    /// Definition of "system message" (from [`crate::types::MboMessage::is_system_message`]):
+    /// `order_id == 0 || size == 0 || price <= 0`.
+    ///
+    /// The loader does NOT skip system messages — it yields them with the
+    /// counter incremented. Downstream consumers retain the freedom to
+    /// filter them via their own policy. Per hft-rules §8: never silently
+    /// drop data without observability.
+    pub system_messages_seen: u64,
 }
 
 impl LoaderStats {
@@ -599,6 +620,12 @@ impl<D: DecodeRecord> Iterator for MessageIterator<D> {
             match DbnBridge::convert(dbn_msg_ref) {
                 Ok(mbo_msg) => {
                     self.stats.messages_read += 1;
+                    // Phase M M.A.7 (REV 3 F-010 closure): producer-side
+                    // system-message counter. We yield the message regardless;
+                    // downstream consumers retain their filtering policy.
+                    if mbo_msg.is_system_message() {
+                        self.stats.system_messages_seen += 1;
+                    }
                     return Some(mbo_msg);
                 }
                 Err(e) => {
@@ -742,6 +769,12 @@ impl<D: DecodeRecord> Iterator for TypedMessageIterator<D> {
             match DbnBridge::convert(dbn_msg_ref) {
                 Ok(mbo_msg) => {
                     self.stats.messages_read += 1;
+                    // Phase M M.A.7 (REV 3 F-010 closure): producer-side
+                    // system-message counter. We yield the message regardless;
+                    // downstream consumers retain their filtering policy.
+                    if mbo_msg.is_system_message() {
+                        self.stats.system_messages_seen += 1;
+                    }
                     return Some(Ok(mbo_msg));
                 }
                 Err(e) => {
@@ -854,6 +887,27 @@ mod tests {
         let stats = LoaderStats::default();
         assert_eq!(stats.messages_read, 0);
         assert_eq!(stats.messages_skipped, 0);
+        // Phase M M.A.2: bytes_read populated via CountingReader (F-008 closure).
+        assert_eq!(stats.bytes_read, 0);
+        // Phase M M.A.3: mid_record_eof counter for torn DBN streams (Decision 5b).
+        assert_eq!(stats.mid_record_eof, 0);
+        assert!(stats.is_clean_eof());
+        // Phase M M.A.7: system_messages_seen counter for producer-side
+        // observability (F-010 closure). Locks the field exists with the
+        // expected type so a future struct refactor can't silently delete it.
+        assert_eq!(stats.system_messages_seen, 0);
+    }
+
+    #[test]
+    fn test_loader_stats_system_messages_seen_field_mutable() {
+        // Phase M M.A.7 (REV 3 F-010 closure): the producer-side counter
+        // is `pub` and live-mutated by both `MessageIterator::next` (legacy)
+        // and `TypedMessageIterator::next` (post-M.A.3). Locks the public
+        // mutable field surface so consumers can read it after iteration
+        // (e.g., for sidecar JSON emission).
+        let mut stats = LoaderStats::default();
+        stats.system_messages_seen = 42;
+        assert_eq!(stats.system_messages_seen, 42);
     }
 
     #[test]
