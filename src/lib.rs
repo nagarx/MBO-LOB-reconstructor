@@ -235,7 +235,7 @@ pub use hotstore::{HotStoreConfig, HotStoreManager};
 
 #[cfg(feature = "databento")]
 #[allow(deprecated)]
-pub use loader::{is_valid_order, DbnLoader, LoaderStats, IO_BUFFER_SIZE};
+pub use loader::{is_valid_order, BoundaryError, DbnLoader, LoaderStats, IO_BUFFER_SIZE};
 
 // Re-exports - Parquet export (feature-gated)
 #[cfg(feature = "export")]

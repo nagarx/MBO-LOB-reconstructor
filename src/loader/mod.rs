@@ -49,6 +49,9 @@
 //! This loader focuses on I/O and decode errors only. Use `skip_invalid(true)`
 //! to skip messages that fail to decode from the DBN format.
 
+pub mod error;
+pub use error::BoundaryError;
+
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
