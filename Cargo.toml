@@ -70,10 +70,13 @@ parquet = { version = "55", default-features = false, features = ["arrow", "snap
 name = "reconstruction"
 harness = false
 
-# Example that requires databento feature
+# Example that requires databento + legacy-iterator-api features.
+# Phase M M.A.12: legacy-iterator-api is required because the example
+# consumes `loader.iter_messages()` (legacy API). The post-2026-10-29
+# 0.3.0 cycle will migrate this example to `iter_messages_typed()`.
 [[example]]
 name = "process_nvda_single_day"
-required-features = ["databento"]
+required-features = ["databento", "legacy-iterator-api"]
 
 # CLI tool for decompressing to hot store
 [[bin]]

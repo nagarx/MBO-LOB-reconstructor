@@ -63,9 +63,14 @@ use crate::hotstore::HotStoreManager;
 use crate::loader::DbnLoader;
 #[cfg(feature = "legacy-iterator-api")]
 use crate::loader::MessageIterator;
-#[cfg(feature = "databento")]
+// Phase M M.A.12: `File` and `BufReader` are only consumed by the
+// `MarketDataSource for DbnSource` impl (gated under both `databento` AND
+// `legacy-iterator-api`). Widen the import gate to match — pre-M.A.12 the
+// imports were `databento`-only, producing dead-code warnings under
+// `--features databento --no-default-features` (Agent V1 CRITICAL).
+#[cfg(all(feature = "databento", feature = "legacy-iterator-api"))]
 use std::fs::File;
-#[cfg(feature = "databento")]
+#[cfg(all(feature = "databento", feature = "legacy-iterator-api"))]
 use std::io::BufReader;
 
 // ============================================================================
@@ -551,7 +556,14 @@ mod tests {
     // DbnSource tests (require databento feature)
     // ========================================================================
 
-    #[cfg(feature = "databento")]
+    // Phase M M.A.12: gated under BOTH features. The tests call
+    // `source.metadata()` and `source.messages()` which come from the
+    // `MarketDataSource for DbnSource` trait impl that is itself gated
+    // `#[cfg(all(databento, legacy-iterator-api))]`. Pre-M.A.12 only the
+    // `databento` gate was applied here, producing E0599 errors when
+    // building with `--features databento --no-default-features` (Agent V1
+    // CRITICAL feature-gating finding).
+    #[cfg(all(feature = "databento", feature = "legacy-iterator-api"))]
     mod dbn_tests {
         use super::*;
 

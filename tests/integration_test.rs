@@ -11,9 +11,17 @@
 //! cargo test --test integration_test --release
 //! ```
 //!
-//! Note: These tests require the `databento` feature (enabled by default).
+//! Phase M M.A.12: gated under BOTH `databento` AND `legacy-iterator-api`
+//! features. The tests consume `loader.iter_messages()` which is only
+//! available under the legacy feature flag (deprecated; calendar removal
+//! 2026-10-29 → 0.3.0). Post-removal these tests will be migrated to
+//! `iter_messages_typed()` in a dedicated test-hardening cycle. Pre-M.A.12
+//! the file was gated only under `databento`, which made
+//! `cargo test --features databento --no-default-features` fail with
+//! 24+ E0599 errors (Agent V1 CRITICAL finding) because the call sites
+//! reference symbols that do not exist outside the legacy feature.
 
-#![cfg(feature = "databento")]
+#![cfg(all(feature = "databento", feature = "legacy-iterator-api"))]
 
 use std::path::Path;
 use std::time::Instant;

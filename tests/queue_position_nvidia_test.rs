@@ -3,11 +3,15 @@
 //! These tests validate the queue position tracking using actual MBO data
 //! to ensure correctness in real-world scenarios.
 //!
-//! **Note**: This test module requires the `databento` feature to be enabled
-//! since it uses `DbnLoader` for reading MBO data files.
+//! Phase M M.A.12: gated under BOTH `databento` AND `legacy-iterator-api`
+//! features. Tests call `loader.iter_messages()` (legacy iterator);
+//! post-2026-10-29 0.3.0 removal, these will be migrated to
+//! `iter_messages_typed()`. Pre-M.A.12 the file was gated only under
+//! `databento`, which made `cargo test --features databento
+//! --no-default-features` fail with E0599 errors (Agent V1 CRITICAL).
 
-// This entire test module requires the databento feature for DbnLoader
-#![cfg(feature = "databento")]
+// This entire test module requires both features for DbnLoader + iter_messages.
+#![cfg(all(feature = "databento", feature = "legacy-iterator-api"))]
 
 use mbo_lob_reconstructor::{
     DbnLoader, LobReconstructor, QueuePositionConfig, QueuePositionTracker,
