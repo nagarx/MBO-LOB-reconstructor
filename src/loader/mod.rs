@@ -228,9 +228,29 @@ pub struct LoaderStats {
 }
 
 impl LoaderStats {
-    /// Returns `true` if no mid-record EOF was observed during iteration.
+    /// Returns `true` if no mid-record EOF was observed during iteration
+    /// (the dbn-reported signal).
     ///
     /// Phase M M.A.3 (REV 3 Decision 5b): caller-decides abort/warn discipline.
+    ///
+    /// # Important caveat (Phase M M.A.11 — post-validation Agent V5 finding)
+    ///
+    /// Under dbn 0.20.0, the `silence_eof_error` mechanism converts
+    /// `Err(io::Error{kind: UnexpectedEof, ..})` to `Ok(None)` clean-EOF in
+    /// BOTH `read_exact` paths inside `decode_record_ref`. This means our
+    /// `mid_record_eof` counter (incremented when the iterator's match arm
+    /// catches `dbn::Error::Io { source, .. } if source.kind() == UnexpectedEof`)
+    /// is ALMOST NEVER reachable in production against real `.dbn.zst` files.
+    /// Verified by reading
+    /// `~/.cargo/git/checkouts/dbn-*/error.rs:116-122` ground-truth.
+    ///
+    /// Consequence: `is_clean_eof()` will return `true` even on truncated
+    /// streams in production. For best-available torn-detection, callers
+    /// should also check [`LoaderStats::bytes_read_matches_file_size()`]
+    /// (a heuristic byte-count signal added in M.A.11) OR (preferred) use
+    /// external file-integrity checks (e.g., manifest SHA-256 verification
+    /// at the producer side via `databento-ingest`'s atomic-write +
+    /// SHA-256 verify pattern).
     ///
     /// # Usage
     ///
@@ -241,15 +261,75 @@ impl LoaderStats {
     ///     // ... process ...
     /// }
     /// let stats = iter.finalize();
-    /// if !stats.is_clean_eof() {
-    ///     // torn record detected; production callers should propagate Err,
-    ///     // analytical callers should WARN + continue
-    ///     log::warn!("Torn DBN record: mid_record_eof={}", stats.mid_record_eof);
+    /// if !stats.is_clean_termination() {
+    ///     // torn record detected (best-available signal — see caveats above);
+    ///     // production callers should propagate Err, analytical callers WARN.
+    ///     log::warn!(
+    ///         "Stream may be truncated: mid_record_eof={}, bytes_read={}, file_size={}",
+    ///         stats.mid_record_eof, stats.bytes_read, stats.file_size,
+    ///     );
     /// }
     /// ```
     #[inline]
     pub fn is_clean_eof(&self) -> bool {
         self.mid_record_eof == 0
+    }
+
+    /// Returns `true` if bytes consumed by the decoder matches the file's
+    /// on-disk size — a heuristic torn-stream signal complementary to
+    /// [`LoaderStats::is_clean_eof()`].
+    ///
+    /// # Phase M M.A.11 (post-validation Agent V5 finding)
+    ///
+    /// Background: dbn 0.20.0's `silence_eof_error` silences UnexpectedEof
+    /// inside `read_exact` paths, making `is_clean_eof()`'s `mid_record_eof`
+    /// counter unreachable in production. M.A.11 adds this byte-count
+    /// fallback signal: if the decoder consumed fewer bytes than the file's
+    /// on-disk size, the stream was likely truncated mid-file (corrupt
+    /// `.dbn.zst` with embedded mid-stream truncation, or the decoder
+    /// bailed early on a malformed frame and didn't consume the rest).
+    ///
+    /// # Returns
+    ///
+    /// - `true` if `file_size == 0` (constructor never populated it; can't
+    ///   judge) OR `bytes_read >= file_size` (decoder consumed everything).
+    /// - `false` if `bytes_read < file_size` (suspect mid-file truncation).
+    ///
+    /// # LIMITATION (read carefully)
+    ///
+    /// This signal **CANNOT detect end-of-file truncation** where the file
+    /// is truncated AT the natural end with the last record incomplete:
+    /// the decoder consumes ALL available bytes (so `bytes_read == file_size`),
+    /// then encounters UnexpectedEof on the next record's read_exact, which
+    /// dbn silences. In that scenario neither this method nor
+    /// `is_clean_eof()` detects the torn-end. **Production-grade torn
+    /// detection requires external file-integrity checks** (e.g., the
+    /// `databento-ingest` manifest's SHA-256 verification, OR per-day
+    /// expected-record-count metadata).
+    ///
+    /// This method's value: catches mid-file truncation (a non-trivial
+    /// fraction of real-world DBN-stream-corruption scenarios where a
+    /// network blip, NFS quirk, or zstd-frame-corruption stops the
+    /// decoder before consuming the full file).
+    #[inline]
+    pub fn bytes_read_matches_file_size(&self) -> bool {
+        self.file_size == 0 || self.bytes_read >= self.file_size
+    }
+
+    /// Combined torn-stream signal: returns `true` only if BOTH
+    /// `is_clean_eof()` AND `bytes_read_matches_file_size()` indicate
+    /// clean termination.
+    ///
+    /// Phase M M.A.11: the best-available in-process torn-detection
+    /// signal post-Phase-M, given dbn 0.20.0's UnexpectedEof silencing
+    /// (see [`LoaderStats::is_clean_eof()`] caveat).
+    ///
+    /// **For production-grade torn detection**, supplement this with
+    /// external file-integrity checks (SHA-256 manifest verification
+    /// at the producer side).
+    #[inline]
+    pub fn is_clean_termination(&self) -> bool {
+        self.is_clean_eof() && self.bytes_read_matches_file_size()
     }
 }
 
@@ -916,6 +996,85 @@ mod tests {
         let mut stats = LoaderStats::default();
         stats.system_messages_seen = 42;
         assert_eq!(stats.system_messages_seen, 42);
+    }
+
+    #[test]
+    fn test_bytes_read_matches_file_size_returns_true_when_file_size_zero() {
+        // Phase M M.A.11 (Agent V5 fallback torn-detection): when file_size
+        // is 0 (constructor didn't populate it; e.g., test fixture), the
+        // method conservatively returns true (can't judge truncation
+        // without knowing the expected size). Locks the design choice.
+        let stats = LoaderStats::default(); // file_size = 0
+        assert!(stats.bytes_read_matches_file_size());
+        assert!(stats.is_clean_termination());
+    }
+
+    #[test]
+    fn test_bytes_read_matches_file_size_detects_mid_file_truncation() {
+        // Phase M M.A.11: mid-file truncation case. file_size = 1MB, but
+        // decoder only consumed 500KB before bailing on a malformed frame.
+        // bytes_read < file_size → method returns false → suspect torn.
+        let stats = LoaderStats {
+            file_size: 1_000_000,
+            bytes_read: 500_000,
+            ..LoaderStats::default()
+        };
+        assert!(!stats.bytes_read_matches_file_size());
+        assert!(!stats.is_clean_termination());
+    }
+
+    #[test]
+    fn test_bytes_read_matches_file_size_clean_eof_path() {
+        // Phase M M.A.11: clean EOF case. Decoder consumed all bytes; file
+        // ended naturally; no truncation. file_size == bytes_read → true.
+        let stats = LoaderStats {
+            file_size: 1_000_000,
+            bytes_read: 1_000_000,
+            ..LoaderStats::default()
+        };
+        assert!(stats.bytes_read_matches_file_size());
+        assert!(stats.is_clean_termination());
+    }
+
+    #[test]
+    fn test_bytes_read_matches_file_size_decoder_overshoot_tolerated() {
+        // Phase M M.A.11: edge case — decoder ends up consuming MORE bytes
+        // than file_size (theoretically impossible since file_size is fixed,
+        // but defensive check). Method returns true (>=, not ==).
+        let stats = LoaderStats {
+            file_size: 1_000_000,
+            bytes_read: 1_000_001, // unlikely but defensive
+            ..LoaderStats::default()
+        };
+        assert!(stats.bytes_read_matches_file_size());
+    }
+
+    #[test]
+    fn test_is_clean_termination_combines_both_signals() {
+        // Phase M M.A.11: the combined signal is true ONLY if BOTH the
+        // mid_record_eof check AND the byte-count check pass. Each fails
+        // it independently.
+        let mut stats = LoaderStats {
+            file_size: 1_000,
+            bytes_read: 1_000,
+            mid_record_eof: 0,
+            ..LoaderStats::default()
+        };
+        // Both signals clean
+        assert!(stats.is_clean_termination());
+
+        // mid_record_eof fires (rare under dbn 0.20.0 but theoretically
+        // possible if a non-silenced UnexpectedEof path is reached).
+        stats.mid_record_eof = 1;
+        assert!(!stats.is_clean_termination());
+        assert!(!stats.is_clean_eof());
+
+        // Byte-count fires (mid-file truncation).
+        stats.mid_record_eof = 0;
+        stats.bytes_read = 500;
+        assert!(!stats.is_clean_termination());
+        assert!(stats.is_clean_eof()); // dbn-side signal still says clean
+        assert!(!stats.bytes_read_matches_file_size());
     }
 
     #[test]

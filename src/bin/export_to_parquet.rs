@@ -506,11 +506,22 @@ fn process_day(
     // binary's policy is WARN-and-continue on torn DBN streams (analytical
     // batch tool, not production fail-fast). Surface the anomaly via WARN
     // so operators can correlate truncated days against feed-availability.
+    //
+    // Phase M M.A.11 (post-validation Agent V5 HIGH): dbn 0.20.0's
+    // silence_eof_error makes `is_clean_eof()`'s `mid_record_eof` counter
+    // unreachable in production. We now use `is_clean_termination()` which
+    // ALSO checks `bytes_read >= file_size` — best-available in-process
+    // signal. Production-grade torn-detection requires external SHA-256
+    // checks (databento-ingest does this).
     let loader_stats = messages.finalize();
-    if !loader_stats.is_clean_eof() {
+    if !loader_stats.is_clean_termination() {
         log::warn!(
-            "[{date}] mid-record EOF: {} torn record(s) — DBN stream truncated",
-            loader_stats.mid_record_eof
+            "[{date}] DBN stream may be truncated: mid_record_eof={}, bytes_read={} of file_size={} \
+             — see LoaderStats::is_clean_termination() doc-comment for caveats; \
+             for production-grade torn-detection use external SHA-256 manifest verification",
+            loader_stats.mid_record_eof,
+            loader_stats.bytes_read,
+            loader_stats.file_size,
         );
     }
 
