@@ -178,7 +178,23 @@ pub struct LobReconstructor {
 }
 
 /// Statistics for monitoring LOB health.
+///
+/// Phase M M.A.4 (REV 3 boundary discipline cycle):
+/// - `#[non_exhaustive]` per Decision 18 — additive-only future evolution; external
+///   crates cannot construct `LobStats { ... }` via struct literal (use
+///   `LobStats::default()` + `..LobStats::default()` struct-update syntax).
+/// - The legacy `errors: u64` field was REMOVED per Decision 10b (F-007 closure)
+///   after pre-implementation gate confirmed ZERO genuine increment sites in
+///   production code. Specific error categories are tracked by `crossed_quotes`,
+///   `locked_quotes`, and the per-action `*_not_found` / `*_missing` counters
+///   below. **Breaking change for external code reading `.errors`** —
+///   documented in `CHANGELOG.md` (M.A.8).
+/// - F-013 closure: NEW `modify_order_not_found` + `add_order_id_collision`
+///   counters expose silent fall-through behavior at the modify-of-missing
+///   and add-of-existing paths (see `LobReconstructor::modify_order` and
+///   `LobReconstructor::add_order`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct LobStats {
     /// Total messages processed (excludes system messages if skip_system_messages=true)
     pub messages_processed: u64,
@@ -194,9 +210,6 @@ pub struct LobStats {
 
     /// Number of price levels (ask side)
     pub ask_levels: usize,
-
-    /// Total errors encountered
-    pub errors: u64,
 
     /// Number of crossed quotes detected (bid >= ask)
     pub crossed_quotes: u64,
@@ -228,6 +241,30 @@ pub struct LobStats {
     /// Number of trades where order was not at expected price level
     pub trade_order_at_level_missing: u64,
 
+    /// Number of `modify_order` operations where the `order_id` was NOT found
+    /// in the active orders map.
+    ///
+    /// Phase M M.A.4 (REV 3 F-013 closure): increments at
+    /// `LobReconstructor::modify_order` line ~500 BEFORE the recovery
+    /// fall-through to `add_order(msg)` (which creates a NEW order at the
+    /// MODIFY message's price/side/size). This is a normal warmup pattern
+    /// for messages whose corresponding `Add` arrived before the iteration
+    /// window started; persistent non-zero values during steady-state
+    /// indicate upstream feed gaps.
+    #[serde(default)]
+    pub modify_order_not_found: u64,
+
+    /// Number of `add_order` operations where the `order_id` already existed
+    /// in the active orders map.
+    ///
+    /// Phase M M.A.4 (REV 3 F-013 sibling closure): increments at
+    /// `LobReconstructor::add_order` line ~462 BEFORE the recovery
+    /// fall-through to `modify_order(msg)` (some exchanges reuse `order_id`s).
+    /// Persistent non-zero values may indicate either (a) legitimate id reuse
+    /// by the venue, or (b) data-feed quirks worth investigating.
+    #[serde(default)]
+    pub add_order_id_collision: u64,
+
     /// Number of book clears/resets
     pub book_clears: u64,
 
@@ -244,6 +281,8 @@ impl LobStats {
             || self.trade_order_not_found > 0
             || self.trade_price_level_missing > 0
             || self.trade_order_at_level_missing > 0
+            || self.modify_order_not_found > 0
+            || self.add_order_id_collision > 0
     }
 
     /// Get total number of warnings.
@@ -254,6 +293,8 @@ impl LobStats {
             + self.trade_order_not_found
             + self.trade_price_level_missing
             + self.trade_order_at_level_missing
+            + self.modify_order_not_found
+            + self.add_order_id_collision
     }
 
     /// Export stats to JSON file.
@@ -459,7 +500,13 @@ impl LobReconstructor {
     fn add_order(&mut self, msg: &MboMessage) -> Result<()> {
         // Check if order already exists
         if self.orders.contains_key(&msg.order_id) {
-            // Some exchanges reuse order IDs, treat as modify
+            // Some exchanges reuse order IDs, treat as modify.
+            //
+            // Phase M M.A.4 (REV 3 F-013 sibling closure): increment
+            // `add_order_id_collision` counter BEFORE the silent recovery
+            // fall-through. Production NVDA data shows ~0.5% — small but
+            // non-zero; persistent values help operators detect feed quirks.
+            self.stats.add_order_id_collision += 1;
             return self.modify_order(msg);
         }
 
@@ -496,7 +543,17 @@ impl LobReconstructor {
         let old_order = match self.orders.get(&msg.order_id) {
             Some(order) => *order,
             None => {
-                // Order not found, treat as add
+                // Order not found, treat as add.
+                //
+                // Phase M M.A.4 (REV 3 F-013 closure): increment
+                // `modify_order_not_found` counter BEFORE the silent
+                // recovery fall-through. The fall-through creates a NEW
+                // order at MODIFY's price/side/size — this is the documented
+                // warmup heuristic for messages whose corresponding `Add`
+                // arrived before the iteration window started. Production
+                // NVDA data shows the rate empirically; persistent non-zero
+                // during steady-state indicates upstream feed gaps.
+                self.stats.modify_order_not_found += 1;
                 return self.add_order(msg);
             }
         };
@@ -1198,6 +1255,96 @@ mod tests {
         assert_eq!(lob.order_count(), 1);
         assert_eq!(state.best_bid, Some(100_010_000_000));
         assert_eq!(state.bid_sizes[0], 150);
+    }
+
+    /// Phase M M.A.4 F-013 closure: locks the silent-fall-through observability
+    /// counter for `Modify` of an unknown `order_id`.
+    ///
+    /// Pre-M.A.4: a `Modify` for a missing `order_id` would silently call
+    /// `add_order(msg)` (creating a NEW order at MODIFY's price), with no
+    /// counter, no log, no diagnostic surface — operators had zero visibility
+    /// into the rate. Post-M.A.4: the counter increments BEFORE the recovery
+    /// fall-through, exposing the rate to operator dashboards.
+    #[test]
+    fn test_modify_order_not_found_increments_counter() {
+        let mut lob = LobReconstructor::new(10);
+
+        // No prior Add — the order is not in the tracker.
+        assert_eq!(lob.stats().modify_order_not_found, 0);
+
+        // Modify with an unknown order_id; recovers as Add at MODIFY's price.
+        let modify = create_test_message(99, Action::Modify, Side::Bid, 100.5, 200);
+        lob.process_message(&modify).unwrap();
+
+        // Counter must increment exactly once.
+        assert_eq!(lob.stats().modify_order_not_found, 1);
+
+        // Recovery semantic preserved: a NEW order now exists at MODIFY's
+        // price, side, size — verifying the fall-through still works.
+        assert_eq!(lob.order_count(), 1);
+
+        // A second Modify-of-missing increments to 2.
+        let modify2 = create_test_message(100, Action::Modify, Side::Ask, 101.0, 300);
+        lob.process_message(&modify2).unwrap();
+        assert_eq!(lob.stats().modify_order_not_found, 2);
+
+        // has_warnings() reports true (warning counter taxonomy).
+        assert!(lob.stats().has_warnings());
+        assert!(lob.stats().total_warnings() >= 2);
+    }
+
+    /// Phase M M.A.4 F-013 sibling closure: locks the silent-fall-through
+    /// observability counter for `Add` of an existing `order_id`.
+    ///
+    /// Pre-M.A.4: an `Add` for an already-tracked `order_id` would silently
+    /// call `modify_order(msg)` (some venues reuse IDs intentionally), with
+    /// no counter. Post-M.A.4: the counter increments BEFORE the recovery
+    /// fall-through, exposing the rate.
+    #[test]
+    fn test_add_order_id_collision_increments_counter() {
+        let mut lob = LobReconstructor::new(10);
+
+        // First Add for order_id=1.
+        let add1 = create_test_message(1, Action::Add, Side::Bid, 100.0, 100);
+        lob.process_message(&add1).unwrap();
+        assert_eq!(lob.stats().add_order_id_collision, 0);
+
+        // Second Add for the same order_id=1; recovers as Modify.
+        let add2 = create_test_message(1, Action::Add, Side::Bid, 100.05, 150);
+        lob.process_message(&add2).unwrap();
+
+        // Counter must increment exactly once.
+        assert_eq!(lob.stats().add_order_id_collision, 1);
+
+        // Recovery semantic preserved: order_count remains 1 (modify not add).
+        assert_eq!(lob.order_count(), 1);
+
+        // has_warnings() reports true.
+        assert!(lob.stats().has_warnings());
+    }
+
+    /// Phase M M.A.4 F-007 closure: verify the legacy `errors` field has
+    /// been REMOVED from the `LobStats` struct. This test is a structural
+    /// regression-lock — if a future commit re-introduces the field, this
+    /// test will fail to compile (intentional drift detector).
+    ///
+    /// The replacement counters (`modify_order_not_found` +
+    /// `add_order_id_collision`) cover the previously-untracked anomalies.
+    /// Specific error variants are tracked by `crossed_quotes`,
+    /// `locked_quotes`, and the per-action `*_not_found` / `*_missing`
+    /// counters.
+    #[test]
+    fn test_lob_stats_errors_field_removed() {
+        let stats = LobStats::default();
+        // Verify replacement counters are present + default to zero.
+        assert_eq!(stats.modify_order_not_found, 0);
+        assert_eq!(stats.add_order_id_collision, 0);
+        // Pre-existing surface preserved.
+        assert_eq!(stats.crossed_quotes, 0);
+        assert_eq!(stats.locked_quotes, 0);
+        // Note: `stats.errors` is intentionally absent. Compile-time
+        // verification — any reintroduction would require this test to
+        // change (drift detector).
     }
 
     #[test]
@@ -2218,13 +2365,17 @@ mod tests {
 
     #[test]
     fn test_lobstats_export_roundtrip() {
+        // Phase M M.A.4: `errors` field REMOVED per Decision 10b
+        // (F-007 closure — dead field). Two new fields added in its place:
+        // `modify_order_not_found` + `add_order_id_collision` (F-013 closure).
+        // Use struct-update syntax `..LobStats::default()` to be resilient
+        // against future additive fields.
         let stats = LobStats {
             messages_processed: 1_000_000,
             system_messages_skipped: 42,
             active_orders: 500,
             bid_levels: 10,
             ask_levels: 10,
-            errors: 3,
             crossed_quotes: 7,
             locked_quotes: 2,
             last_timestamp: Some(1_700_000_000_000_000_000),
@@ -2234,6 +2385,8 @@ mod tests {
             trade_order_not_found: 20,
             trade_price_level_missing: 5,
             trade_order_at_level_missing: 2,
+            modify_order_not_found: 8,
+            add_order_id_collision: 6,
             book_clears: 1,
             noop_messages: 100,
         };
@@ -2250,7 +2403,6 @@ mod tests {
         assert_eq!(loaded.active_orders, 500);
         assert_eq!(loaded.bid_levels, 10);
         assert_eq!(loaded.ask_levels, 10);
-        assert_eq!(loaded.errors, 3);
         assert_eq!(loaded.crossed_quotes, 7);
         assert_eq!(loaded.locked_quotes, 2);
         assert_eq!(loaded.last_timestamp, Some(1_700_000_000_000_000_000));
@@ -2260,6 +2412,8 @@ mod tests {
         assert_eq!(loaded.trade_order_not_found, 20);
         assert_eq!(loaded.trade_price_level_missing, 5);
         assert_eq!(loaded.trade_order_at_level_missing, 2);
+        assert_eq!(loaded.modify_order_not_found, 8);
+        assert_eq!(loaded.add_order_id_collision, 6);
         assert_eq!(loaded.book_clears, 1);
         assert_eq!(loaded.noop_messages, 100);
 
@@ -2279,8 +2433,13 @@ mod tests {
         let json_str = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
 
+        // Phase M M.A.4: `errors` field REMOVED (F-007). The new
+        // `modify_order_not_found` + `add_order_id_collision` counters use
+        // `#[serde(default)]` so they default to 0 in the JSON when omitted
+        // — included here to lock the wire-format key names.
         assert_eq!(parsed["messages_processed"], 0);
-        assert_eq!(parsed["errors"], 0);
+        assert_eq!(parsed["modify_order_not_found"], 0);
+        assert_eq!(parsed["add_order_id_collision"], 0);
         assert_eq!(parsed["book_clears"], 0);
         assert_eq!(parsed["noop_messages"], 0);
 

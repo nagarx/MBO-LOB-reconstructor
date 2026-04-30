@@ -68,6 +68,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🚀 Starting processing...\n");
 
     // Process all messages
+    //
+    // Phase M M.A.4: legacy iter_messages() is deprecated. This example
+    // demonstrates the legacy API for backward-compat reference; new code
+    // should use iter_messages_typed() (yields Result<MboMessage, BoundaryError>).
+    // Suppression here is intentional and matches src/bin/export_to_parquet.rs.
+    #[allow(deprecated)]
     for mbo_msg in loader.iter_messages()? {
         // Skip invalid messages (system messages, metadata, etc.)
         // Common patterns: order_id=0, size=0, invalid price
@@ -164,9 +170,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "  Messages with LOB errors:  {:>15}",
         format_number(lob_error_count)
     );
+    // Phase M M.A.4 (REV 3 F-007 closure): the legacy `lob_stats.errors`
+    // field was REMOVED — it was declared but never incremented. Specific
+    // anomaly counters now expose the silent fall-through behavior:
     println!(
-        "  DBN decode errors:         {:>15}",
-        format_number(lob_stats.errors)
+        "  Modify-of-missing:         {:>15}",
+        format_number(lob_stats.modify_order_not_found)
+    );
+    println!(
+        "  Add-of-existing-id:        {:>15}",
+        format_number(lob_stats.add_order_id_collision)
     );
     println!(
         "  Valid message rate:        {:>14.2}%",

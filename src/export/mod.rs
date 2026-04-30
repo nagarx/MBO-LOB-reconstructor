@@ -106,6 +106,20 @@ impl ExportConfig {
                 "ExportConfig.batch_size must be > 0".into(),
             ));
         }
+        // Phase M M.A.4 (REV 3 F-034 closure): reject DownsampleStrategy::EveryN(0).
+        // Pre-M.A.4: a 0 value silently meant "no downsample" (latent reinterpretation
+        // at LobSnapshotWriter::should_write). Post-M.A.4: fail-loud at config-validation
+        // boundary so operators using EveryN must be intentional about the value.
+        if let Some(ds) = &self.downsample {
+            if let DownsampleStrategy::EveryN(0) = ds.strategy {
+                return Err(crate::error::TlobError::InvalidConfig(
+                    "DownsampleStrategy::EveryN(0) is invalid \
+                     (use DownsampleStrategy::None for no-downsampling, \
+                     or set EveryN(n) with n >= 1)"
+                        .into(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -179,5 +193,45 @@ mod tests {
         let mut config = ExportConfig::default();
         config.levels = crate::types::MAX_LOB_LEVELS;
         config.validate().unwrap(); // MAX_LOB_LEVELS is valid
+    }
+
+    #[test]
+    fn test_export_config_validate_rejects_every_n_zero() {
+        // Phase M M.A.4 (REV 3 F-034 closure): EveryN(0) is invalid and must
+        // be rejected at config-validation time. Pre-M.A.4 the value silently
+        // meant "no downsample" (latent reinterpretation at writer-time);
+        // operators must now use DownsampleStrategy::None explicitly.
+        let mut config = ExportConfig::default();
+        config.downsample = Some(DownsampleConfig {
+            strategy: DownsampleStrategy::EveryN(0),
+        });
+        let result = config.validate();
+        assert!(result.is_err(), "EveryN(0) must fail validation");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("EveryN(0) is invalid"),
+            "error message must cite EveryN(0); got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_export_config_validate_accepts_every_n_one() {
+        // Boundary test: EveryN(1) is the minimum-valid value (export every
+        // snapshot), distinct from None (which means the same thing but is
+        // semantically explicit). Both are valid.
+        let mut config = ExportConfig::default();
+        config.downsample = Some(DownsampleConfig {
+            strategy: DownsampleStrategy::EveryN(1),
+        });
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_export_config_validate_accepts_downsample_none() {
+        let mut config = ExportConfig::default();
+        config.downsample = Some(DownsampleConfig {
+            strategy: DownsampleStrategy::None,
+        });
+        config.validate().unwrap();
     }
 }
