@@ -405,25 +405,70 @@ impl LobStats {
     /// - **Envelope shape** (post-M.A.5): `{ "schema_version": "2.0.0",
     ///   "stats": {...} }` — preferred.
     /// - **Legacy flat shape** (pre-M.A.5): `{messages_processed: ..., ...}`
-    ///   without an envelope. Emits a one-time `log::warn!` so operators are
-    ///   aware they're reading deprecated-format files. Scheduled for removal
-    ///   in next MAJOR (calendar 2026-10-29 — aligned with
+    ///   without an envelope. Emits a `log::warn!` (per call) so operators
+    ///   are aware they're reading deprecated-format files. Scheduled for
+    ///   removal in next MAJOR (calendar 2026-10-29 — aligned with
     ///   `legacy-iterator-api` removal).
     ///
-    /// The dual-format support uses `serde(untagged)` over a private enum;
-    /// envelope parses first, legacy parses if envelope shape doesn't match.
+    /// # Format dispatch (Phase M M.A.5 hardening — explicit over `untagged`)
+    ///
+    /// Earlier `#[serde(untagged)]` over `LobStatsLoadable` had a silent-
+    /// acceptance failure mode: a JSON with top-level `schema_version` BUT
+    /// the `stats` key MISSING (e.g., a botched migration script that wrote
+    /// `schema_version` but forgot the `stats` wrapper) would silently route
+    /// through the legacy variant — `LobStats` doesn't have a `schema_version`
+    /// field, so serde dropped it without error. The post-hardening dispatch
+    /// peeks at top-level keys via `serde_json::Value` BEFORE deserializing,
+    /// then routes:
+    /// - If `schema_version` AND `stats` are both present → strict envelope parse.
+    /// - If `schema_version` is present BUT `stats` is missing → fail-loud
+    ///   (`std::io::Error::other`) per hft-rules §5 — refusing to silently
+    ///   accept malformed envelope output.
+    /// - Otherwise → legacy flat parse + WARN.
     pub fn load_from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
-        let json = std::fs::read_to_string(path.as_ref())?;
-        let loaded: LobStatsLoadable =
+        let path_ref = path.as_ref();
+        let json = std::fs::read_to_string(path_ref)?;
+
+        // Peek at top-level keys via Value to disambiguate envelope vs legacy
+        // PRECISELY — closes the silent-accept loophole that `#[serde(untagged)]`
+        // had with malformed-but-envelope-shaped payloads.
+        let value: serde_json::Value =
             serde_json::from_str(&json).map_err(std::io::Error::other)?;
-        match loaded {
-            LobStatsLoadable::Envelope { stats, .. } => Ok(stats),
-            LobStatsLoadable::Legacy(stats) => {
+
+        let has_schema_version = value
+            .as_object()
+            .map(|o| o.contains_key("schema_version"))
+            .unwrap_or(false);
+        let has_stats = value
+            .as_object()
+            .map(|o| o.contains_key("stats"))
+            .unwrap_or(false);
+
+        match (has_schema_version, has_stats) {
+            (true, true) => {
+                // Envelope shape — strict parse.
+                let envelope: LobStatsExportEnvelope =
+                    serde_json::from_value(value).map_err(std::io::Error::other)?;
+                Ok(envelope.stats)
+            }
+            (true, false) => {
+                // Malformed: claims envelope (has schema_version) but missing stats wrapper.
+                // Pre-hardening this would silently parse as Legacy(LobStats), dropping
+                // schema_version. Post-hardening: fail-loud per hft-rules §5.
+                Err(std::io::Error::other(format!(
+                    "malformed envelope at {}: top-level `schema_version` present but `stats` wrapper missing",
+                    path_ref.display(),
+                )))
+            }
+            (false, _) => {
+                // Legacy flat shape.
+                let stats: LobStats =
+                    serde_json::from_value(value).map_err(std::io::Error::other)?;
                 log::warn!(
                     "loaded LobStats from {} in legacy flat-shape JSON (pre-M.A.5); \
                      re-export to upgrade to envelope schema {}. \
                      Legacy format scheduled for removal in next MAJOR (2026-10-29).",
-                    path.as_ref().display(),
+                    path_ref.display(),
                     LOB_STATS_SCHEMA_VERSION,
                 );
                 Ok(stats)
@@ -437,6 +482,20 @@ impl LobStats {
 /// Used internally by [`LobStats::export_to_file`] for serialization. External
 /// readers should NOT depend on this struct; use [`LobStats::load_from_file`]
 /// which transparently strips the envelope.
+///
+/// # Wire-shape rationale (envelope vs flat)
+///
+/// Sibling sidecar wrappers in the pipeline (`feature-extractor-MBO-LOB`'s
+/// `_diagnostics.json`, `_metadata.json`) use a FLAT shape with
+/// `schema_version` as a top-level field alongside payload fields. M.A.5
+/// chose a NESTED envelope `{schema_version, stats}` instead — deliberately
+/// per Phase M REV 3 Decision 12 — because the legacy pre-M.A.5 wire shape
+/// (`serde_json::to_writer_pretty(&LobStats)` directly) ALREADY occupied the
+/// flat top-level namespace. Adding a top-level `schema_version` field to
+/// `LobStats` itself would require either a hand-coded migration shim OR a
+/// second BREAKING bump down the line. The envelope is a one-time MAJOR bump
+/// (1.0 → 2.0) that creates a clean separation between the wrapper layer and
+/// the payload layer for all future evolution.
 ///
 /// `#[non_exhaustive]` per Phase M Decision 18 — additive-only future evolution.
 #[derive(Debug, Serialize, Deserialize)]
@@ -460,24 +519,12 @@ struct LobStatsExportEnvelopeRef<'a> {
     stats: &'a LobStats,
 }
 
-/// Untagged enum supporting dual-format read (envelope OR legacy flat).
-///
-/// Tries to parse as `Envelope` first (wins because `schema_version` is a
-/// required field there); falls back to `Legacy` if the envelope shape
-/// doesn't match. Phase M M.A.5 backward-compat layer.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum LobStatsLoadable {
-    /// Envelope shape (post-M.A.5).
-    Envelope {
-        #[allow(dead_code)]
-        // accepted but currently unused; reserved for future schema-version checks
-        schema_version: String,
-        stats: LobStats,
-    },
-    /// Legacy flat shape (pre-M.A.5). Triggers a WARN log.
-    Legacy(LobStats),
-}
+// Phase M M.A.5 hardening: the previous `LobStatsLoadable` `#[serde(untagged)]`
+// enum was REPLACED by an explicit `serde_json::Value`-peek dispatch in
+// `LobStats::load_from_file` (above). Rationale: untagged-fallback silently
+// accepted malformed envelope payloads (top-level `schema_version` but missing
+// `stats` wrapper) by routing to the Legacy variant and dropping the unknown
+// field. Explicit dispatch fails-loud on that malformed shape per hft-rules §5.
 
 /// The type of order reduction operation being performed.
 ///
@@ -2758,6 +2805,61 @@ mod tests {
         assert_eq!(loaded.modify_order_not_found, 4);
         assert_eq!(loaded.add_order_id_collision, 2);
         assert_eq!(loaded.last_timestamp, Some(1_700_000_000_000_000_000));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_lobstats_load_malformed_envelope_fails_loud() {
+        // Phase M M.A.5 hardening (post-validation Agent 3 MEDIUM finding):
+        // a JSON with top-level `schema_version` BUT the `stats` wrapper
+        // MISSING (e.g., a botched migration script that emitted
+        // `schema_version` but forgot to wrap `stats`) MUST fail-loud per
+        // hft-rules §5 — pre-hardening this would silently route to the
+        // legacy variant and DROP the unknown `schema_version` field.
+        let dir = std::env::temp_dir().join("lobstats_malformed_envelope_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("malformed.json");
+
+        // Hand-crafted malformed payload: claims envelope (has schema_version
+        // top-level) but `stats` wrapper MISSING. Pre-hardening:
+        // `#[serde(untagged)]` would parse as `Legacy(LobStats)` with
+        // schema_version silently dropped via serde-default.
+        let malformed_json = r#"{
+            "schema_version": "2.0.0",
+            "messages_processed": 99,
+            "system_messages_skipped": 0,
+            "active_orders": 0,
+            "bid_levels": 0,
+            "ask_levels": 0,
+            "crossed_quotes": 0,
+            "locked_quotes": 0,
+            "last_timestamp": null,
+            "cancel_order_not_found": 0,
+            "cancel_price_level_missing": 0,
+            "cancel_order_at_level_missing": 0,
+            "trade_order_not_found": 0,
+            "trade_price_level_missing": 0,
+            "trade_order_at_level_missing": 0,
+            "book_clears": 0,
+            "noop_messages": 0
+        }"#;
+        std::fs::write(&path, malformed_json).unwrap();
+
+        let result = LobStats::load_from_file(&path);
+        assert!(
+            result.is_err(),
+            "malformed envelope (schema_version present, stats wrapper missing) MUST fail-loud per hft-rules §5"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("malformed envelope"),
+            "error message must cite 'malformed envelope'; got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("`stats` wrapper missing"),
+            "error message must cite missing `stats` wrapper; got: {err_msg}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

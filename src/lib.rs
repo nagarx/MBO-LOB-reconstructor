@@ -191,6 +191,10 @@ pub use types::{Action, BookConsistency, LobState, MboMessage, Order, Side, MAX_
 // Re-exports - LOB reconstruction
 pub use lob::{CrossedQuotePolicy, LobConfig, LobReconstructor, LobStats, MultiSymbolLob};
 
+// Re-exports - LobStats wire-format (Phase M M.A.5: envelope wrapper + schema version).
+// Exposed at crate root for external consumers reading `_reconstruction_stats.json`.
+pub use lob::reconstructor::{LobStatsExportEnvelope, LOB_STATS_SCHEMA_VERSION};
+
 // Re-exports - Day Boundary Detection
 pub use lob::{DayBoundary, DayBoundaryConfig, DayBoundaryDetector, DayBoundaryStats};
 
