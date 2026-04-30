@@ -1286,6 +1286,6 @@ ExportConfig {
 
 ---
 
-*Last updated: 2025-12-19*
-*Crate version: 0.1.0*
+*Last updated: 2026-04-30 (post Phase M REV 3 — Boundary Discipline cycle)*
+*Crate version: 0.2.0*
 
