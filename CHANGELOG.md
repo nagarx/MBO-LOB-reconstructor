@@ -101,9 +101,26 @@ F-007/F-008/F-010/F-013/F-021/F-023/F-024/F-031/F-034 + DESIGN-1).
 
 - **`process_day` migration to `iter_messages_typed()`** — closes
   F-021 by surfacing decode/convert errors per-message into the
-  binary's structured-match path. `skip_invalid(true)` REMOVED so
-  errors aren't swallowed at the iterator level (M.A.6 post-validation
-  hardening). (M.A.6 + M.A.7)
+  binary's structured-match path. The `.skip_invalid(true)` builder-
+  call removed at the `process_day` callsite (the
+  `LoaderConfig::skip_invalid(bool)` builder method + struct field
+  remain available for other callers); errors now surface to the
+  structured match path so the new anomaly counters actually populate
+  (M.A.6 post-validation hardening). (M.A.6 + M.A.7)
+
+- **`DbnBridge::convert` 3-case timestamp dispatch** — closes the
+  M.A.6↔M.A.7 cross-cascade (Agent A1 H-1 from post-validation round):
+  pre-M.A.9, M.A.6 F-023 rejected ALL `ts_event=0` as
+  `InvalidTimestamp`, which silently shadowed the M.A.7 F-010
+  `system_messages_seen` counter at the typed iterator (Databento
+  heartbeat / metadata system messages with both `order_id=0` AND
+  `ts_event=0` flowed through the `BoundaryError::Convert` arm and
+  inflated `rows_skipped_decode_or_convert` instead of counting as
+  expected heartbeats). Post-M.A.9 dispatch: (1) overflow
+  (`ts_signed < 0`) always corrupt → `Err`; (2) `ts_event == 0` AND
+  is-system-message → `Ok(timestamp = None)` so message reaches the
+  iterator's F-010 counter; (3) `ts_event == 0` AND non-system →
+  `Err(InvalidTimestamp(0))` (genuine corruption). (M.A.9)
 
 - **`DownsampleStrategy::EveryN(0)` rejected at config-validation
   time** — closes F-034: pre-M.A.4 `EveryN(0)` was silently
@@ -132,6 +149,30 @@ F-007/F-008/F-010/F-013/F-021/F-023/F-024/F-031/F-034 + DESIGN-1).
   deferred to a follow-up commit pending clarification of the actual
   target site. Documented in M.A.4 commit message.
 
+- **`benches/typed_iterator_overhead.rs` criterion bench** — the plan
+  §M.A.8 budgeted a criterion bench harness comparing typed vs legacy
+  iterator overhead. Deferred to a focused performance-tracking cycle
+  since (a) the existing `benches/reconstruction.rs` already covers
+  the LobReconstructor hot path; (b) Decision 17 (single-thread-per-
+  iterator `Arc<AtomicU64>`) is analytically <0.3% regression per
+  Agent V5 (verified by reading dbn 0.20.0 source); (c) the
+  boundary-discipline correctness ship is the load-bearing piece for
+  unblocking Stage B. Tracked for post-Stage-B hardening cycle.
+
+- **End-to-end DBN-fixture tests for typed iterator** (BoundedTruncatingReader
+  + synthetic-DBN-byte feeds) — plan §M.A.8 budgeted these but they
+  require crate-internal `DecodeRecord` mock infrastructure. F-002 +
+  F-003 + F-024 wires currently have STRUCTURAL coverage only
+  (LoaderStats field-existence locks; no live counter increment from
+  iterator drive). Per Agent V3 + Agent V5: closing this gap requires
+  synthesizing `dbn::MboMsg` via `dbn::encode::DbnEncoder` writing to
+  `Vec<u8>`. Tracked for post-Stage-B test-hardening cycle.
+
+- **`tests/parquet_export_counters.rs`** — plan §M.A.8 budgeted a
+  2-test integration file for the parquet binary's 5-arm match. The
+  binary itself has zero `#[test]`. Tracked alongside the DBN-fixture
+  work above.
+
 ### Migration notes
 
 - **Schema version 1.0 → 2.0** for `_reconstruction_stats.json`. The
@@ -149,6 +190,14 @@ F-007/F-008/F-010/F-013/F-021/F-023/F-024/F-031/F-034 + DESIGN-1).
   constructed `LobStats { errors: 3, ... }` via struct literal will
   break at compile time. Migration: use `LobStats::default()` +
   struct-update syntax `..Default::default()`.
+- **`#[non_exhaustive]` on `TlobError` + `LoaderStats`** (M.A.10
+  polish) — same discipline as `LobStats`. The M.A.6 `InvalidTimestamp`
+  variant addition was technically a Rust SemVer break for any
+  external exhaustive match; post-M.A.10 future variant additions are
+  non-breaking. Verified zero live exhaustive matches in
+  feature-extractor / mbo-statistical-profiler / opra-statistical-profiler
+  by Agent V1 cumulative ground-truth audit. External crates
+  pattern-matching on `TlobError` MUST include a wildcard arm.
 - **`ErrorMode::FailFast` semantic change** for downstream
   consumers — pre-Phase-M, torn DBN silently completed. Post-Phase-M
   under default `FailFast`, a single torn-DBN day surfaces at the
@@ -160,12 +209,15 @@ F-007/F-008/F-010/F-013/F-021/F-023/F-024/F-031/F-034 + DESIGN-1).
 
 ### Test count
 
-- **Library tests: 271 → 278** (+7 net across Phase M REV 3
-  cumulative); plus 3 doctests + ~31 ignored doctests via
-  `--include-ignored`. 240 (no-default-features). External
-  integration tests at `tests/loader_typed_iterator.rs` +
-  `tests/lob_stats_counters.rs` add additional regression-lock
-  coverage (+~20 tests).
+- **Library tests: 271 → 280** (+9 net across Phase M REV 3
+  cumulative — M.A.4 +1, M.A.5 +2, M.A.5 hardening +1, M.A.6 +3,
+  M.A.7 +1, M.A.9 +2, then M.A.10 polish unchanged at lib level).
+  Plus 3 doctests + ~31 ignored doctests via `--include-ignored`.
+  240 (no-default-features). External integration tests at
+  `tests/loader_typed_iterator.rs` (7) + `tests/lob_stats_counters.rs`
+  (8) add 15 additional regression-lock tests; pre-existing 21
+  in `tests/integration_test.rs` + 5 + 8 across other suites
+  bring total integration to 41.
 
 ### Added
 

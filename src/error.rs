@@ -8,7 +8,16 @@ use thiserror::Error;
 pub type Result<T> = std::result::Result<T, TlobError>;
 
 /// Main error type for TLOB operations.
+///
+/// Phase M M.A.10 (REV 3 polish, post-validation V4 HIGH + A7 §6 closure):
+/// `#[non_exhaustive]` discipline applied so future variant additions (M.A.6
+/// `InvalidTimestamp` was technically a Rust SemVer break for any external
+/// exhaustive match) become non-breaking. External crates pattern-matching on
+/// `TlobError` MUST include a wildcard arm. Verified zero live exhaustive
+/// matches in feature-extractor / mbo-statistical-profiler / opra-statistical-profiler
+/// by Agent V1 cumulative ground-truth audit (2026-04-30).
 #[derive(Error, Debug, Clone)]
+#[non_exhaustive]
 pub enum TlobError {
     /// Invalid order ID (e.g., zero or duplicate)
     #[error("Invalid order ID: {0}")]

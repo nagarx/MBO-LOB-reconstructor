@@ -167,7 +167,15 @@ impl<R: BufRead> BufRead for CountingReader<R> {
 /// Phase M M.A.3 (REV 3): added `mid_record_eof` counter (Decision 5b —
 /// observability-tier "stream did not end where expected"; surfaces via
 /// [`LoaderStats::is_clean_eof()`] post-iteration).
+///
+/// Phase M M.A.10 (post-validation V4 HIGH closure): `#[non_exhaustive]`
+/// discipline applied so future counter additions (e.g., per-anomaly-class
+/// breakdowns the M.A.7 F-010 fold introduced) are non-breaking for external
+/// crates. External crates MUST construct via `LoaderStats::default()` +
+/// struct-update syntax `..LoaderStats::default()`. In-crate construction
+/// is exempt by Rust semantics. Mirrors the M.A.4 `LobStats` discipline.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct LoaderStats {
     /// Total messages successfully read.
     pub messages_read: u64,

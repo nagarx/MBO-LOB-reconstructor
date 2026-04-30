@@ -567,13 +567,19 @@ if stats.has_warnings() {
 ### LobStats (src/lob/reconstructor.rs)
 
 ```rust
+// Phase M M.A.4 (REV 3): #[non_exhaustive] applied — additive-only
+// future evolution. External crates MUST construct via
+// LobStats::default() + struct-update `..Default::default()`.
+#[non_exhaustive]
 pub struct LobStats {
     pub messages_processed: u64,
     pub system_messages_skipped: u64,
     pub active_orders: usize,
     pub bid_levels: usize,
     pub ask_levels: usize,
-    pub errors: u64,
+    // NOTE: Phase M M.A.4 REMOVED the `errors: u64` field (F-007 closure —
+    // declared but never incremented). Specific anomaly counters below
+    // expose the silent fall-through behavior previously hidden.
     pub crossed_quotes: u64,
     pub locked_quotes: u64,
     pub last_timestamp: Option<i64>,
@@ -584,6 +590,12 @@ pub struct LobStats {
     pub trade_order_not_found: u64,
     pub trade_price_level_missing: u64,
     pub trade_order_at_level_missing: u64,
+    // Phase M M.A.4 NEW (F-013 closure): observability counters for
+    // silent fall-through paths. Increment BEFORE the recovery semantic
+    // (modify_order falls through to add_order on missing id; add_order
+    // falls through to modify_order on collision).
+    pub modify_order_not_found: u64,
+    pub add_order_id_collision: u64,
     pub book_clears: u64,
     pub noop_messages: u64,
 }
