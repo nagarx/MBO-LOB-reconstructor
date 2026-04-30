@@ -55,6 +55,12 @@ log = "0.4"
 env_logger = "0.10"
 indexmap = "2.12.1"
 
+# Phase M M.A.5: atomic write for `_reconstruction_stats.json`. SSoT-deferred:
+# `hft_statistics::io::atomic_write_json` (default-off `io` feature, 0.3.0-dev)
+# is the canonical primitive; consolidation is scheduled for a sibling-wide
+# 0.3.x bump cycle when reconstructor + sibling profilers all migrate together.
+tempfile = "3.8"
+
 [dev-dependencies]
 criterion = "0.5"
 arrow = { version = "55", default-features = false }

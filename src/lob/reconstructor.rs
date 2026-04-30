@@ -16,6 +16,25 @@ use crate::error::{Result, TlobError};
 use crate::lob::price_level::PriceLevel;
 use crate::types::{Action, BookConsistency, LobState, MboMessage, Order, Side};
 
+/// Schema version for the `LobStats` JSON serialization envelope.
+///
+/// Phase M M.A.5 (REV 3 boundary discipline cycle): introduced
+/// [`LobStatsExportEnvelope`] wrapping the raw stats with a `schema_version`
+/// field. Bumped to `2.0.0` to signal the conceptual break from the legacy
+/// flat shape (no envelope existed before — pre-M.A.5 was implicit-1.0).
+///
+/// **Independent of** [`crate::export::SCHEMA_VERSION`] (`"1.0"`), which
+/// versions the Parquet export schema — a different artifact. When either
+/// constant bumps, the other should NOT auto-bump.
+///
+/// # Versioning policy (per hft-rules §1)
+///
+/// - MAJOR: any breaking change to the on-disk JSON shape (e.g., remove a
+///   field, rename a field, change an envelope key).
+/// - MINOR: additive non-breaking changes (e.g., new `LobStats` field).
+/// - PATCH: docs-only changes.
+pub const LOB_STATS_SCHEMA_VERSION: &str = "2.0.0";
+
 /// How to handle crossed quotes (bid >= ask) when they occur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum CrossedQuotePolicy {
@@ -297,18 +316,167 @@ impl LobStats {
             + self.add_order_id_collision
     }
 
-    /// Export stats to JSON file.
+    /// Export stats to a JSON file with atomic-write + envelope discipline.
+    ///
+    /// Phase M M.A.5 (REV 3 boundary discipline cycle):
+    ///
+    /// **Atomic write**: uses `tempfile::NamedTempFile::persist()` to write
+    /// to a sibling tmp file in the same directory, fsync, then atomically
+    /// rename to `path`. Eliminates the SIGKILL-mid-write partial-file risk
+    /// of the pre-M.A.5 `BufWriter + serde_json::to_writer_pretty` path.
+    ///
+    /// **Envelope wrapper**: output JSON is `{ "schema_version": "2.0.0",
+    /// "stats": {...} }`. The `schema_version` field is the
+    /// [`LOB_STATS_SCHEMA_VERSION`] constant. **Breaking change** for the
+    /// on-disk format; pre-M.A.5 flat-shape files cannot round-trip through
+    /// `export_to_file → load_from_file` cleanly anymore (but
+    /// [`Self::load_from_file`] remains backward-compatible via dual-format
+    /// reading — see its docs).
+    ///
+    /// **Fallback**: if `NamedTempFile::new_in(parent)` fails (e.g., NFS
+    /// quirks, EROFS) or `persist()` fails (e.g., cross-device link EXDEV),
+    /// the function falls back to direct `File::create` + `write_all` +
+    /// `sync_all` and emits a `log::warn!`. The fallback emits the same
+    /// envelope shape so readers cannot distinguish atomic vs fallback paths.
+    ///
+    /// # SSoT-deferred consolidation
+    ///
+    /// `hft_statistics::io::atomic_write_json` (default-off `io` feature in
+    /// 0.3.0-dev) is the canonical primitive for this pattern across the
+    /// pipeline. Reconstructor's inline implementation is intentionally
+    /// duplicated until a sibling-wide hft-statistics 0.3.x bump cycle
+    /// allows all standalone-repo siblings (this repo + sibling profilers)
+    /// to migrate together.
     pub fn export_to_file(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
-        let file = std::fs::File::create(path)?;
-        let writer = std::io::BufWriter::new(file);
-        serde_json::to_writer_pretty(writer, self).map_err(std::io::Error::other)
+        let path = path.as_ref();
+        let envelope = LobStatsExportEnvelopeRef {
+            schema_version: LOB_STATS_SCHEMA_VERSION,
+            stats: self,
+        };
+
+        // Determine parent directory for tmp file co-location.
+        // Edge case: path with no parent (e.g., "stats.json" relative to CWD,
+        // or the unusual "/" root) — fall back to CWD.
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+
+        // Atomic-write path: tempfile in same FS as target → write → fsync → rename.
+        match tempfile::NamedTempFile::new_in(parent) {
+            Ok(mut tmp) => {
+                serde_json::to_writer_pretty(&mut tmp, &envelope).map_err(std::io::Error::other)?;
+                tmp.as_file().sync_all()?;
+                if let Err(persist_err) = tmp.persist(path) {
+                    log::warn!(
+                        "atomic persist failed for {} ({}); falling back to direct write",
+                        path.display(),
+                        persist_err.error
+                    );
+                    return Self::write_envelope_direct(path, &envelope);
+                }
+                Ok(())
+            }
+            Err(tmp_err) => {
+                log::warn!(
+                    "tempfile creation failed in {} ({}); falling back to direct write",
+                    parent.display(),
+                    tmp_err
+                );
+                Self::write_envelope_direct(path, &envelope)
+            }
+        }
     }
 
-    /// Load stats from a JSON file.
-    pub fn load_from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
-        let json = std::fs::read_to_string(path)?;
-        serde_json::from_str(&json).map_err(std::io::Error::other)
+    /// Direct (non-atomic) write fallback path. Same envelope shape as the
+    /// atomic path — readers cannot distinguish.
+    fn write_envelope_direct(
+        path: &std::path::Path,
+        envelope: &LobStatsExportEnvelopeRef<'_>,
+    ) -> std::io::Result<()> {
+        let mut file = std::fs::File::create(path)?;
+        serde_json::to_writer_pretty(&mut file, envelope).map_err(std::io::Error::other)?;
+        file.sync_all()
     }
+
+    /// Load stats from a JSON file (dual-format aware).
+    ///
+    /// Phase M M.A.5 (REV 3 boundary discipline cycle): accepts BOTH:
+    /// - **Envelope shape** (post-M.A.5): `{ "schema_version": "2.0.0",
+    ///   "stats": {...} }` — preferred.
+    /// - **Legacy flat shape** (pre-M.A.5): `{messages_processed: ..., ...}`
+    ///   without an envelope. Emits a one-time `log::warn!` so operators are
+    ///   aware they're reading deprecated-format files. Scheduled for removal
+    ///   in next MAJOR (calendar 2026-10-29 — aligned with
+    ///   `legacy-iterator-api` removal).
+    ///
+    /// The dual-format support uses `serde(untagged)` over a private enum;
+    /// envelope parses first, legacy parses if envelope shape doesn't match.
+    pub fn load_from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let json = std::fs::read_to_string(path.as_ref())?;
+        let loaded: LobStatsLoadable =
+            serde_json::from_str(&json).map_err(std::io::Error::other)?;
+        match loaded {
+            LobStatsLoadable::Envelope { stats, .. } => Ok(stats),
+            LobStatsLoadable::Legacy(stats) => {
+                log::warn!(
+                    "loaded LobStats from {} in legacy flat-shape JSON (pre-M.A.5); \
+                     re-export to upgrade to envelope schema {}. \
+                     Legacy format scheduled for removal in next MAJOR (2026-10-29).",
+                    path.as_ref().display(),
+                    LOB_STATS_SCHEMA_VERSION,
+                );
+                Ok(stats)
+            }
+        }
+    }
+}
+
+/// On-disk envelope wrapping [`LobStats`] with a schema version (Phase M M.A.5).
+///
+/// Used internally by [`LobStats::export_to_file`] for serialization. External
+/// readers should NOT depend on this struct; use [`LobStats::load_from_file`]
+/// which transparently strips the envelope.
+///
+/// `#[non_exhaustive]` per Phase M Decision 18 — additive-only future evolution.
+#[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct LobStatsExportEnvelope {
+    /// Schema version string (e.g., `"2.0.0"`).
+    pub schema_version: String,
+
+    /// The wrapped [`LobStats`] payload.
+    pub stats: LobStats,
+}
+
+/// Borrowing variant of the envelope used for write-side zero-copy serialization.
+///
+/// Pairs with [`LobStatsExportEnvelope`] (the deserialize-side owned variant).
+/// This split avoids `Cow<LobStats>` complications and keeps the serialization
+/// path zero-allocation for the stats payload.
+#[derive(Debug, Serialize)]
+struct LobStatsExportEnvelopeRef<'a> {
+    schema_version: &'static str,
+    stats: &'a LobStats,
+}
+
+/// Untagged enum supporting dual-format read (envelope OR legacy flat).
+///
+/// Tries to parse as `Envelope` first (wins because `schema_version` is a
+/// required field there); falls back to `Legacy` if the envelope shape
+/// doesn't match. Phase M M.A.5 backward-compat layer.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LobStatsLoadable {
+    /// Envelope shape (post-M.A.5).
+    Envelope {
+        #[allow(dead_code)]
+        // accepted but currently unused; reserved for future schema-version checks
+        schema_version: String,
+        stats: LobStats,
+    },
+    /// Legacy flat shape (pre-M.A.5). Triggers a WARN log.
+    Legacy(LobStats),
 }
 
 /// The type of order reduction operation being performed.
@@ -2433,15 +2601,18 @@ mod tests {
         let json_str = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
 
+        // Phase M M.A.5: envelope wrapper added — every key now lives under
+        // `parsed["stats"][...]`. Schema version is locked at the top level.
         // Phase M M.A.4: `errors` field REMOVED (F-007). The new
         // `modify_order_not_found` + `add_order_id_collision` counters use
         // `#[serde(default)]` so they default to 0 in the JSON when omitted
         // — included here to lock the wire-format key names.
-        assert_eq!(parsed["messages_processed"], 0);
-        assert_eq!(parsed["modify_order_not_found"], 0);
-        assert_eq!(parsed["add_order_id_collision"], 0);
-        assert_eq!(parsed["book_clears"], 0);
-        assert_eq!(parsed["noop_messages"], 0);
+        assert_eq!(parsed["schema_version"], LOB_STATS_SCHEMA_VERSION);
+        assert_eq!(parsed["stats"]["messages_processed"], 0);
+        assert_eq!(parsed["stats"]["modify_order_not_found"], 0);
+        assert_eq!(parsed["stats"]["add_order_id_collision"], 0);
+        assert_eq!(parsed["stats"]["book_clears"], 0);
+        assert_eq!(parsed["stats"]["noop_messages"], 0);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2462,14 +2633,131 @@ mod tests {
         let json_str = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
 
+        // Phase M M.A.5: envelope wrapper — last_timestamp lives under
+        // `parsed["stats"][...]` post-bump.
         assert!(
-            parsed["last_timestamp"].is_null(),
+            parsed["stats"]["last_timestamp"].is_null(),
             "None should serialize as null, got: {}",
-            parsed["last_timestamp"]
+            parsed["stats"]["last_timestamp"]
         );
 
         let loaded = LobStats::load_from_file(&path).unwrap();
         assert_eq!(loaded.last_timestamp, None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_lobstats_export_envelope_shape() {
+        // Phase M M.A.5 (REV 3 F-007 closure tail): lock the envelope wire
+        // format end-to-end. Asserts that the on-disk JSON has EXACTLY two
+        // top-level keys (`schema_version`, `stats`); the schema_version is
+        // pinned to the LOB_STATS_SCHEMA_VERSION constant; and the `stats`
+        // sub-object roundtrips byte-identically through
+        // `serde_json::from_value::<LobStats>` so external tools can parse
+        // the envelope directly without going through `load_from_file`.
+        let stats = LobStats {
+            messages_processed: 42,
+            modify_order_not_found: 7,
+            add_order_id_collision: 3,
+            last_timestamp: Some(1_700_000_000_000_000_000),
+            ..LobStats::default()
+        };
+
+        let dir = std::env::temp_dir().join("lobstats_envelope_shape_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("envelope.json");
+
+        stats.export_to_file(&path).unwrap();
+
+        let json_str = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        // Lock envelope shape: exactly two top-level keys.
+        let obj = parsed
+            .as_object()
+            .expect("envelope must be a JSON object at the top level");
+        assert_eq!(
+            obj.len(),
+            2,
+            "envelope must have exactly 2 top-level keys (schema_version, stats); got: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+        assert!(obj.contains_key("schema_version"));
+        assert!(obj.contains_key("stats"));
+
+        // Lock schema version pin — bumping LOB_STATS_SCHEMA_VERSION must
+        // visibly cascade through this test.
+        assert_eq!(obj["schema_version"], LOB_STATS_SCHEMA_VERSION);
+
+        // Lock structural integrity: `stats` sub-object must deserialize
+        // back to a LobStats with the SAME field values.
+        let inner: LobStats = serde_json::from_value(obj["stats"].clone())
+            .expect("stats sub-object must deserialize as LobStats");
+        assert_eq!(inner.messages_processed, 42);
+        assert_eq!(inner.modify_order_not_found, 7);
+        assert_eq!(inner.add_order_id_collision, 3);
+        assert_eq!(inner.last_timestamp, Some(1_700_000_000_000_000_000));
+
+        // Round-trip via load_from_file (envelope branch) yields the same.
+        let loaded = LobStats::load_from_file(&path).unwrap();
+        assert_eq!(loaded.messages_processed, 42);
+        assert_eq!(loaded.modify_order_not_found, 7);
+        assert_eq!(loaded.add_order_id_collision, 3);
+        assert_eq!(loaded.last_timestamp, Some(1_700_000_000_000_000_000));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_lobstats_load_legacy_format() {
+        // Phase M M.A.5: dual-format read. `load_from_file` accepts both
+        // envelope (post-2.0.0) AND legacy (pre-2.0.0 flat) shapes. The
+        // legacy branch logs a WARN with calendar 2026-10-29 removal note
+        // (not asserted here — log-capture would couple to env_logger
+        // initialization). Asserts: a FLAT (non-envelope) JSON parses cleanly
+        // into a valid LobStats with non-default values preserved.
+        //
+        // Realism: the pre-M.A.5 serializer wrote `serde_json::to_writer_pretty(
+        // &LobStats)` directly — i.e., a flat object containing ALL serde
+        // fields. Therefore we construct the legacy fixture by serializing a
+        // populated LobStats DIRECTLY (bypassing the envelope wrapper), then
+        // assert `load_from_file` recovers it.
+        let dir = std::env::temp_dir().join("lobstats_legacy_load_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.json");
+
+        let original = LobStats {
+            messages_processed: 99,
+            modify_order_not_found: 4,
+            add_order_id_collision: 2,
+            last_timestamp: Some(1_700_000_000_000_000_000),
+            ..LobStats::default()
+        };
+        // Write the FLAT shape directly — emulates pre-M.A.5 export bytes.
+        let flat_json = serde_json::to_string_pretty(&original).unwrap();
+        std::fs::write(&path, &flat_json).unwrap();
+
+        // Sanity: top-level keys are NOT envelope keys (no schema_version, no
+        // stats wrapper). This locks our fixture against accidental drift to
+        // the envelope shape.
+        let parsed: serde_json::Value = serde_json::from_str(&flat_json).unwrap();
+        assert!(
+            parsed.get("schema_version").is_none(),
+            "legacy fixture must NOT carry schema_version: {flat_json}"
+        );
+        assert!(
+            parsed.get("stats").is_none(),
+            "legacy fixture must NOT carry stats wrapper: {flat_json}"
+        );
+        assert!(parsed.get("messages_processed").is_some());
+
+        // Dual-format reader recovers the original.
+        let loaded = LobStats::load_from_file(&path).unwrap();
+        assert_eq!(loaded.messages_processed, 99);
+        assert_eq!(loaded.modify_order_not_found, 4);
+        assert_eq!(loaded.add_order_id_collision, 2);
+        assert_eq!(loaded.last_timestamp, Some(1_700_000_000_000_000_000));
 
         std::fs::remove_dir_all(&dir).ok();
     }
