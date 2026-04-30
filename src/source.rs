@@ -422,8 +422,13 @@ impl DbnSource {
 }
 
 /// Type alias for the DBN message iterator (auto-detects compression).
+///
+/// Phase M M.A.2: inner reader is wrapped in [`CountingReader`] for byte-tracking
+/// observability (closes F-008 — `LoaderStats::bytes_read` now correctly populated).
 #[cfg(feature = "databento")]
-type DbnMessageIterator = MessageIterator<dbn::decode::DynDecoder<'static, BufReader<File>>>;
+type DbnMessageIterator = MessageIterator<
+    dbn::decode::DynDecoder<'static, crate::loader::CountingReader<BufReader<File>>>,
+>;
 
 #[cfg(feature = "databento")]
 impl MarketDataSource for DbnSource {

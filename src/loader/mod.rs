@@ -53,8 +53,10 @@ pub mod error;
 pub use error::BoundaryError;
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::dbn_bridge::DbnBridge;
 use crate::error::{Result, TlobError};
@@ -85,9 +87,80 @@ use dbn::VersionUpgradePolicy;
 pub const IO_BUFFER_SIZE: usize = 1024 * 1024; // 1 MB
 
 // Type alias for the decoder we use
-// We wrap the file reader in a BufReader for efficiency, then in a zstd decoder
+// We wrap the file reader in a BufReader for efficiency, then in a CountingReader
+// for byte-tracking observability (Phase M M.A.2 — closes F-008), then in a zstd
+// decoder.
 /// Decoder type that auto-detects compression (compressed or uncompressed DBN files).
-type DbnFileDecoder = DynDecoder<'static, BufReader<File>>;
+type DbnFileDecoder = DynDecoder<'static, CountingReader<BufReader<File>>>;
+
+/// Byte-counting wrapper around a `Read` source.
+///
+/// Tracks total bytes read from the underlying reader via an atomic counter
+/// shared with the [`MessageIterator`] (Phase M M.A.2 — closes F-008 by
+/// wiring `LoaderStats::bytes_read`).
+///
+/// # Decision 17 — Single-thread-per-iterator scope (Phase M REV 3)
+///
+/// The `Arc<AtomicU64>` counter is constructed inside `iter_messages()` and
+/// `iter_messages_typed()` (M.A.3) and dropped when the iterator is dropped.
+/// **It MUST NOT cross the `Rayon::par_iter` boundary in `BatchProcessor`** —
+/// each parallel-day worker owns its own iterator + its own `Arc<AtomicU64>`,
+/// so there is no inter-thread contention.
+///
+/// Cross-thread sharing of this counter would turn the un-contended
+/// `lock xadd` (~25 ns) into 100s of ns under cache-line bouncing (Drepper,
+/// "What Every Programmer Should Know About Memory" §6.3).
+///
+/// # Performance
+///
+/// `Ordering::Relaxed` `fetch_add` lowers to a single `lock xadd` on x86-64.
+/// Since `BufReader` reads in 1MB chunks (per `IO_BUFFER_SIZE`), the
+/// `fetch_add` fires ~once per ~17,000 messages — amortized cost is
+/// effectively free (~0.001 ns/msg).
+pub struct CountingReader<R: Read> {
+    inner: R,
+    bytes_read: Arc<AtomicU64>,
+}
+
+impl<R: Read> CountingReader<R> {
+    /// Wrap a `Read` source with byte counting.
+    ///
+    /// Returns the wrapped reader. The caller retains the [`Arc<AtomicU64>`]
+    /// handle (passed in) for read-side access via
+    /// `bytes_read.load(Ordering::Relaxed)`.
+    pub fn new(inner: R, bytes_read: Arc<AtomicU64>) -> Self {
+        Self { inner, bytes_read }
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+impl<R: BufRead> BufRead for CountingReader<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        // Buffer fill itself doesn't count as "consumed" bytes; only consume()
+        // advances the byte counter. This matches BufRead semantics where
+        // fill_buf() may expose more bytes than will be consumed (via consume(n)).
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        // Phase M M.A.2: track bytes actually consumed by the upstream
+        // consumer. dbn::DynDecoder uses BufRead protocol (fill_buf + consume)
+        // for zstd-compressed streams and Read protocol (read) for
+        // uncompressed streams. The two code paths are disjoint per byte —
+        // dbn calls EITHER read() OR fill_buf+consume() per chunk, never
+        // both — so tracking in both `Read::read` AND `BufRead::consume`
+        // gives exact byte counting without double-counting.
+        self.bytes_read.fetch_add(amt as u64, Ordering::Relaxed);
+        self.inner.consume(amt);
+    }
+}
 
 /// Statistics for DBN file loading.
 #[derive(Debug, Clone, Default)]
@@ -267,7 +340,7 @@ impl DbnLoader {
     /// # Performance
     ///
     /// Uses a 1MB I/O buffer (see [`IO_BUFFER_SIZE`]) to reduce syscall overhead.
-    fn open_decoder(&self) -> Result<DbnFileDecoder> {
+    fn open_decoder(&self) -> Result<(DbnFileDecoder, Arc<AtomicU64>)> {
         let file = File::open(&self.path)
             .map_err(|e| TlobError::generic(format!("Failed to open file: {e}")))?;
 
@@ -275,10 +348,18 @@ impl DbnLoader {
         // Default BufReader uses 8KB; we use 1MB for 5-15% improvement
         let reader = BufReader::with_capacity(IO_BUFFER_SIZE, file);
 
+        // Phase M M.A.2: wrap in CountingReader to track bytes_read for
+        // F-008 closure. Arc shared between reader (writer side) and the
+        // iterator (reader side via stats sync in next() loop).
+        let bytes_read_handle = Arc::new(AtomicU64::new(0));
+        let counting_reader = CountingReader::new(reader, Arc::clone(&bytes_read_handle));
+
         // Use DynDecoder to auto-detect compression
         // Handles both .dbn (uncompressed) and .dbn.zst (compressed) files
-        DynDecoder::inferred_with_buffer(reader, VersionUpgradePolicy::AsIs)
-            .map_err(|e| TlobError::generic(format!("Failed to create decoder: {e}")))
+        let decoder = DynDecoder::inferred_with_buffer(counting_reader, VersionUpgradePolicy::AsIs)
+            .map_err(|e| TlobError::generic(format!("Failed to create decoder: {e}")))?;
+
+        Ok((decoder, bytes_read_handle))
     }
 
     /// Iterate over all MBO messages in the file.
@@ -299,12 +380,13 @@ impl DbnLoader {
     /// }
     /// ```
     pub fn iter_messages(self) -> Result<MessageIterator<DbnFileDecoder>> {
-        let decoder = self.open_decoder()?;
+        let (decoder, bytes_read_handle) = self.open_decoder()?;
 
         Ok(MessageIterator {
             decoder,
             stats: self.stats,
             skip_invalid: self.skip_invalid,
+            bytes_read_handle,
         })
     }
 
@@ -351,6 +433,11 @@ pub struct MessageIterator<D: DecodeRecord> {
     decoder: D,
     stats: LoaderStats,
     skip_invalid: bool,
+    /// Phase M M.A.2: shared `Arc<AtomicU64>` with the inner [`CountingReader`].
+    /// Updates `stats.bytes_read` on every `next()` call so `progress()` returns
+    /// the correct fraction (closes F-008 — pre-M.A.2 `bytes_read` was always 0).
+    /// See [`CountingReader`] for Decision 17 single-thread-per-iterator scope.
+    bytes_read_handle: Arc<AtomicU64>,
 }
 
 impl<D: DecodeRecord> Iterator for MessageIterator<D> {
@@ -358,6 +445,12 @@ impl<D: DecodeRecord> Iterator for MessageIterator<D> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
+            // Phase M M.A.2: sync bytes_read from CountingReader (closes F-008).
+            // Cost: 1 atomic load with Relaxed ordering on x86-64 → ~1 ns/call.
+            // BufReader pulls 1MB at a time, so the actual fetch_add inside
+            // CountingReader fires only on buffer refill (~17K msgs/refill).
+            self.stats.bytes_read = self.bytes_read_handle.load(Ordering::Relaxed);
+
             // Decode next record
             // decode_record returns a reference to the decoder's internal buffer.
             // We convert immediately, so no clone is needed - the reference is valid
