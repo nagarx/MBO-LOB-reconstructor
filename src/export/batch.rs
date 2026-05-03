@@ -13,7 +13,7 @@ use arrow::array::{
 use arrow::datatypes::Schema;
 
 use crate::error::{Result, TlobError};
-use crate::types::{LobState, MboMessage};
+use crate::types::{LobState, MboMessage, MAX_LOB_LEVELS};
 
 use super::schema::book_consistency_to_u8;
 
@@ -82,10 +82,69 @@ impl LobBatch {
     }
 
     /// Append a single `LobState` snapshot to the batch.
+    ///
+    /// # Phase O Cycle 1 / B.1 — single source of truth for levels
+    ///
+    /// Pre-B.1, this method had a dual source of truth: `level_count` was
+    /// pushed from `state.levels` while iteration used `self.levels`. When
+    /// the two differed (a misconfiguration where `LobReconstructor::new(N)`
+    /// is paired with a `LobSnapshotWriter` configured for `M ≠ N`), the
+    /// on-disk row would record one count but materialize a different
+    /// number of FixedSizeList values. That broke the per-file `levels`
+    /// schema invariant that downstream Python consumers rely on (e.g.,
+    /// `MBO-LOB-analyzer/src/rawlobanalyzer/io/schema.py:80` hardcodes
+    /// `pa.list_(pa.int64(), 10)`).
+    ///
+    /// Post-B.1: `self.levels` is the SSoT for BOTH the `level_count`
+    /// column AND the iteration bound. The on-disk `levels` column is a
+    /// per-file constant equal to `ExportConfig.levels` for every row.
+    ///
+    /// # Invariants enforced (debug builds)
+    ///
+    /// - `state.levels == self.levels`: in production this is guaranteed
+    ///   by `LobReconstructor::fill_lob_state_with_temporal` at
+    ///   `reconstructor.rs:1075` setting `state.levels = self.config.levels`.
+    ///   `debug_assert_eq!` here catches misconfiguration at development
+    ///   time + external direct mutation of `pub state.levels`
+    ///   (`types.rs:309`).
+    /// - `self.levels <= MAX_LOB_LEVELS`: the caller (`LobBatch::new` via
+    ///   `ExportConfig::validate`) already enforces this bound; the
+    ///   `debug_assert!` documents it at the use site (defense-in-depth).
+    ///
+    /// In release builds (debug_assert compiled out), the `level_count`
+    /// column STILL records `self.levels` (not `state.levels`), preserving
+    /// the per-file constant contract even under misconfiguration. The
+    /// for-loop bound is `self.levels`, so `state.bid_prices[i]` is
+    /// always indexed within `[0, self.levels)`. Stack-allocated
+    /// `bid_prices: [i64; MAX_LOB_LEVELS]` is bounds-safe iff
+    /// `self.levels <= MAX_LOB_LEVELS`, which the construction-time
+    /// `ExportConfig::validate` enforces. No release-mode UB.
     pub(crate) fn push(&mut self, state: &LobState) {
+        debug_assert!(
+            self.levels <= MAX_LOB_LEVELS,
+            "LobBatch::push: self.levels ({}) > MAX_LOB_LEVELS ({}); \
+             ExportConfig::validate should have caught this at construction",
+            self.levels,
+            MAX_LOB_LEVELS,
+        );
+        debug_assert_eq!(
+            state.levels, self.levels,
+            "LobBatch::push: state.levels ({}) != writer self.levels ({}); \
+             caller must construct LobReconstructor and LobSnapshotWriter with \
+             identical `levels` (production code path via \
+             `process_message_into` -> `fill_lob_state_with_temporal` at \
+             reconstructor.rs:1075 sets state.levels = config.levels — this \
+             panic indicates either (a) external mutation of pub state.levels \
+             (types.rs:309) or (b) reconstructor/writer levels misconfiguration)",
+            state.levels, self.levels,
+        );
+
         self.timestamp_ns.push(state.timestamp.unwrap_or(0));
         self.sequence.push(state.sequence);
-        self.level_count.push(state.levels as u8);
+        // B.1: SSoT for the per-file `levels` column is self.levels (=
+        // ExportConfig.levels). Pre-B.1 this was state.levels, which could
+        // diverge from the FixedSizeList column width under misconfiguration.
+        self.level_count.push(self.levels as u8);
         self.best_bid.push(state.best_bid);
         self.best_ask.push(state.best_ask);
 
@@ -324,4 +383,112 @@ fn build_fixed_list_u32(flat: Vec<u32>, list_size: i32, row_count: usize) -> Res
     FixedSizeListArray::try_new(field, list_size, values, None)
         .map(|a| Arc::new(a) as ArrayRef)
         .map_err(|e| TlobError::Generic(format!("FixedSizeList<UInt32> error: {e}")))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase O Cycle 1 / B.1 — LobBatch level-source-of-truth regression tests
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Per Phase O design (PHASE_O_DESIGN_REFINED_2026_05_03.md, B.1):
+// pre-fix `LobBatch::push` had a dual source of truth — `level_count` was
+// pushed from `state.levels` (line 88) while iteration used `self.levels`
+// (line 92). When `state.levels != self.levels` (misconfiguration where a
+// `LobReconstructor::new(N)` is paired with a `LobSnapshotWriter` configured
+// for `M ≠ N`), the on-disk row would record one count but materialize a
+// different number of FixedSizeList values, breaking the per-file
+// `levels` schema invariant (which Python consumers like
+// `MBO-LOB-analyzer/src/rawlobanalyzer/io/schema.py:80` rely on as a
+// per-file constant equal to `ExportConfig.levels`).
+//
+// Post-fix discipline:
+//   * `self.levels` is the SSoT for BOTH the `level_count` column AND the
+//     iteration bound — the on-disk `levels` column is a per-file constant
+//     equal to `ExportConfig.levels` for every row in the file.
+//   * `debug_assert_eq!(state.levels, self.levels, ...)` catches
+//     misconfiguration at development time (cargo test default + debug
+//     builds). Release builds tolerate a state.levels mismatch but the
+//     emitted column count remains self.levels — the pre-existing
+//     contract is preserved.
+//   * `debug_assert!(self.levels <= MAX_LOB_LEVELS)` is a defense-in-depth
+//     bound check; the caller (`LobBatch::new` via `ExportConfig::validate`)
+//     already enforces this, but the assert documents it at the use site.
+//
+// In production today (LobReconstructor → LobSnapshotWriter via
+// `process_message_into` → `fill_lob_state_with_temporal` at
+// `reconstructor.rs:1075` setting `state.levels = self.config.levels`),
+// `state.levels == self.levels` is invariant. The fix is purely DEFENSIVE
+// against external direct mutation of `pub state.levels` (types.rs:309)
+// and against misconfigured pairings where reconstructor and writer
+// `levels` diverge.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{LobState, MAX_LOB_LEVELS};
+
+    /// Baseline: state.levels == self.levels (the production case).
+    /// Verifies no regression for the normal path: 5 real levels in,
+    /// 5 real levels out, level_count == 5.
+    #[test]
+    fn b1_lob_batch_baseline_state_equals_self_levels() {
+        let mut batch = LobBatch::new(10, 5, false);
+        let mut state = LobState::new(5);
+        for i in 0..5 {
+            state.bid_prices[i] = 100 - i as i64;
+            state.bid_sizes[i] = 10 + i as u32;
+            state.ask_prices[i] = 200 + i as i64;
+            state.ask_sizes[i] = 20 + i as u32;
+        }
+        batch.push(&state);
+
+        assert_eq!(batch.bid_prices.len(), 5, "5 bid prices for 1 row");
+        assert_eq!(batch.bid_prices, vec![100, 99, 98, 97, 96]);
+        assert_eq!(batch.bid_sizes, vec![10, 11, 12, 13, 14]);
+        assert_eq!(batch.ask_prices, vec![200, 201, 202, 203, 204]);
+        assert_eq!(batch.ask_sizes, vec![20, 21, 22, 23, 24]);
+        assert_eq!(
+            batch.level_count[0], 5,
+            "level_count is the per-file constant self.levels (= ExportConfig.levels)"
+        );
+    }
+
+    /// Critical regression test: state.levels != self.levels MUST panic in
+    /// debug builds (proves the fail-loud discipline introduced by the
+    /// B.1 fix). Pre-B.1: this test would NOT panic (no debug_assert
+    /// existed) — the should_panic gate would FAIL the test, exposing
+    /// the missing safety invariant. Post-B.1: panic fires with both
+    /// values cited, the test PASSES.
+    #[test]
+    #[should_panic(expected = "state.levels")]
+    fn b1_lob_batch_levels_mismatch_panics_in_debug() {
+        let mut batch = LobBatch::new(10, 5, false);
+        let mut state = LobState::new(3);
+        state.bid_prices[0] = 100;
+        state.bid_prices[1] = 99;
+        state.bid_prices[2] = 98;
+        // state.levels (3) != self.levels (5) → debug_assert_eq! fires.
+        batch.push(&state);
+    }
+
+    /// Boundary case: self.levels = MAX_LOB_LEVELS. Verifies the upper
+    /// bound is reachable without spurious panic. The
+    /// `debug_assert!(self.levels <= MAX_LOB_LEVELS)` invariant in push()
+    /// is `<=` (not `<`), so MAX_LOB_LEVELS itself is valid.
+    #[test]
+    fn b1_lob_batch_max_levels_boundary_accepted() {
+        let mut batch = LobBatch::new(2, MAX_LOB_LEVELS, false);
+        let mut state = LobState::new(MAX_LOB_LEVELS);
+        for i in 0..MAX_LOB_LEVELS {
+            state.bid_prices[i] = (1000 + i) as i64;
+            state.ask_prices[i] = (2000 + i) as i64;
+        }
+        batch.push(&state);
+
+        assert_eq!(batch.bid_prices.len(), MAX_LOB_LEVELS);
+        assert_eq!(batch.level_count[0] as usize, MAX_LOB_LEVELS);
+        assert_eq!(batch.bid_prices[0], 1000);
+        assert_eq!(
+            batch.bid_prices[MAX_LOB_LEVELS - 1],
+            1000 + (MAX_LOB_LEVELS - 1) as i64
+        );
+    }
 }

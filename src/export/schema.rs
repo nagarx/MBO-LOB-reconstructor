@@ -41,6 +41,24 @@ use super::SCHEMA_VERSION;
 /// | triggering_action  | UInt8                      | true     |
 /// | triggering_side    | UInt8                      | true     |
 ///
+/// # Per-file invariant: `levels` column (Phase O Cycle 1 / B.1)
+///
+/// The `levels` column is a **per-file CONSTANT** equal to the `levels`
+/// argument passed to this function (= `ExportConfig.levels`). It does
+/// NOT vary row-to-row. For every row, `levels[i] == N == FixedSizeList
+/// width`. Downstream consumers MAY rely on this invariant; e.g.,
+/// `MBO-LOB-analyzer/src/rawlobanalyzer/io/schema.py:80` hardcodes
+/// `pa.list_(pa.int64(), 10)`, which is correct iff every file in the
+/// corpus is exported with `ExportConfig.levels == 10`. Files exported
+/// with a different `levels` value form a DIFFERENT per-file schema
+/// (the `levels` column value will differ).
+///
+/// This invariant is enforced producer-side at `LobBatch::push`
+/// (`batch.rs::LobBatch::push`) via `debug_assert_eq!(state.levels,
+/// self.levels)` — caller must construct `LobReconstructor` and
+/// `LobSnapshotWriter` with identical `levels` so that the per-row
+/// `state.levels` matches the per-file `self.levels`.
+///
 /// # Derived columns (when `include_derived = true`)
 ///
 /// | Column             | Type    | Nullable |
