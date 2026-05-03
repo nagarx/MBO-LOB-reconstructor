@@ -1157,7 +1157,27 @@ impl LobReconstructor {
     #[inline]
     pub fn process_message_into(&mut self, msg: &MboMessage, state: &mut LobState) -> Result<()> {
         // System messages (heartbeats, status updates) are not valid orders.
-        if self.config.skip_system_messages && msg.is_system_message() {
+        //
+        // Phase O Cycle 1 / B.2a (NEW-AUDIT-A3 closure): exempt
+        // `Action::Clear` from this filter. Clear messages are SEMANTIC
+        // market events (mid-day book wipes from circuit-breaker /
+        // market-wide auction halts) that canonically carry the same
+        // zero-field shape as system heartbeats (`order_id=0, size=0,
+        // price=0`). Pre-B.2a this filter silently swallowed them,
+        // making the `Action::Clear => self.reset()` handler at the
+        // match dispatch below UNREACHABLE for default-config callers
+        // (`LobConfig::default()` sets `skip_system_messages: true`).
+        // The companion Phase O B.2b fix in the extractor's outer
+        // filter (`feature-extractor-MBO-LOB/.../pipeline.rs:253`) is
+        // the operator-visible counter side; B.2a is the load-bearing
+        // book-state fix. `Action::None` is intentionally NOT exempted
+        // — it has identical zero-field shape but per types.rs:48 is a
+        // "no-op action" with no required handler side effect; silent-
+        // drop preserves pre-B.2a behavior.
+        if self.config.skip_system_messages
+            && msg.is_system_message()
+            && msg.action != Action::Clear
+        {
             self.stats.system_messages_skipped += 1;
             // Still populate temporal info even for skipped messages
             self.fill_lob_state_with_temporal(
@@ -1169,8 +1189,21 @@ impl LobReconstructor {
             return Ok(());
         }
 
-        // Validate message (if enabled)
-        if self.config.validate_messages {
+        // Validate message (if enabled).
+        //
+        // Phase O B.2a: also exempt `Action::Clear` from validation.
+        // `MboMessage::validate()` (types.rs:186-202) requires
+        // `order_id > 0 AND price > 0 AND size > 0` — the docstring at
+        // types.rs:183-185 explicitly says "checks whether a message
+        // that *should* represent a valid order actually has valid
+        // field values. System messages (heartbeats, status) should be
+        // filtered first." Clear is NOT supposed to represent a valid
+        // order, so it is correctly excluded from this validation
+        // contract. Without this exemption, the B.2a inner-filter
+        // exemption above would only move the silent-drop ONE LINE
+        // DOWN (Clear would pass the filter then be rejected by
+        // validation as `InvalidOrderId(0)`) — defeating the whole fix.
+        if self.config.validate_messages && msg.action != Action::Clear {
             msg.validate()?;
         }
 
@@ -2080,6 +2113,82 @@ mod tests {
     // Action::Clear Tests
     // =========================================================================
 
+    /// Phase O Cycle 1 / B.2a — Action::Clear MUST work under DEFAULT
+    /// config. Pre-B.2a, the inner is_system_message filter at
+    /// `process_message_into` line 1160 + the validate() check at line
+    /// 1173 silently swallowed Clear (Clear matches is_system_message
+    /// because order_id=0 AND fails validation because order_id=0).
+    /// The pre-existing `test_clear_resets_book` test below works around
+    /// this with `.with_skip_system_messages(false).with_validation(false)`
+    /// — proving the test author KNEW about the bug but routed around it.
+    /// This new test uses the DEFAULT config (both flags true) to lock
+    /// the post-B.2a behavior: Clear bypasses BOTH filters and reaches
+    /// the `Action::Clear => self.reset()` handler.
+    #[test]
+    fn b2a_action_clear_works_under_default_config() {
+        // DEFAULT config: skip_system_messages=true AND validate_messages=true.
+        let mut lob = LobReconstructor::new(10);
+
+        // Build up some state with valid orders.
+        lob.process_message(&create_test_message(1, Action::Add, Side::Bid, 100.0, 100))
+            .unwrap();
+        lob.process_message(&create_test_message(2, Action::Add, Side::Ask, 100.01, 200))
+            .unwrap();
+        lob.process_message(&create_test_message(3, Action::Add, Side::Bid, 99.99, 150))
+            .unwrap();
+
+        assert_eq!(lob.order_count(), 3, "pre-Clear book has 3 orders");
+        assert_eq!(lob.bid_levels(), 2);
+        assert_eq!(lob.ask_levels(), 1);
+        assert_eq!(
+            lob.stats().book_clears,
+            0,
+            "no Clears processed yet; counter must be 0"
+        );
+
+        // Clear with Databento-canonical zero fields.
+        // Pre-B.2a: silently swallowed by inner filter — Result was Ok
+        // but book retained 3 stale orders + book_clears NEVER incremented.
+        // Post-B.2a: Clear bypasses inner filter + validation, reaches
+        // the Action::Clear arm at line 1183, calls self.reset().
+        let msg = MboMessage::new(0, Action::Clear, Side::None, 0, 0);
+        lob.process_message(&msg).unwrap();
+
+        // Book reset (B.2a load-bearing assertion).
+        assert_eq!(
+            lob.order_count(),
+            0,
+            "B.2a: Clear handler MUST fire under default config and reset book. \
+             Pre-fix: book retained 3 stale orders. Post-fix: book is empty."
+        );
+        assert_eq!(lob.bid_levels(), 0);
+        assert_eq!(lob.ask_levels(), 0);
+        assert!(lob.get_lob_state().best_bid.is_none());
+        assert!(lob.get_lob_state().best_ask.is_none());
+
+        // Stats verification (B.2a observability assertion).
+        assert_eq!(
+            lob.stats().book_clears,
+            1,
+            "B.2a: book_clears stat MUST increment by 1. \
+             Pre-fix: 0 (Clear handler skipped). Post-fix: 1."
+        );
+        // system_messages_skipped MUST NOT increment for Clear (Clear is
+        // exempt from the system-message classification post-B.2a).
+        assert_eq!(
+            lob.stats().system_messages_skipped,
+            0,
+            "B.2a: Clear must NOT be counted as a system-message skip. \
+             Pre-fix: Clear was wrongly counted (1). Post-fix: 0."
+        );
+    }
+
+    /// B.2a sanity: pre-existing `test_clear_resets_book` workaround
+    /// (with_skip_system_messages(false) + with_validation(false)) STILL
+    /// works post-B.2a. Locks that B.2a doesn't break the
+    /// caller-explicit-config code path that some integration tests use.
+    /// The actual assertions are in `test_clear_resets_book` (below);
+    /// this comment is the audit pointer.
     #[test]
     fn test_clear_resets_book() {
         // Disable validation and system message skipping since Clear uses dummy values
