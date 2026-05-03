@@ -364,7 +364,7 @@ impl HotStoreManager {
         let compressed_path = compressed_path.as_ref();
         let decompressed_path = self.decompressed_path_for(compressed_path);
 
-        // Check if already decompressed
+        // Fast path: already decompressed
         if decompressed_path.exists() {
             log::info!(
                 "Decompressed file already exists: {}",
@@ -373,61 +373,183 @@ impl HotStoreManager {
             return Ok(decompressed_path);
         }
 
-        // Ensure hot store directory exists
-        if let Some(parent) = decompressed_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                TlobError::generic(format!(
-                    "Failed to create hot store directory {}: {}",
-                    parent.display(),
-                    e
-                ))
-            })?;
-        }
+        // Ensure hot store directory exists (idempotent across threads;
+        // multiple callers racing on this is fine — fs::create_dir_all
+        // returns Ok if the directory already exists).
+        let parent_dir = decompressed_path.parent().ok_or_else(|| {
+            TlobError::generic(format!(
+                "Decompressed path has no parent: {}",
+                decompressed_path.display()
+            ))
+        })?;
+        fs::create_dir_all(parent_dir).map_err(|e| {
+            TlobError::generic(format!(
+                "Failed to create hot store directory {}: {}",
+                parent_dir.display(),
+                e
+            ))
+        })?;
 
-        // Use temporary file for atomic write
-        let temp_path = decompressed_path.with_extension("tmp");
+        // Phase O Cycle 1 / B.4: race-safe atomic write via NamedTempFile
+        // + persist_noclobber. Pre-B.4 used a fixed `.tmp` extension
+        // which exhibited four distinct failure modes:
+        //
+        //   (a) TOCTOU race: two threads both pass the `.exists()` check
+        //       above, both decompress to the SAME `.tmp` path → last-
+        //       writer-wins corruption (one thread's write is overwritten
+        //       mid-stream by the other's).
+        //   (b) Cross-input collision: different compressed inputs that
+        //       map to the same `decompressed_path` (e.g., basename-only
+        //       hashing in `decompressed_path_for` — see C-1 in B.4
+        //       pre-impl audit; out of B.4 scope, deferred to Phase P)
+        //       collide on the SAME `.tmp` path with the same corruption.
+        //   (c) Last-writer-wins on `fs::rename`: process A renames first;
+        //       process B's rename then OVERWRITES A's clean output with
+        //       B's identical-but-newly-written file (low risk but pointless
+        //       I/O + orphan inode churn).
+        //   (d) Sync-targeting bug (D-2 from B.4 pre-impl audit): the
+        //       pre-B.4 `decompress_zstd(src, dst: &Path)` opened a NEW
+        //       file at `dst` via `File::create(dst)`, which truncates
+        //       and replaces whatever inode was at that path. Any caller
+        //       that subsequently called `tmp.as_file().sync_all()` would
+        //       have synced the ORIGINAL (now-empty) inode, NOT the new
+        //       inode containing the decompressed bytes — atomicity
+        //       illusory. Post-B.4 `decompress_zstd(src, dst_file: &mut
+        //       File)` writes through `tmp.as_file_mut()` so `sync_all`
+        //       targets the SAME inode that received the bytes.
+        //
+        // M.A.5 envelope writer at `src/lob/reconstructor.rs:366-388` is
+        // the architectural template for the sync_all + persist sequence
+        // (M.A.5 uses `persist` for single-writer JSON envelope; B.4
+        // uses `persist_noclobber` for race-safe multi-writer where the
+        // FIRST winner persists and subsequent threads detect via
+        // `ErrorKind::AlreadyExists`).
+        //
+        // `tempfile::NamedTempFile::persist_noclobber` is documented as
+        // NON-ATOMIC on systems where `renameat_with(NOREPLACE)` returns
+        // EINVAL (rare; primary path uses `linkat` + `unlinkat` on POSIX
+        // and `MoveFileEx` without REPLACE_EXISTING on Windows). On macOS
+        // APFS (the typical hot store mount per CLAUDE.md), the primary
+        // path IS atomic. Operators on filesystems that fall back to the
+        // non-atomic path may rarely see two valid copies briefly during
+        // concurrent decompression — both copies have identical content
+        // (deterministic zstd output), so the consumer sees no corruption.
+        let mut temp = tempfile::NamedTempFile::new_in(parent_dir).map_err(|e| {
+            TlobError::generic(format!(
+                "Failed to create temp file in {}: {}",
+                parent_dir.display(),
+                e
+            ))
+        })?;
 
-        // Decompress
         log::info!(
             "Decompressing {} to {}",
             compressed_path.display(),
             decompressed_path.display()
         );
 
-        let result = self.decompress_zstd(compressed_path, &temp_path);
+        // Phase O Cycle 1 / B.4 D-2 fix: decompress_zstd writes through
+        // the NamedTempFile's own File handle (not via File::create on
+        // the path). This guarantees the bytes land in the inode that
+        // `temp.as_file().sync_all()` will subsequently fsync.
+        let bytes = self.decompress_zstd(compressed_path, temp.as_file_mut())?;
 
-        match result {
-            Ok(bytes) => {
-                // Atomic rename
-                fs::rename(&temp_path, &decompressed_path).map_err(|e| {
-                    // Clean up temp file on rename failure
-                    let _ = fs::remove_file(&temp_path);
-                    TlobError::generic(format!("Failed to rename temp file: {}", e))
-                })?;
+        // Phase O Cycle 1 / B.4 C-3/D-1 fix: fsync the SAME inode that
+        // just received the decompressed bytes, matching the M.A.5
+        // envelope-writer idiom at reconstructor.rs:369. Without this,
+        // a power-cut between persist_noclobber and the OS's lazy flush
+        // of the page cache could leave the renamed file pointing at
+        // zeroed or torn data on disk (rename is metadata-atomic but
+        // data blocks may not be on disk yet at rename time).
+        temp.as_file().sync_all().map_err(|e| {
+            TlobError::generic(format!(
+                "Failed to fsync decompressed temp file before persist: {}",
+                e
+            ))
+        })?;
 
+        match temp.persist_noclobber(&decompressed_path) {
+            Ok(_) => {
                 log::info!("Decompression complete: {} bytes written", bytes);
+                // Phase O Cycle 1 / B.4 post-rename integrity check:
+                // catches the edge case where decompress_zstd returned
+                // Ok(0) (zstd source had a valid header but zero
+                // decompressible content — e.g., empty zstd frame).
+                // Per HFT-rules §8 (fail-loud, never silently emit
+                // empty/corrupt output).
+                let metadata = fs::metadata(&decompressed_path).map_err(|e| {
+                    TlobError::generic(format!(
+                        "Post-decompress metadata read failed for {}: {}",
+                        decompressed_path.display(),
+                        e
+                    ))
+                })?;
+                if metadata.len() == 0 {
+                    return Err(TlobError::generic(format!(
+                        "Decompression produced empty file at {} \
+                         (zstd source likely contained zero decompressible \
+                          content despite valid header)",
+                        decompressed_path.display()
+                    )));
+                }
                 Ok(decompressed_path)
             }
-            Err(e) => {
-                // Clean up temp file on error
-                let _ = fs::remove_file(&temp_path);
-                Err(e)
+            Err(persist_err) => {
+                // Phase O Cycle 1 / B.4 D-3 fix: discriminate the
+                // persist_noclobber Err — only ErrorKind::AlreadyExists
+                // permits the "another thread won" recovery branch. Any
+                // other Err (EROFS, EACCES, EXDEV, ENOSPC, ...) MUST
+                // propagate; pre-B.4 design used a bare `.exists()`
+                // check which would silently mask EROFS as success
+                // when a stale orphan happened to exist at the target.
+                let kind = persist_err.error.kind();
+                if kind == io::ErrorKind::AlreadyExists && decompressed_path.exists() {
+                    log::info!(
+                        "Concurrent decompression detected for {}; \
+                         using existing file (another thread won the race)",
+                        decompressed_path.display()
+                    );
+                    Ok(decompressed_path)
+                } else {
+                    Err(TlobError::generic(format!(
+                        "Failed to persist decompressed temp to {} \
+                         (kind={:?}): {}",
+                        decompressed_path.display(),
+                        kind,
+                        persist_err.error
+                    )))
+                }
             }
         }
     }
 
     /// Internal zstd decompression implementation.
-    fn decompress_zstd(&self, src: &Path, dst: &Path) -> Result<u64> {
+    ///
+    /// # Phase O Cycle 1 / B.4 (D-2 fix)
+    ///
+    /// Pre-B.4 signature was `(&self, src: &Path, dst: &Path) -> Result<u64>`
+    /// and the function called `File::create(dst)` to obtain a write
+    /// handle, opening a NEW inode at the temp path. The caller's
+    /// `NamedTempFile` handle (`tmp.as_file()`) was bound to the
+    /// ORIGINAL inode created by `NamedTempFile::new_in()`, so any
+    /// subsequent `tmp.as_file().sync_all()` would have synced the
+    /// WRONG (now-empty) inode rather than the one containing the
+    /// decompressed bytes.
+    ///
+    /// Post-B.4 the signature accepts `dst_file: &mut File` and writes
+    /// through that handle directly. The caller passes
+    /// `tmp.as_file_mut()` so `tmp.as_file().sync_all()` correctly
+    /// targets the same inode that received the bytes.
+    fn decompress_zstd(&self, src: &Path, dst_file: &mut File) -> Result<u64> {
         let input_file = File::open(src)
             .map_err(|e| TlobError::generic(format!("Failed to open {}: {}", src.display(), e)))?;
 
-        let output_file = File::create(dst).map_err(|e| {
-            TlobError::generic(format!("Failed to create {}: {}", dst.display(), e))
-        })?;
-
-        // Use large buffers for better throughput
+        // Use large buffers for better throughput. BufWriter borrows
+        // dst_file mutably; the borrow ends when BufWriter is dropped
+        // at function return, releasing dst_file for the caller's
+        // sync_all call.
         let reader = BufReader::with_capacity(IO_BUFFER_SIZE, input_file);
-        let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, output_file);
+        let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, dst_file);
 
         // Create zstd decoder
         let mut decoder = zstd::stream::read::Decoder::new(reader)
@@ -853,5 +975,240 @@ mod tests {
         assert_eq!(result1, result2);
 
         cleanup(&dir);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Phase O Cycle 1 / B.4 — Hot-store atomicity tests
+    //
+    // These tests verify the post-B.4 race-safety + integrity invariants:
+    //   - tempfile::NamedTempFile::new_in eliminates fixed `.tmp`
+    //     collision class (T-1 concurrent_same_path + concurrent_distinct_basenames)
+    //   - persist_noclobber + ErrorKind::AlreadyExists discriminator
+    //     handles "another thread won" without masking real errors
+    //   - Post-rename metadata().len() > 0 fails loud on zero-byte
+    //     decompression output (T-1 truncated_source)
+    //   - HotStoreManager: Send + Sync at the type level (T-1 send_sync)
+    // ─────────────────────────────────────────────────────────────────
+
+    /// B.4 concurrent same-path: 8 threads decompress the same compressed
+    /// input simultaneously. Verifies persist_noclobber's race safety
+    /// (only ONE thread persists the file; the other 7 detect via
+    /// ErrorKind::AlreadyExists and use the existing file). Asserts:
+    ///   - all threads return Ok with the SAME path,
+    ///   - file content matches the original test_data,
+    ///   - no `.tmp*` orphan files remain in hot_dir (NamedTempFile RAII
+    ///     cleanup on losing-thread Drop).
+    #[test]
+    fn b_4_decompress_concurrent_same_path_no_corruption() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = unique_temp_dir("b4_concurrent_same");
+        cleanup(&dir);
+
+        let hot_dir = dir.join("hot");
+        let manager = HotStoreManager::for_dbn(&hot_dir);
+
+        let compressed_dir = dir.join("compressed");
+        fs::create_dir_all(&compressed_dir).unwrap();
+        let compressed_path = compressed_dir.join("test.dbn.zst");
+        // 10KB pseudo-random content (deterministic per i % 256) so
+        // content-equality assertion is meaningful.
+        let test_data: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
+
+        let mut encoder =
+            zstd::stream::write::Encoder::new(File::create(&compressed_path).unwrap(), 0).unwrap();
+        encoder.write_all(&test_data).unwrap();
+        encoder.finish().unwrap();
+
+        let manager_arc = Arc::new(manager);
+        let compressed_arc = Arc::new(compressed_path);
+        // Barrier aligns thread starts so all 8 threads cross the
+        // `.exists()` check at near-identical instants — maximizes
+        // race-window probability.
+        let barrier = Arc::new(Barrier::new(8));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let m = manager_arc.clone();
+                let p = compressed_arc.clone();
+                let b = barrier.clone();
+                thread::spawn(move || {
+                    b.wait();
+                    m.decompress(&*p)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // All 8 threads MUST succeed (winning thread persists; losing
+        // threads recover via ErrorKind::AlreadyExists).
+        for (i, r) in results.iter().enumerate() {
+            assert!(r.is_ok(), "thread {i} failed: {r:?}");
+        }
+
+        // All threads MUST return the SAME path (winner's path is the
+        // canonical decompressed_path; losers return that same path
+        // via the recovery branch).
+        let first_path = results[0].as_ref().unwrap();
+        for (i, r) in results[1..].iter().enumerate() {
+            assert_eq!(
+                r.as_ref().unwrap(),
+                first_path,
+                "thread {} returned different path",
+                i + 1
+            );
+        }
+
+        // File content MUST match the original — no torn writes from
+        // concurrent persist attempts.
+        let content = fs::read(first_path).unwrap();
+        assert_eq!(
+            content, test_data,
+            "decompressed content must match original"
+        );
+
+        // No `.tmp*` orphans should remain in hot_dir. Losing threads'
+        // NamedTempFile drops on the persist_noclobber Err path and
+        // RAII unlinks the temp inode automatically.
+        let orphans: Vec<_> = fs::read_dir(&hot_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().into_string().unwrap_or_default())
+            .filter(|n| n.starts_with(".tmp") || n.contains(".tmp"))
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "no .tmp* orphans should remain post-decompression; found: {orphans:?}"
+        );
+
+        cleanup(&dir);
+    }
+
+    /// B.4 concurrent distinct basenames: 4 threads each decompress a
+    /// DIFFERENT compressed input (4 distinct basenames → 4 distinct
+    /// decompressed paths → 4 distinct NamedTempFile temp files). Verifies
+    /// no cross-input contamination (random-suffix temp naming via
+    /// NamedTempFile::new_in eliminates the cross-input `.tmp` collision
+    /// class that the pre-B.4 fixed `.tmp` extension was vulnerable to).
+    #[test]
+    fn b_4_decompress_concurrent_distinct_basenames() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = unique_temp_dir("b4_concurrent_distinct");
+        cleanup(&dir);
+
+        let hot_dir = dir.join("hot");
+        let manager = HotStoreManager::for_dbn(&hot_dir);
+
+        let compressed_dir = dir.join("compressed");
+        fs::create_dir_all(&compressed_dir).unwrap();
+
+        // 4 distinct compressed inputs with DISTINCT content (so cross-
+        // contamination from .tmp collision would produce a content
+        // mismatch we can detect).
+        let inputs: Vec<(PathBuf, Vec<u8>)> = (0..4)
+            .map(|i| {
+                let path = compressed_dir.join(format!("input_{i}.dbn.zst"));
+                let content: Vec<u8> = (0..5_000).map(|j| ((i * 1000 + j) % 256) as u8).collect();
+                let mut encoder =
+                    zstd::stream::write::Encoder::new(File::create(&path).unwrap(), 0).unwrap();
+                encoder.write_all(&content).unwrap();
+                encoder.finish().unwrap();
+                (path, content)
+            })
+            .collect();
+
+        let manager_arc = Arc::new(manager);
+        let inputs_arc = Arc::new(inputs);
+        let barrier = Arc::new(Barrier::new(4));
+
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let m = manager_arc.clone();
+                let inp = inputs_arc.clone();
+                let b = barrier.clone();
+                thread::spawn(move || {
+                    b.wait();
+                    let result = m.decompress(&inp[i].0);
+                    (i, result)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Each thread must return Ok with the CORRECT content for its
+        // input. If cross-input contamination occurred (e.g., thread 0
+        // and thread 2 both wrote to the SAME .tmp path due to basename
+        // collision), the content read back would be wrong.
+        for (idx, r) in results {
+            let path = r.as_ref().unwrap_or_else(|e| panic!("thread {idx}: {e:?}"));
+            let content = fs::read(path).unwrap();
+            assert_eq!(
+                content, inputs_arc[idx].1,
+                "thread {idx}: content mismatch — possible cross-input \
+                 contamination from .tmp collision"
+            );
+        }
+
+        cleanup(&dir);
+    }
+
+    /// B.4 truncated source: a corrupt zstd source (header + zero
+    /// decompressible bytes) MUST fail-loud at the post-rename
+    /// metadata().len() > 0 integrity check, NOT silently return
+    /// the path of a zero-byte file. Per HFT-rules §8.
+    #[test]
+    fn b_4_decompress_zero_byte_source_returns_err_not_empty_file() {
+        let dir = unique_temp_dir("b4_truncated");
+        cleanup(&dir);
+
+        let hot_dir = dir.join("hot");
+        let manager = HotStoreManager::for_dbn(&hot_dir);
+
+        let compressed_dir = dir.join("compressed");
+        fs::create_dir_all(&compressed_dir).unwrap();
+        let compressed_path = compressed_dir.join("empty.dbn.zst");
+
+        // Compress ZERO bytes → valid zstd frame containing no
+        // decompressible content. This is the edge case where
+        // decompress_zstd returns Ok(0) but the resulting file is
+        // empty — pre-B.4 would have silently returned the zero-byte
+        // path; post-B.4 the metadata().len() == 0 check fails loud.
+        let mut encoder =
+            zstd::stream::write::Encoder::new(File::create(&compressed_path).unwrap(), 0).unwrap();
+        // No write_all() call — just finish to emit an empty frame.
+        encoder.finish().unwrap();
+
+        let result = manager.decompress(&compressed_path);
+
+        assert!(
+            result.is_err(),
+            "zero-byte zstd source MUST fail-loud (HFT-rules §8); got: {result:?}"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("empty file"),
+            "error message must cite empty-file failure mode; got: {err_msg}"
+        );
+
+        cleanup(&dir);
+    }
+
+    /// B.4 Send + Sync static assertion (T-1): HotStoreManager + its
+    /// internal config must be safely shareable across threads. The
+    /// `concurrent_*` tests above rely on this via Arc<HotStoreManager>;
+    /// this test asserts the trait bounds at the TYPE level so a future
+    /// refactor that accidentally adds a non-Send/Sync field (e.g., Rc,
+    /// RefCell) fires a compile error rather than silently breaking
+    /// the concurrent tests.
+    #[test]
+    fn b_4_send_sync_static_assertions() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<HotStoreManager>();
+        assert_send_sync::<HotStoreConfig>();
     }
 }

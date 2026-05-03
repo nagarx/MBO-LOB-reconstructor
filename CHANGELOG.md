@@ -260,8 +260,140 @@ timestamp must back the throttle.
     appropriate per HFT-rules §3 monotonic-timestamp invariant.
   - `decompressed_path_for` basename-collision class (silent data-
     substitution bug between different compressed sources mapping to
-    same basename) — Phase P task.
+    same basename) — Phase P task (see also B.4 entry below).
   - At-startup orphan `.tmp*` sweep — Phase P operational task.
+
+### Fixed — Phase O Cycle 1: B.4 hot-store decompress race + integrity (2026-05-03, 1 commit)
+
+Closes a 4-class race-condition + integrity-gap cluster at
+`src/hotstore.rs::HotStoreManager::decompress` (lines 363-417 pre-B.4):
+
+  (a) **TOCTOU race**: two threads both pass the `.exists()` check on
+      the decompressed path, both decompress to the SAME fixed `.tmp`
+      path → last-writer-wins corruption.
+  (b) **Cross-input `.tmp` collision**: different compressed inputs
+      mapping to the same `decompressed_path` (basename-only hashing
+      in `decompressed_path_for` — itself a separate Phase P concern,
+      C-1 in the B.4 pre-impl audit) collide on the SAME `.tmp` path
+      with the same corruption.
+  (c) **Last-writer-wins on `fs::rename`**: process A renames first;
+      process B's rename then OVERWRITES A's clean output.
+  (d) **Sync-targeting bug** (D-2 from B.4 pre-impl audit, the
+      load-bearing critical issue): the pre-B.4
+      `decompress_zstd(src, dst: &Path)` opened a NEW file at the
+      `dst` path via `File::create(dst)`, which truncates and
+      replaces the inode. A future caller adding
+      `tmp.as_file().sync_all()` (matching the M.A.5 envelope-writer
+      idiom at `src/lob/reconstructor.rs:369`) would have synced the
+      ORIGINAL (now-empty) inode, NOT the new inode containing the
+      decompressed bytes — atomicity illusory.
+
+- **B.4** — fix(hotstore): race-safe atomic decompression via
+  `tempfile::NamedTempFile::new_in` (random-suffix naming eliminates
+  fixed `.tmp` collision class) + `tmp.as_file().sync_all()` (fsync
+  the SAME inode that received bytes, matching M.A.5 idiom) +
+  `tmp.persist_noclobber()` (atomic rename ONLY when target absent)
+  + `ErrorKind::AlreadyExists` discriminator (the ONLY persist Err
+  that permits "another thread won" recovery; all other Err kinds
+  propagate, NOT silently masked by `.exists()` check) + post-rename
+  `metadata().len() > 0` integrity check (fail-loud per HFT-rules §8
+  on zero-byte zstd decompression).
+
+  File scope (1 source + this CHANGELOG):
+
+  - `src/hotstore.rs::decompress` — replaced fixed `.tmp` path +
+    `decompress_zstd` + `fs::rename` flow with NamedTempFile +
+    sync_all + persist_noclobber. The 4 race classes (a)-(d) cited
+    inline in the rewritten body's comment block.
+
+  - `src/hotstore.rs::decompress_zstd` (D-2 fix): signature
+    `(&self, src: &Path, dst: &Path) -> Result<u64>` →
+    `(&self, src: &Path, dst_file: &mut File) -> Result<u64>`.
+    Function now writes through the caller-provided File handle
+    instead of opening a NEW inode at the path; caller passes
+    `tmp.as_file_mut()` so subsequent `tmp.as_file().sync_all()`
+    targets the SAME inode that received the bytes. BufWriter
+    borrows `dst_file` for the function duration; borrow ends at
+    return, releasing the file handle for sync_all.
+
+  - `src/hotstore.rs` test mod — 4 new B.4 regression tests:
+    * `b_4_decompress_concurrent_same_path_no_corruption` — 8
+      threads decompress same input via std::sync::Barrier-aligned
+      race; verifies all return Ok with same path, content matches
+      original, no `.tmp*` orphans (T-1 main test).
+    * `b_4_decompress_concurrent_distinct_basenames` — 4 threads
+      each decompress a DIFFERENT input with distinct content;
+      verifies each gets correct content.
+    * `b_4_decompress_zero_byte_source_returns_err_not_empty_file` —
+      empty zstd frame → metadata().len() == 0 fail-loud check
+      fires → Err returned. Per HFT-rules §8.
+    * `b_4_send_sync_static_assertions` — type-level Send + Sync
+      assertion for HotStoreManager + HotStoreConfig; future
+      refactor that adds a non-Send/Sync field fires a compile
+      error rather than silently breaking the concurrent tests.
+
+  **Bit-exact preservation invariant**: GOLDEN_HASH_SEQUENCES_NPY
+  (`0x8bebad9b09b564cd`) and GOLDEN_HASH_LABELS_NPY
+  (`0x5dcf907068fcadcc`) UNCHANGED. B.4 changes producer-side
+  hot-store atomicity which is BELOW the feature-extraction layer
+  (the extractor's golden hashes are post-decompression); the
+  decompressed file CONTENT is bit-identical pre- and post-B.4
+  (deterministic zstd output regardless of which thread's
+  persist_noclobber wins the race).
+
+  **`PRODUCER_DIAGNOSTICS_SCHEMA_VERSION` UNCHANGED at 2.9.0**: B.4
+  changes only the producer-internal Rust file-creation pattern; no
+  new canonical aggregator names, no new fields in the diagnostics
+  struct, no wire-format changes to `_diagnostics.json`. Phase L
+  precedent applies (wire-format-invariant changes do not bump the
+  diagnostics schema version).
+
+  **Public API invariant preserved**: no public type signature
+  changes (HotStoreManager / HotStoreConfig / `decompress` return
+  type unchanged at the public API boundary; `decompress_zstd` is
+  private `fn`). Cross-repo blast radius zero (verified by grep
+  across all 7 sibling repos).
+
+  **Test count delta**: reconstructor 400 → **404** (+4, all
+  passing — 4 new b_4_* tests). Existing decompress tests
+  (`test_decompress_creates_directory`, `test_decompress_idempotent`)
+  unchanged + still passing — `decompress_zstd` signature change
+  is private and does NOT break any public-API caller.
+
+  **`tempfile::NamedTempFile::persist_noclobber` non-atomic-fallback
+  caveat**: documented as NON-ATOMIC on systems where
+  `renameat_with(NOREPLACE)` returns EINVAL/ENOSYS (rare; primary
+  path uses `linkat` + `unlinkat` on POSIX, `MoveFileEx` without
+  `REPLACE_EXISTING` on Windows). On Linux/macOS APFS (typical
+  hot-store mount per CLAUDE.md), the primary path IS atomic. On
+  rare filesystems that fall back to the non-atomic path, two valid
+  copies could briefly exist during concurrent decompression — both
+  with identical content (deterministic zstd output) so consumers
+  see no corruption. WARNINGS.md update deferred to a separate
+  Stage E-pre docs commit.
+
+  **Adversarial validation cycle**:
+  - Pre-implementation: parallel adversarial Plan agent (B.4 design
+    challenge) → 18-angle audit + cross-crate impact analysis →
+    SHIP-WITH-MODIFICATIONS verdict with 4 mandatory pre-merge
+    fixes (D-2 decompress_zstd refactor [APPLIED], C-3/D-1
+    sync_all between write + persist [APPLIED], D-3
+    ErrorKind::AlreadyExists discriminator [APPLIED], T-1 4
+    concurrent tests [APPLIED]).
+  - Post-implementation: standard quality-gate cascade.
+
+  **Phase O follow-ups deferred to Phase P** (per pre-impl agent's
+  scope-discipline triage):
+  - C-1: `decompressed_path_for` basename-collision class — silent
+    data-substitution bug between different compressed sources
+    mapping to same decompressed basename. Phase P task.
+  - C-5: zstd `frame_content_size` integrity check — replace
+    `metadata.len() == 0` weak check with stronger frame-content-
+    size cross-check when source declares a content size.
+  - D-4/D-5: at-startup orphan `.tmp*` sweep — operational task
+    for accumulated debris from `kill -9`'d processes.
+  - WARNINGS.md update for `tempfile::persist_noclobber` non-atomic-
+    fallback caveat — separate docs commit.
 
 ## [0.2.0] — 2026-04-30
 
