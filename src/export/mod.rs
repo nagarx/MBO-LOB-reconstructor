@@ -108,8 +108,9 @@ impl ExportConfig {
         }
         // Phase M M.A.4 (REV 3 F-034 closure): reject DownsampleStrategy::EveryN(0).
         // Pre-M.A.4: a 0 value silently meant "no downsample" (latent reinterpretation
-        // at LobSnapshotWriter::should_write). Post-M.A.4: fail-loud at config-validation
-        // boundary so operators using EveryN must be intentional about the value.
+        // at LobSnapshotWriter::write_decision — renamed from should_write in B.3).
+        // Post-M.A.4: fail-loud at config-validation boundary so operators using
+        // EveryN must be intentional about the value.
         if let Some(ds) = &self.downsample {
             if let DownsampleStrategy::EveryN(0) = ds.strategy {
                 return Err(crate::error::TlobError::InvalidConfig(
@@ -141,8 +142,48 @@ pub enum DownsampleStrategy {
     MinIntervalNs(u64),
 }
 
+/// Downsample-strategy statistics for a Parquet export.
+///
+/// # Phase O Cycle 1 / B.3
+///
+/// Introduced when the `MinIntervalNs` wraparound bug was fixed in
+/// `LobSnapshotWriter::write_decision` (private fn — see
+/// `lob_writer.rs`). Surfaces the per-writer `out_of_order_skipped`
+/// counter so operators can detect upstream non-monotonic-timestamp
+/// issues in the [`LobSnapshotWriter`]'s input stream (which pre-B.3
+/// were silently WRITTEN due to negative-i64 → near-`u64::MAX` cast
+/// at the downsample-comparison site).
+///
+/// `#[non_exhaustive]` so future additions (e.g., per-strategy skip
+/// counts for `EveryN`) are non-breaking by construction.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct DownsampleStats {
+    /// Number of snapshots skipped due to non-monotonic (out-of-order)
+    /// timestamps under [`DownsampleStrategy::MinIntervalNs`]. Should be
+    /// 0 in normal operation; non-zero indicates upstream timestamp
+    /// issues in the producer's input stream and operators should
+    /// audit the source data (per HFT-rules §3 — monotonic timestamps
+    /// are a pipeline invariant; per HFT-rules §8 — never silently
+    /// drop without recording diagnostics).
+    pub out_of_order_skipped: u64,
+}
+
 /// Statistics returned after completing a Parquet export.
+///
+/// # Phase O Cycle 1 / B.3 (`#[non_exhaustive]` + `downsample` field)
+///
+/// `#[non_exhaustive]` so future additions are non-breaking by
+/// construction (sibling-policy alignment with the four peer Phase M
+/// REV 3 boundary-discipline-aligned types: `LoaderStats`, `LobStats`,
+/// `LobStatsExportEnvelope`, `BoundaryError`, plus `TlobError`).
+///
+/// The `downsample` field is `Some(DownsampleStats)` when the writer's
+/// `ExportConfig.downsample` was non-`None` (e.g., `LobSnapshotWriter`
+/// with a configured strategy); `None` for writers without downsample
+/// (`MboEventWriter`, or `LobSnapshotWriter` with `downsample = None`).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ParquetExportStats {
     /// Total rows written to the file.
     pub rows_written: u64,
@@ -150,6 +191,8 @@ pub struct ParquetExportStats {
     pub rows_seen: u64,
     /// Number of row groups flushed.
     pub row_groups: u64,
+    /// Downsample-strategy statistics, if any. See [`DownsampleStats`].
+    pub downsample: Option<DownsampleStats>,
 }
 
 #[cfg(test)]

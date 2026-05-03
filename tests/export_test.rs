@@ -884,6 +884,381 @@ fn test_downsample_none_strategy() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Phase O Cycle 1 / B.3 — MinIntervalNs wraparound + DownsampleStats tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// B.3 main fix: out-of-order timestamps under MinIntervalNs are now
+/// SKIPPED (post-B.3) instead of silently WRITTEN (pre-B.3 due to
+/// `(ts - last) as u64` casting negative i64 to ~u64::MAX → always
+/// >= min_ns → always wrote).
+///
+/// Sequence: t=0 (write, anchor), t=2s (write, delta=2s>=1s), t=1s
+/// (out-of-order: 1s<2s, SKIP via WriteDecision::SkippedOutOfOrder),
+/// t=3s (write, delta=1s>=1s; anchor was 2s).
+#[test]
+fn b_3_downsample_min_interval_out_of_order_skipped_and_counted() {
+    let tmp = TempDir::new("ds_out_of_order");
+    let path = tmp.file("lob.parquet");
+    let mut config = small_config(2, false);
+    config.batch_size = 128;
+    config.downsample = Some(DownsampleConfig {
+        strategy: DownsampleStrategy::MinIntervalNs(1_000_000_000), // 1s
+    });
+
+    let mut writer = LobSnapshotWriter::new(&path, &config, HashMap::new()).unwrap();
+
+    // t=0 — written (None anchor branch).
+    let mut s0 = make_test_state(2);
+    s0.timestamp = Some(0);
+    writer.write_snapshot(&s0).unwrap();
+
+    // t=2_000_000_000 — written (delta=2s >= 1s).
+    let mut s1 = make_test_state(2);
+    s1.timestamp = Some(2_000_000_000);
+    writer.write_snapshot(&s1).unwrap();
+
+    // t=1_000_000_000 — OUT OF ORDER (1s < 2s anchor).
+    // Pre-B.3: (1_000_000_000 - 2_000_000_000) as u64 = ~u64::MAX
+    //          → ~u64::MAX >= 1_000_000_000 → TRUE → silently WRITTEN.
+    // Post-B.3: i64::checked_sub(1e9, 2e9) = Some(-1e9), guard `delta >= 0`
+    //          fails → WriteDecision::SkippedOutOfOrder → SKIP + count.
+    let mut s_oo = make_test_state(2);
+    s_oo.timestamp = Some(1_000_000_000);
+    writer.write_snapshot(&s_oo).unwrap();
+
+    // t=3_000_000_000 — written (delta=1s vs 2s anchor since s_oo skipped).
+    let mut s2 = make_test_state(2);
+    s2.timestamp = Some(3_000_000_000);
+    writer.write_snapshot(&s2).unwrap();
+
+    let stats = writer.finish().unwrap();
+
+    assert_eq!(stats.rows_seen, 4, "all 4 snapshots seen");
+    assert_eq!(
+        stats.rows_written, 3,
+        "B.3 fix: t=0 + t=2s + t=3s written; t=1s SKIPPED (out-of-order). \
+         Pre-B.3 would have written all 4 due to wraparound."
+    );
+
+    let ds_stats = stats
+        .downsample
+        .as_ref()
+        .expect("DownsampleStats MUST be Some when config.downsample is configured");
+    assert_eq!(
+        ds_stats.out_of_order_skipped, 1,
+        "B.3 fix: 1 out-of-order snapshot must be COUNTED for operator \
+         observability per HFT-rules §8 (no silent drop)"
+    );
+}
+
+/// B.3 boundary: MinIntervalNs(0) is a LEGITIMATE post-B.3 use case acting
+/// as a "non-decreasing-only filter" — writes every snapshot whose timestamp
+/// is >= last_written_ts (strictly-increasing AND equal-ts), skips only
+/// strictly-decreasing-ts. Documents the new well-defined semantics that
+/// pre-B.3 silently degenerated to "write all" (because (negative) as u64
+/// >= 0 was always true).
+///
+/// Naming note (per B.3 post-impl validator F-3): "non-decreasing" is the
+/// mathematically-precise label (allows duplicates) — distinguishing
+/// MinIntervalNs(0) (writes equal-ts) from MinIntervalNs(1) (skips
+/// equal-ts because delta=0 < min_ns=1). The companion test
+/// `b_3_downsample_min_interval_zero_writes_equal_ts_snapshots` pins
+/// the equal-ts-write semantic explicitly.
+#[test]
+fn b_3_downsample_min_interval_zero_acts_as_non_decreasing_filter() {
+    let tmp = TempDir::new("ds_min_zero_non_decreasing");
+    let path = tmp.file("lob.parquet");
+    let mut config = small_config(2, false);
+    config.batch_size = 128;
+    config.downsample = Some(DownsampleConfig {
+        strategy: DownsampleStrategy::MinIntervalNs(0),
+    });
+
+    let mut writer = LobSnapshotWriter::new(&path, &config, HashMap::new()).unwrap();
+
+    // 3 non-decreasing ts (0, 1, 2) — all written (delta >= 0 ALWAYS true;
+    // min_ns=0 means "any non-negative delta is acceptable").
+    for i in 0u64..3 {
+        let mut s = make_test_state(2);
+        s.timestamp = Some(i as i64);
+        writer.write_snapshot(&s).unwrap();
+    }
+
+    // 1 strictly-decreasing (ts=1 < anchor=2) — SKIP.
+    let mut s_oo = make_test_state(2);
+    s_oo.timestamp = Some(1);
+    writer.write_snapshot(&s_oo).unwrap();
+
+    let stats = writer.finish().unwrap();
+
+    assert_eq!(stats.rows_seen, 4);
+    assert_eq!(
+        stats.rows_written, 3,
+        "MinIntervalNs(0) acts as non-decreasing-only filter post-B.3: \
+         writes 3 non-decreasing, skips 1 strictly-decreasing"
+    );
+    assert_eq!(
+        stats.downsample.as_ref().unwrap().out_of_order_skipped,
+        1,
+        "strictly-decreasing-ts counter must increment under MinIntervalNs(0) \
+         (it does NOT degenerate to DownsampleStrategy::None)"
+    );
+}
+
+/// B.3 sub-boundary (post-validator F-3): explicitly pin the equal-ts
+/// write semantic for `MinIntervalNs(0)` — distinct from `MinIntervalNs(1)`
+/// where equal-ts → SkippedDownsample (delta=0 < 1).
+///
+/// Pre-validator-F-3: this case was implicitly covered by
+/// `b_3_downsample_min_interval_zero_acts_as_non_decreasing_filter` (3
+/// monotonic ts) but never with same-value ts; this test makes the
+/// equal-ts-write case unambiguous so future operators relying on
+/// MinIntervalNs(0) as "monotonic-only" cannot be misled.
+#[test]
+fn b_3_downsample_min_interval_zero_writes_equal_ts_snapshots() {
+    let tmp = TempDir::new("ds_min_zero_equal_ts");
+    let path = tmp.file("lob.parquet");
+    let mut config = small_config(2, false);
+    config.batch_size = 128;
+    config.downsample = Some(DownsampleConfig {
+        strategy: DownsampleStrategy::MinIntervalNs(0),
+    });
+
+    let mut writer = LobSnapshotWriter::new(&path, &config, HashMap::new()).unwrap();
+
+    // 3 snapshots at SAME timestamp (delta=0 each, but >= 0 so written).
+    for _ in 0..3 {
+        let mut s = make_test_state(2);
+        s.timestamp = Some(42);
+        writer.write_snapshot(&s).unwrap();
+    }
+    let stats = writer.finish().unwrap();
+
+    assert_eq!(stats.rows_seen, 3);
+    assert_eq!(
+        stats.rows_written, 3,
+        "MinIntervalNs(0) writes EQUAL-ts snapshots (delta=0, but `delta >= 0` \
+         arm + `(0 as u64) >= 0` both hold). Distinct from MinIntervalNs(1) \
+         where the same input would yield rows_written == 1 (delta=0 < 1 → \
+         SkippedDownsample for the 2nd and 3rd snapshots)."
+    );
+    assert_eq!(
+        stats.downsample.as_ref().unwrap().out_of_order_skipped,
+        0,
+        "Equal-ts is delta=0 (NOT strictly-decreasing); MUST NOT count toward \
+         out_of_order_skipped"
+    );
+}
+
+/// B.3 boundary: equal timestamps with min_ns > 0 → SKIP (delta=0 < min_ns).
+/// Boundary preservation invariant: pre-B.3 and post-B.3 behave identically
+/// here (only out-of-order is changed).
+#[test]
+fn b_3_downsample_min_interval_equal_ts_skips_when_min_ns_positive() {
+    let tmp = TempDir::new("ds_eq_skip");
+    let path = tmp.file("lob.parquet");
+    let mut config = small_config(2, false);
+    config.batch_size = 128;
+    config.downsample = Some(DownsampleConfig {
+        strategy: DownsampleStrategy::MinIntervalNs(1),
+    });
+
+    let mut writer = LobSnapshotWriter::new(&path, &config, HashMap::new()).unwrap();
+    for _ in 0..3 {
+        let mut s = make_test_state(2);
+        s.timestamp = Some(42);
+        writer.write_snapshot(&s).unwrap();
+    }
+    let stats = writer.finish().unwrap();
+
+    assert_eq!(stats.rows_seen, 3);
+    assert_eq!(
+        stats.rows_written, 1,
+        "Only the FIRST equal-ts snapshot is written (anchor None branch); \
+         subsequent equal-ts snapshots have delta=0 < min_ns=1 → SKIP."
+    );
+    assert_eq!(
+        stats.downsample.as_ref().unwrap().out_of_order_skipped,
+        0,
+        "Equal-ts is delta=0 (NOT out-of-order); should NOT count toward \
+         out_of_order_skipped (delta == 0 satisfies `delta >= 0` arm)"
+    );
+}
+
+/// B.3 latent bug C-4 closure: a `None`-timestamp snapshot in the middle
+/// of a stream MUST NOT overwrite the `Some(last_written_ts)` anchor with
+/// `None` (pre-B.3 it did, silently resetting the throttle so the next
+/// snapshot was always written regardless of delta).
+///
+/// Sequence: t=0 (write, anchor=Some(0)), None-ts (write, anchor MUST
+/// remain Some(0) post-B.3), t=500ms with min_ns=1s (post-B.3 SKIP because
+/// delta=500ms<1s; pre-B.3 wrote because anchor was clobbered to None).
+#[test]
+fn b_3_downsample_min_interval_none_timestamp_does_not_overwrite_anchor() {
+    let tmp = TempDir::new("ds_none_ts_anchor");
+    let path = tmp.file("lob.parquet");
+    let mut config = small_config(2, false);
+    config.batch_size = 128;
+    config.downsample = Some(DownsampleConfig {
+        strategy: DownsampleStrategy::MinIntervalNs(1_000_000_000), // 1s
+    });
+
+    let mut writer = LobSnapshotWriter::new(&path, &config, HashMap::new()).unwrap();
+
+    // t=0 — written (None anchor branch). Anchor becomes Some(0).
+    let mut s0 = make_test_state(2);
+    s0.timestamp = Some(0);
+    writer.write_snapshot(&s0).unwrap();
+
+    // None-ts — MinIntervalNs arm hits the `None => return WriteDecision::Write`
+    // early branch, writes the snapshot. Pre-B.3: assigned anchor = None
+    // (overwriting Some(0)). Post-B.3: anchor stays Some(0) because of the
+    // `if state.timestamp.is_some()` guard.
+    let mut s_none = make_test_state(2);
+    s_none.timestamp = None;
+    writer.write_snapshot(&s_none).unwrap();
+
+    // t=500_000_000 — delta vs Some(0) anchor = 500ms < 1s → SKIP.
+    // Pre-B.3 would have WRITTEN here because anchor was clobbered to
+    // None during the previous step (None branch returns Write
+    // unconditionally).
+    let mut s_short = make_test_state(2);
+    s_short.timestamp = Some(500_000_000);
+    writer.write_snapshot(&s_short).unwrap();
+
+    let stats = writer.finish().unwrap();
+
+    assert_eq!(stats.rows_seen, 3, "all 3 snapshots seen");
+    assert_eq!(
+        stats.rows_written, 2,
+        "B.3 C-4 fix: t=0 + None-ts written (2 rows); t=500ms SKIPPED \
+         because the anchor stayed Some(0) during the None-ts write. \
+         Pre-B.3 would have written all 3 (silent downsample-leakage)."
+    );
+}
+
+/// B.3 numerical edge: i64 timestamps near MIN/MAX boundaries do NOT
+/// panic via `checked_sub` overflow. Demonstrates the defensive arm
+/// catches both negative-result AND overflow-None cases.
+#[test]
+fn b_3_downsample_min_interval_extreme_underflow_does_not_panic() {
+    let tmp = TempDir::new("ds_extreme");
+    let path = tmp.file("lob.parquet");
+    let mut config = small_config(2, false);
+    config.batch_size = 128;
+    config.downsample = Some(DownsampleConfig {
+        strategy: DownsampleStrategy::MinIntervalNs(1),
+    });
+
+    let mut writer = LobSnapshotWriter::new(&path, &config, HashMap::new()).unwrap();
+
+    // Anchor at i64::MAX.
+    let mut s_max = make_test_state(2);
+    s_max.timestamp = Some(i64::MAX);
+    writer.write_snapshot(&s_max).unwrap();
+
+    // i64::MIN - i64::MAX overflows i64 — checked_sub returns None →
+    // SkippedOutOfOrder arm. Must NOT panic in either debug or release.
+    let mut s_min = make_test_state(2);
+    s_min.timestamp = Some(i64::MIN);
+    writer.write_snapshot(&s_min).unwrap();
+
+    let stats = writer.finish().unwrap();
+
+    assert_eq!(stats.rows_seen, 2);
+    assert_eq!(
+        stats.rows_written, 1,
+        "Only s_max written; s_min skipped due to overflow → out-of-order arm"
+    );
+    assert_eq!(
+        stats.downsample.as_ref().unwrap().out_of_order_skipped,
+        1,
+        "checked_sub overflow MUST count toward out_of_order_skipped \
+         (defensive arm catches None as well as negative-delta)"
+    );
+}
+
+/// B.3 ParquetExportStats default: when no downsample strategy is
+/// configured, the `downsample` field is `None` (not `Some(default)`).
+/// Locks the contract that operators can use `.is_some()` as a reliable
+/// indicator that the writer was configured with a downsample strategy.
+#[test]
+fn b_3_parquet_export_stats_downsample_is_none_when_no_strategy() {
+    let tmp = TempDir::new("ds_no_strategy");
+    let path = tmp.file("lob.parquet");
+    let config = small_config(2, false); // downsample: None per small_config
+
+    let state = make_test_state(2);
+    let mut writer = LobSnapshotWriter::new(&path, &config, HashMap::new()).unwrap();
+    for _ in 0..3 {
+        writer.write_snapshot(&state).unwrap();
+    }
+    let stats = writer.finish().unwrap();
+
+    assert_eq!(stats.rows_written, 3);
+    assert!(
+        stats.downsample.is_none(),
+        "downsample MUST be None when ExportConfig.downsample is None \
+         (operators rely on .is_some() as a downsample-configured indicator)"
+    );
+}
+
+/// B.3 ParquetExportStats present: when a downsample strategy IS
+/// configured (even with no out-of-order events observed), the
+/// `downsample` field is `Some(DownsampleStats { out_of_order_skipped: 0 })`.
+#[test]
+fn b_3_parquet_export_stats_downsample_is_some_when_strategy_configured() {
+    let tmp = TempDir::new("ds_strategy_configured");
+    let path = tmp.file("lob.parquet");
+    let mut config = small_config(2, false);
+    config.batch_size = 128;
+    config.downsample = Some(DownsampleConfig {
+        strategy: DownsampleStrategy::MinIntervalNs(1),
+    });
+
+    // Single monotonic snapshot — no out-of-order events.
+    let state = make_test_state(2);
+    let mut writer = LobSnapshotWriter::new(&path, &config, HashMap::new()).unwrap();
+    writer.write_snapshot(&state).unwrap();
+    let stats = writer.finish().unwrap();
+
+    let ds_stats = stats
+        .downsample
+        .as_ref()
+        .expect("downsample MUST be Some when ExportConfig.downsample is Some");
+    assert_eq!(
+        ds_stats.out_of_order_skipped, 0,
+        "monotonic input → out_of_order_skipped == 0"
+    );
+}
+
+/// B.3 MboEventWriter: ALWAYS returns `downsample: None` because MBO
+/// events have no downsample strategy (writes every event 1:1).
+/// Prevents the "fake metric" anti-pattern where a writer reports
+/// downsample stats it doesn't actually compute.
+#[test]
+fn b_3_mbo_event_writer_downsample_field_is_always_none() {
+    let tmp = TempDir::new("mbo_downsample_none");
+    let path = tmp.file("mbo.parquet");
+    let config = small_config(2, false);
+
+    let mut writer = MboEventWriter::new(&path, &config, HashMap::new()).unwrap();
+    for _ in 0..5 {
+        writer
+            .write_event(&make_test_msg(Action::Add, Side::Bid))
+            .unwrap();
+    }
+    let stats = writer.finish().unwrap();
+
+    assert_eq!(stats.rows_written, 5);
+    assert!(
+        stats.downsample.is_none(),
+        "MboEventWriter MUST always return downsample: None (no downsample \
+         strategy applies to MBO events; preventing fake-metric anti-pattern)"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Metadata tests
 // ─────────────────────────────────────────────────────────────────────────────
 

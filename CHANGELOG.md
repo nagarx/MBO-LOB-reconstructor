@@ -114,6 +114,155 @@ scheduled separately (Phase O follow-up **F-9** per
   (B-4 in `PHASE_O_VALIDATION_FINDINGS`). Stage E-pre B-2 cross-repo
   E2E integration test (separate Stage E-pre commit) closes this gap.
 
+### Fixed — Phase O Cycle 1: B.3 MinIntervalNs wraparound + DownsampleStats observability (2026-05-03, 1 commit)
+
+Closes the silent-semantic-inversion bug at
+`src/export/lob_writer.rs::should_write` (renamed `write_decision`
+post-B.3) under the `DownsampleStrategy::MinIntervalNs(min_ns)` arm.
+The pre-B.3 expression `(ts - last) as u64 >= *min_ns` cast a negative
+`i64` (when `ts < last`, i.e., out-of-order timestamps) to a near-
+`u64::MAX` value, which is ALWAYS `>= min_ns` for any finite `min_ns`,
+causing out-of-order snapshots to be ALWAYS WRITTEN instead of SKIPPED.
+This is the same defect class as the EveryN(0) silent reinterpretation
+(closed F-034 in Phase M M.A.4) — a downsample-time predicate that
+silently degenerates under out-of-spec input.
+
+Closes the C-4 latent companion bug (surfaced by post-design adversarial
+review): `last_written_ts = state.timestamp` overwrote the throttle
+anchor with `None` when a `None`-timestamp snapshot was written in the
+middle of a stream, silently resetting the throttle so the NEXT
+snapshot was always written regardless of its delta. Post-B.3 the
+anchor only advances when `state.timestamp.is_some()` — a real
+timestamp must back the throttle.
+
+- **B.3** — fix(export): close MinIntervalNs i64→u64 wraparound +
+  surface out-of-order skip counter via DownsampleStats. File scope
+  (5 source + 1 test + this CHANGELOG):
+  - `src/export/mod.rs` — new `DownsampleStats { out_of_order_skipped: u64 }`
+    `#[non_exhaustive]` struct + `ParquetExportStats` extended with
+    `downsample: Option<DownsampleStats>` field + `#[non_exhaustive]`
+    attribute (sibling-policy alignment with the four peer Phase M
+    REV 3 boundary-discipline-aligned types: `LoaderStats`, `LobStats`,
+    `LobStatsExportEnvelope`, `BoundaryError`, plus `TlobError`).
+  - `src/export/lob_writer.rs` — private `WriteDecision` enum
+    (`Write` / `SkippedDownsample` / `SkippedOutOfOrder`) returned from
+    new `write_decision(&self, state) -> WriteDecision` (refactor of
+    `should_write`); `out_of_order_skipped: u64` counter on
+    `LobSnapshotWriter`; `write_snapshot` matches on `WriteDecision`
+    and increments the counter + emits `log::warn!` on
+    `SkippedOutOfOrder`; `last_written_ts` only advances when
+    `state.timestamp.is_some()` (C-4 fix); `finish()` constructs
+    `Some(DownsampleStats { .. })` when `config.downsample.is_some()`,
+    `None` otherwise.
+  - `src/export/mbo_writer.rs` — `finish()` always returns
+    `downsample: None` (MBO events are written 1:1 with no downsample
+    strategy; preventing the "fake metric" anti-pattern where a writer
+    reports counters it doesn't compute).
+  - `src/bin/export_to_parquet.rs` — `DayResult.rows_skipped_out_of_order`
+    field reads `lob_export_stats.downsample.as_ref().map(|d|
+    d.out_of_order_skipped).unwrap_or(0)` per day; aggregator loop sums
+    into `total_rows_skipped_out_of_order: u64`; `_export_summary.json`
+    `rows_skipped` block gains `downsample_out_of_order` key for
+    operator-facing observability per HFT-rules §8 (no silent drops
+    without recording diagnostics).
+  - `tests/export_test.rs` — 9 new regression tests in the Phase O
+    Cycle 1 / B.3 section (after the existing downsample tests):
+    `b_3_downsample_min_interval_out_of_order_skipped_and_counted`
+    (main fix), `b_3_downsample_min_interval_zero_acts_as_non_decreasing_filter`
+    (documents new well-defined `MinIntervalNs(0)` semantics — see
+    DEVIATION below), `b_3_downsample_min_interval_zero_writes_equal_ts_snapshots`
+    (post-validator F-3 sub-boundary: pin equal-ts-write semantic
+    distinct from `MinIntervalNs(1)`),
+    `b_3_downsample_min_interval_equal_ts_skips_when_min_ns_positive`
+    (boundary preservation invariant), `b_3_downsample_min_interval_none_timestamp_does_not_overwrite_anchor`
+    (C-4 latent fix), `b_3_downsample_min_interval_extreme_underflow_does_not_panic`
+    (`i64::MIN` `checked_sub` overflow defensive arm),
+    `b_3_parquet_export_stats_downsample_is_none_when_no_strategy`
+    (Option discriminant), `b_3_parquet_export_stats_downsample_is_some_when_strategy_configured`
+    (Option discriminant inverse), `b_3_mbo_event_writer_downsample_field_is_always_none`
+    (fake-metric prevention).
+
+  **DEVIATION from pre-impl planning agent's recommendation**: the
+  agent recommended rejecting `MinIntervalNs(0)` at
+  `ExportConfig::validate()` for symmetry with `EveryN(0)` (F-034
+  closure). I rejected this recommendation per HFT-rules §0 ("only
+  what the task requires") because the two cases have distinct
+  semantics: `EveryN(0)` is undefined (modulo by zero); `MinIntervalNs(0)`
+  has well-defined post-B.3 semantics (`delta >= 0` arm: writes all
+  NON-DECREASING ts including equal-ts; skips only strictly-
+  decreasing-ts — a legitimate "non-decreasing-only filter" use case
+  unlocked by B.3). The new tests
+  `b_3_downsample_min_interval_zero_acts_as_non_decreasing_filter`
+  + `b_3_downsample_min_interval_zero_writes_equal_ts_snapshots`
+  document the use case so future operators can rely on the
+  semantics. Pre-B.3, `MinIntervalNs(0)` silently degenerated to
+  "write all" because `(negative) as u64 >= 0` was always true; that
+  was a bug, not a feature.
+
+  **Naming precision (per B.3 post-impl validator F-3)**: "non-
+  decreasing" is the mathematically-correct label (allows equal-ts
+  duplicates; only strictly-decreasing-ts is rejected). "Monotonic"
+  alone is ambiguous — it can mean either non-decreasing OR strictly-
+  increasing depending on context. CHANGELOG, test names, and test
+  docstrings all use "non-decreasing" for `MinIntervalNs(0)` and
+  document the equal-ts vs strictly-decreasing distinction.
+
+  **Bit-exact preservation invariant**: GOLDEN_HASH_SEQUENCES_NPY
+  (`0x8bebad9b09b564cd`) and GOLDEN_HASH_LABELS_NPY
+  (`0x5dcf907068fcadcc`) UNCHANGED across B.3. The hashes are golden
+  fixtures of the sibling `feature-extractor-MBO-LOB`'s NPY export
+  pipeline (1D event-loop tests with monotonic synthetic timestamps);
+  B.3 changes Parquet-export downsample behavior under MinIntervalNs
+  on out-of-order timestamps, which the golden fixtures never exercise
+  (synthetic-fixture argument: monotonic-only fixtures make the
+  out-of-order branch a structural no-op).
+
+  **`PRODUCER_DIAGNOSTICS_SCHEMA_VERSION` UNCHANGED at 2.9.0**: B.3
+  introduces new producer-side diagnostic counters (`DownsampleStats`
+  + `_export_summary.json` `downsample_out_of_order` key) but these
+  are reconstructor-internal Parquet-export observability, NOT part
+  of the sibling extractor's `_diagnostics.json` schema (the schema
+  version that gates cross-repo wire format). Phase L set the
+  precedent: wire-format-invariant changes to producer-internal types
+  do not bump the diagnostics schema version (Phase L stayed at 2.6.0;
+  B.3 stays at 2.9.0).
+
+  **`#[non_exhaustive]` on `ParquetExportStats`**: prophylactic — at
+  the time of writing, no out-of-crate `ParquetExportStats { ... }`
+  struct-literal constructors exist (verified by grep across all 7
+  sibling repos). Adding `#[non_exhaustive]` ensures future field
+  additions remain non-breaking by construction; matches the Phase M
+  REV 3 sibling-policy alignment.
+
+  **Test count delta**: reconstructor 391 → **400** (+9, all
+  passing — 8 initial B.3 tests + 1 post-validator F-3 sub-boundary
+  test for `MinIntervalNs(0)` equal-ts semantic). Lib tests +
+  integration tests unchanged at 307 + 92.
+
+  **Adversarial validation cycle**:
+  - Pre-implementation: parallel adversarial Plan agent (B.3 design
+    challenge) → 15-angle audit → SHIP-WITH-MODIFICATIONS verdict
+    with 10 mandatory items: WriteDecision enum (A-1, applied),
+    `#[non_exhaustive]` on ParquetExportStats (C-2, applied), drop
+    `debug_assert!(false)` (D-1, applied — using `log::warn!`
+    instead), Option<DownsampleStats> sub-struct (D-5, applied),
+    C-4 latent fix (applied), `_export_summary.json` wiring (X-1,
+    applied), `MinIntervalNs(0)` rejection (D-7, REJECTED — see
+    DEVIATION rationale above), 9 specific tests (8 applied, 1
+    deferred per DEVIATION).
+  - Post-implementation: standard quality-gate cascade.
+
+  **Phase O follow-ups deferred to Phase P** (per pre-impl agent's
+  scope-discipline triage):
+  - `OnOutOfOrderTimestamp::{Skip, Write, Error}` policy enum
+    (operator opt-in for legacy "write everything including out-of-
+    order" behavior) — separate cycle; current Skip-default is
+    appropriate per HFT-rules §3 monotonic-timestamp invariant.
+  - `decompressed_path_for` basename-collision class (silent data-
+    substitution bug between different compressed sources mapping to
+    same basename) — Phase P task.
+  - At-startup orphan `.tmp*` sweep — Phase P operational task.
+
 ## [0.2.0] — 2026-04-30
 
 Phase M REV 3 — Boundary Discipline Cycle. Closes 12 findings sharing

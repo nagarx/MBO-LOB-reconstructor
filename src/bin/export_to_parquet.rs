@@ -344,6 +344,15 @@ struct DayResult {
     /// `iter_messages()` API or skipped via `skip_invalid(true)`; the typed
     /// iterator surfaces them per-message so we can count them here.
     rows_skipped_decode_or_convert: u64,
+    /// Snapshots skipped due to non-monotonic (out-of-order) timestamps
+    /// under [`mbo_lob_reconstructor::export::DownsampleStrategy::MinIntervalNs`].
+    /// Phase O Cycle 1 / B.3: pre-B.3 these were silently WRITTEN due to
+    /// `(ts - last) as u64` casting negative `i64` to `~u64::MAX`; post-B.3
+    /// the writer's `out_of_order_skipped` counter (surfaced via
+    /// `ParquetExportStats.downsample.out_of_order_skipped`) feeds this
+    /// per-day field. `0` for days where no downsample strategy was
+    /// configured OR the input stream was monotonic.
+    rows_skipped_out_of_order: u64,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -526,6 +535,15 @@ fn process_day(
     }
 
     let lob_export_stats = lob_writer.finish()?;
+    // Phase O Cycle 1 / B.3: surface MinIntervalNs out-of-order skip
+    // count from the writer's DownsampleStats. `0` when no downsample
+    // strategy was configured (DownsampleStats == None) OR no out-of-
+    // order timestamps were observed (out_of_order_skipped == 0).
+    let rows_skipped_out_of_order = lob_export_stats
+        .downsample
+        .as_ref()
+        .map(|d| d.out_of_order_skipped)
+        .unwrap_or(0);
     let mbo_rows = if let Some(mw) = mbo_writer {
         let stats = mw.finish()?;
         stats.rows_written
@@ -552,6 +570,7 @@ fn process_day(
         rows_skipped_other,
         rows_skipped_invalid_state,
         rows_skipped_decode_or_convert,
+        rows_skipped_out_of_order,
     })
 }
 
@@ -579,6 +598,11 @@ struct ExportSummary<'a> {
     total_rows_skipped_other: u64,
     total_rows_skipped_invalid_state: u64,
     total_rows_skipped_decode_or_convert: u64,
+    /// Phase O Cycle 1 / B.3: aggregate per-day out-of-order-skip counts
+    /// summed across all days. Non-zero indicates upstream non-monotonic
+    /// timestamp issues in at least one day's input stream (HFT-rules §3
+    /// monotonic-timestamp invariant + §8 explicit-counter discipline).
+    total_rows_skipped_out_of_order: u64,
 }
 
 fn write_export_summary(s: &ExportSummary<'_>) {
@@ -599,6 +623,11 @@ fn write_export_summary(s: &ExportSummary<'_>) {
             "other_lob_error": s.total_rows_skipped_other,
             "invalid_state_after_ok": s.total_rows_skipped_invalid_state,
             "decode_or_convert_error": s.total_rows_skipped_decode_or_convert,
+            // Phase O Cycle 1 / B.3: out-of-order timestamp skips under
+            // DownsampleStrategy::MinIntervalNs. Should be 0 in normal
+            // operation; non-zero indicates upstream non-monotonic
+            // timestamps requiring source-data audit.
+            "downsample_out_of_order": s.total_rows_skipped_out_of_order,
         },
         "source": "mbo-lob-reconstructor",
         "version": env!("CARGO_PKG_VERSION"),
@@ -718,6 +747,9 @@ fn main() {
     let mut total_rows_skipped_other: u64 = 0;
     let mut total_rows_skipped_invalid_state: u64 = 0;
     let mut total_rows_skipped_decode_or_convert: u64 = 0;
+    // Phase O Cycle 1 / B.3: out-of-order downsample-skip accumulator
+    // (per-day rows_skipped_out_of_order summed across all days).
+    let mut total_rows_skipped_out_of_order: u64 = 0;
 
     for (i, file) in files.iter().enumerate() {
         let day_num = i + 1;
@@ -747,6 +779,7 @@ fn main() {
                 total_rows_skipped_other += result.rows_skipped_other;
                 total_rows_skipped_invalid_state += result.rows_skipped_invalid_state;
                 total_rows_skipped_decode_or_convert += result.rows_skipped_decode_or_convert;
+                total_rows_skipped_out_of_order += result.rows_skipped_out_of_order;
                 day_times.push(result.elapsed_secs);
 
                 let throughput = result.messages as f64 / result.elapsed_secs.max(0.001);
@@ -812,6 +845,7 @@ fn main() {
         total_rows_skipped_other,
         total_rows_skipped_invalid_state,
         total_rows_skipped_decode_or_convert,
+        total_rows_skipped_out_of_order,
     });
 
     if errors > 0 {

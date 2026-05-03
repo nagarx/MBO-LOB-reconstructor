@@ -118,6 +118,11 @@ impl MboEventWriter {
             rows_written: self.rows_written,
             rows_seen: self.rows_written,
             row_groups: self.row_groups,
+            // Phase O Cycle 1 / B.3: MboEventWriter has no downsample
+            // strategy (writes every event 1:1), so DownsampleStats is
+            // always None. Per ParquetExportStats doc: `None` for
+            // writers without downsample.
+            downsample: None,
         })
     }
 
