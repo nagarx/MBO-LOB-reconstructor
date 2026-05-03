@@ -1178,7 +1178,13 @@ mod tests {
         // decompress_zstd returns Ok(0) but the resulting file is
         // empty — pre-B.4 would have silently returned the zero-byte
         // path; post-B.4 the metadata().len() == 0 check fails loud.
-        let mut encoder =
+        // `encoder` is bound non-mutably because no write_all() call
+        // precedes finish() — finish() consumes self by value, no
+        // mutation occurs (B.4 post-impl validator MED-1 closure;
+        // sibling concurrent_* tests at the same scope correctly use
+        // `let mut encoder` because they DO call write_all() before
+        // finish, which takes &mut self).
+        let encoder =
             zstd::stream::write::Encoder::new(File::create(&compressed_path).unwrap(), 0).unwrap();
         // No write_all() call — just finish to emit an empty frame.
         encoder.finish().unwrap();
