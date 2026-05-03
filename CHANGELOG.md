@@ -7,6 +7,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Phase O Cycle 1 (2026-05-03, 2 commits + this docs sweep)
+
+**Producer-side correctness cycle** — closes the Action::Clear silent-
+passthrough class (NEW-AUDIT-A3 / FIND-NEW-6 follow-up) that was
+DEFERRED from Phase K K.5 and previously documented in the sibling
+`feature-extractor-MBO-LOB` repo's CLAUDE.md / EXPORT_INDEX.md /
+diagnostics.rs as "remains OPEN — out of K.5 scope" at the (phantom)
+`adapters.rs:123` location. Plan + per-commit ship-ledger at
+`/Users/knight/.claude/plans/spicy-tickling-mist.md` §"Phase O".
+
+- **B.1** `29a3c96` — fix(export): single source of truth for
+  `LobBatch::push` `level_count` column. Pre-B.1 the metadata-data
+  twin tuple at adjacent sites in `src/export/batch.rs` read
+  `level_count` from BOTH `state.levels.min(MAX_LOB_LEVELS)` (capped)
+  AND `self.levels` (per-file invariant); on heterogeneous-`LobState`
+  pushes the twin pair could silently desync. Post-fix: single read of
+  `self.levels` at both sites + `debug_assert_eq!(state.levels,
+  self.levels)` defense-in-depth in test/dev builds. Schema docstring
+  at `src/export/schema.rs` updated documenting the per-file invariant.
+  +3 regression tests (`b1_level_count_uniform_under_homogeneous_pushes`,
+  `b1_debug_assert_fires_on_heterogeneous_state_levels` (test only),
+  `b1_metadata_data_pair_consistent_post_fix`).
+
+- **B.2a** `90b0966` — fix(lob): exempt `Action::Clear` from the inner
+  `is_system_message()` filter at `src/lob/reconstructor.rs:1179` AND
+  from `validate_message` at `:1206`. Pre-B.2a default-config callers
+  (`LobConfig::skip_system_messages = true` — DEFAULT) silently swallowed
+  every real-data `Action::Clear` message because Clear messages match
+  the `is_system_message()` predicate (zero `order_id`/`size`/`price`
+  by structural definition). The Clear handler at the
+  `Action::Clear` arm of `process_message_into`'s match dispatch was
+  thus UNREACHABLE under default config; book never reset on
+  session-boundary Clear messages → `LobStats::book_clears` permanently
+  shadowed at zero → stale orders persisted across session breaks →
+  consumer features silently corrupt for the post-Clear segment of
+  every Clear-bearing trading day. Fix exempts Clear specifically
+  (other zero-field messages still filtered as heartbeats per
+  documented `WARNINGS.md` § BOOK_CLEARED behavior; `Action::None`
+  intentionally NOT exempted per `types.rs:48` "no-op action [that]
+  may carry flags or other information"). +1 regression test
+  (`b2a_action_clear_works_under_default_config`) verifying default-
+  config Clear pass-through; pre-existing `test_clear_resets_book`
+  using `with_skip_system_messages(false)` workaround retained as
+  audit-pointer regression guard.
+
+  Companion fix in extractor `feature-extractor-MBO-LOB` commit
+  `ab52176` (B.2b) exempts Clear from the OUTER filter at
+  `crates/hft-extractor/src/pipeline.rs:273`. Together: `Action::Clear`
+  now flows through both filter layers → reconstructor's Clear handler
+  fires → `self.reset()` clears the book → downstream features reflect
+  the post-Clear empty book correctly.
+
+  **Mid-cycle 6-agent adversarial validation**
+  (`/Users/knight/code_local/HFT-pipeline-v2/PHASE_O_VALIDATION_FINDINGS_2026_05_03.md`)
+  surfaced 9 BLOCKING items + 9 follow-up items. This commit (B-1
+  reconstructor docs sweep) is one of the Stage E-pre BLOCKING items
+  the validation surfaced.
+
+### Changed — User-visible behavior shift (default-config callers)
+
+**Default `LobConfig` semantic restoration** (B.2a): pre-B.2a callers
+using `LobConfig::default()` (which sets `skip_system_messages = true`)
+experienced silent book-state corruption on any trading day containing
+real-data `Action::Clear` messages (mid-session halts, session
+transitions, exchange system resets, end-of-day clears). The book was
+never reset on these messages because the inner `is_system_message()`
+filter at `src/lob/reconstructor.rs:1177-1180` swallowed them BEFORE the
+`Action::Clear` arm of the match dispatch (lines 1216-1227 post-B.2a)
+could run.
+
+Post-B.2a: under default `LobConfig`, `Action::Clear` messages now reach
+the Clear handler and trigger `self.reset()` as the docstring at
+`src/lob/reconstructor.rs::process_message_into` and `WARNINGS.md`
+§ BOOK_CLEARED have always documented. This is a CORRECTNESS RESTORATION
+— pre-existing tests using `LobConfig::with_skip_system_messages(false)`
+(non-default workaround) were the only ones that exercised the Clear
+handler path on real data; default-config callers had a silent regression
+that this commit closes.
+
+**Operator-impact note**: any pre-B.2a NPY exports (produced by the
+sibling `feature-extractor-MBO-LOB` consumer) of trading days containing
+`Action::Clear` messages have silently corrupt book state for the
+post-Clear segment. A two-class corpus inventory + remediation plan is
+scheduled separately (Phase O follow-up **F-9** per
+`PHASE_O_VALIDATION_FINDINGS_2026_05_03.md` §"FOLLOW-UP Items").
+
+### Notes
+
+- `LobStats::book_clears` field was UNCHANGED by B.2a — the counter's
+  pre-B.2a permanent zero was a downstream symptom of the silent-filter
+  bug, not a counter-side issue. Post-B.2a the counter increments
+  correctly per Clear message that reaches the handler.
+- Bit-exact preservation re-verified by sibling extractor's golden
+  hashes `GOLDEN_HASH_SEQUENCES_NPY = 0x8bebad9b09b564cd` +
+  `GOLDEN_HASH_LABELS_NPY = 0x5dcf907068fcadcc` UNCHANGED across B.1 +
+  B.2a (synthetic-fixture argument: zero-Clear-message fixtures make
+  B.2a exemption a structural no-op).
+- Cycle 1 close push will tag this as `v0.2.1` and the extractor will
+  bump its `Cargo.toml:35` pin from `tag = "v0.2.0"` to
+  `tag = "v0.2.1"` per the standard 5-repo atomic-coordinated cross-repo
+  pattern. Pre-push extractor CI on its own HEAD currently tests
+  against OLD `v0.2.0` (which does NOT contain B.1 or B.2a); end-to-end
+  Clear-handling correctness verified locally but the cross-repo CI
+  Green Badge does NOT prove it until the cycle-close push completes
+  (B-4 in `PHASE_O_VALIDATION_FINDINGS`). Stage E-pre B-2 cross-repo
+  E2E integration test (separate Stage E-pre commit) closes this gap.
+
 ## [0.2.0] — 2026-04-30
 
 Phase M REV 3 — Boundary Discipline Cycle. Closes 12 findings sharing
