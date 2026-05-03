@@ -2183,6 +2183,84 @@ mod tests {
         );
     }
 
+    /// Phase O Cycle 1 / B.3 (post-impl validator Agent 3 GAP 1 closure):
+    /// `full_reset()` MUST zero the `book_clears` counter alongside all
+    /// other `LobStats` fields. This is the cross-day reset semantic
+    /// invariant — at start-of-new-day, `LobReconstructor::full_reset()`
+    /// is called per root CLAUDE.md "Cross-day state (reconstructor):
+    /// Use `full_reset()` — NOT `reset()`. `reset()` preserves stats
+    /// (intentional for mid-session `Action::Clear`); using `reset()`
+    /// between days produces stale statistics **silently**."
+    ///
+    /// This test locks the contract that day-N+1's `_diagnostics.json`
+    /// sidecar reports `lob.book_clears.count` for day-N+1's actual
+    /// Clear messages, NOT carrying forward day-N's count. Without
+    /// this regression-lock, a future refactor adding a new
+    /// `LobStats` field that misses the `LobStats::default()` reset
+    /// path would silently leak per-day counter state across the
+    /// day boundary.
+    ///
+    /// Companion to b2a_action_clear_works_under_default_config above
+    /// (same Phase O Cycle 1 / B.2a + B-3 work cluster); together they
+    /// verify the full Clear handler chain: filter exemption →
+    /// counter increment → wire-into-sidecar → cross-day reset.
+    #[test]
+    fn b3_full_reset_zeroes_book_clears_for_cross_day_invariant() {
+        let mut lob = LobReconstructor::new(10);
+
+        // Day-N: process Add messages + 1 Clear → book_clears == 1
+        lob.process_message(&create_test_message(1, Action::Add, Side::Bid, 100.0, 100))
+            .unwrap();
+        lob.process_message(&create_test_message(2, Action::Add, Side::Ask, 100.01, 200))
+            .unwrap();
+        let clear_msg = MboMessage::new(0, Action::Clear, Side::None, 0, 0);
+        lob.process_message(&clear_msg).unwrap();
+
+        assert_eq!(
+            lob.stats().book_clears,
+            1,
+            "post-Clear: counter incremented (B.2a + B-3 chain pre-condition)"
+        );
+        assert_eq!(
+            lob.order_count(),
+            0,
+            "post-Clear: book reset (B.2a Clear handler fired)"
+        );
+
+        // Cross-day boundary: full_reset() called between days per root
+        // CLAUDE.md cross-day-state design constraint.
+        lob.full_reset();
+
+        // B.3 post-impl validator Agent 3 GAP 1: book_clears MUST be
+        // zeroed by full_reset() (via stats = LobStats::default()).
+        assert_eq!(
+            lob.stats().book_clears,
+            0,
+            "B.3 cross-day invariant: full_reset() MUST zero book_clears \
+             (verified via stats = LobStats::default() at reconstructor.rs:1383). \
+             Without this, day-N+1's _diagnostics.json::lob.book_clears.count \
+             would silently carry forward day-N's count, corrupting per-day \
+             observability + breaking the cross-counter invariant documented \
+             at hft-feature-contract::aggregator_names.rs:145-149."
+        );
+        // Defense-in-depth: verify ALL key counters zeroed by full_reset.
+        assert_eq!(lob.stats().messages_processed, 0);
+        assert_eq!(lob.stats().system_messages_skipped, 0);
+        assert_eq!(lob.stats().crossed_quotes, 0);
+        // Book also reset (reset() called by full_reset() per :1382).
+        assert_eq!(lob.order_count(), 0);
+
+        // Day-N+1: process 1 Clear → book_clears == 1 (NOT 2 — this is
+        // the load-bearing assertion that day-N+1 starts fresh).
+        lob.process_message(&clear_msg).unwrap();
+        assert_eq!(
+            lob.stats().book_clears,
+            1,
+            "B.3 cross-day: day-N+1's first Clear must produce book_clears=1, \
+             NOT 2 (which would indicate day-N count leaked across full_reset)."
+        );
+    }
+
     /// B.2a sanity: pre-existing `test_clear_resets_book` workaround
     /// (with_skip_system_messages(false) + with_validation(false)) STILL
     /// works post-B.2a. Locks that B.2a doesn't break the
