@@ -6,7 +6,7 @@ Primary technical reference for LLM coders. Every claim verified against source 
 
 ## 1. Overview
 
-**mbo-lob-reconstructor** v0.2.0 (Rust edition 2021, MSRV 1.82) converts Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshots. It is the foundation of the HFT pipeline, consumed directly by `feature-extractor-MBO-LOB` (which depends on it via `.cargo/config.toml` path override).
+**mbo-lob-reconstructor** v0.2.0 (Rust edition 2021, MSRV 1.82) converts Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshots. It is the order-book ingestion front-end of the **intraday trading research pipeline** (origin: HFT microstructure; names historical, mission now general — see root `CLAUDE.md` §Research Scope & Charter), consumed directly by `feature-extractor-MBO-LOB` (which depends on it via `.cargo/config.toml` path override).
 
 The crate provides:
 

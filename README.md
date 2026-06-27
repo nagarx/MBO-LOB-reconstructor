@@ -7,6 +7,8 @@ High-performance MBO to LOB reconstruction and analytics for deep learning prepr
 
 Convert Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshots with enriched analytics, designed specifically as a preprocessing step for deep learning models (DeepLOB, TLOB, Transformers, CNN-LSTM, etc.).
 
+> **Pipeline scope (2026-06-02).** This module is part of an **intraday trading research pipeline** — an experiment-first platform for discovering and validating *any* profitable **intraday** trading edge (no overnight positions), across approach classes (microstructure/HFT, scalping, intraday momentum, intraday statistical arbitrage, …) and instruments (equities, futures, same-day options). The pipeline *originated* as a high-frequency NVDA MBO/LOB microstructure system — that origin explains the "HFT" / "LOB" / "MBO" naming here — and that microstructure-direction program is now one (largely-closed) track among many. **Names are historical; the mission is general.** This module's role: the Rust ingestion front-end — reconstructs limit-order-book state (`LobState`) from raw Market-By-Order `.dbn.zst` events (~1M msg/s, BBO 99.17%); the order-book source feeding feature extraction. For the full mission + approach taxonomy + capability-readiness boundary, see root `CLAUDE.md` §Research Scope & Charter (+ `CROSS_ASSET_OFI_FINDINGS_AND_ISSUES_2026_06_01.md` §9).
+
 ## Features
 
 - **High Performance**: Process approximately 1M messages/second on modern hardware
