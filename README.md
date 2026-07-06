@@ -419,7 +419,7 @@ See `src/export/schema.rs` for the authoritative column definitions.
 mbo_lob_reconstructor/
     lib.rs            # Crate root: module declarations, feature gates, re-exports
     types.rs          # Core types: MboMessage, LobState, Action, Side, MAX_LOB_LEVELS
-    error.rs          # Error types (TlobError, 12 variants) and Result alias
+    error.rs          # Error types (TlobError, 13 variants) and Result alias
     constants.rs      # Domain constants: NANODOLLARS_PER_DOLLAR, NS_PER_SECOND, BASIS_POINTS_PER_UNIT, etc.
     lob/
         mod.rs              # LOB module hub, re-exports

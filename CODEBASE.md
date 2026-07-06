@@ -120,7 +120,7 @@ src/
 |--------|---------------|-----------|
 | `types` | Data structures, no logic | `MboMessage`, `LobState`, `Action`, `Side`, `Order`, `BookConsistency`, `MAX_LOB_LEVELS` |
 | `constants` | Domain constants (10 total: prices, time, precision) | `NANODOLLARS_PER_DOLLAR`, `NANODOLLARS_PER_DOLLAR_F64`, `BASIS_POINTS_PER_UNIT`, `DIVISION_GUARD_EPS`, `NS_PER_MILLISECOND`, `NS_PER_SECOND`, `NS_PER_SECOND_F64`, `NS_PER_MINUTE`, `NS_PER_HOUR`, `NS_PER_DAY` |
-| `error` | Error definitions (12 variants) | `TlobError`, `Result<T>` |
+| `error` | Error definitions (13 variants) | `TlobError`, `Result<T>` |
 | `lob/reconstructor` | Core LOB reconstruction | `LobReconstructor`, `LobConfig`, `LobStats`, `CrossedQuotePolicy` |
 | `lob/price_level` | Price level with cached size | `PriceLevel` (O(1) aggregate size) |
 | `lob/multi_symbol` | Multi-stock management | `MultiSymbolLob` |
@@ -534,6 +534,7 @@ pub enum TlobError {
     OrderNotFound(u64),        // Operation on missing order
     InvalidPrice(i64),         // price <= 0
     InvalidSize(u32),          // size == 0
+    InvalidTimestamp(i64),     // ts_event <= 0 or u64->i64 overflow (M.A.6 F-023)
     InvalidAction(u8),         // Unknown action byte
     InvalidSide(u8),           // Unknown side byte
     SymbolNotFound(String),    // Multi-symbol: unknown symbol
@@ -1289,5 +1290,5 @@ ExportConfig {
 ---
 
 *Last updated: 2026-04-30 (post Phase M REV 3 — Boundary Discipline cycle)*
-*Crate version: 0.2.0*
+*Crate version: 0.2.1*
 

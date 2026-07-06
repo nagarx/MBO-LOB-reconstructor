@@ -6,7 +6,7 @@ Primary technical reference for LLM coders. Every claim verified against source 
 
 ## 1. Overview
 
-**mbo-lob-reconstructor** v0.2.0 (Rust edition 2021, MSRV 1.82) converts Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshots. It is the order-book ingestion front-end of the **intraday trading research pipeline** (origin: HFT microstructure; names historical, mission now general — see root `CLAUDE.md` §Research Scope & Charter), consumed directly by `feature-extractor-MBO-LOB` (which depends on it via `.cargo/config.toml` path override).
+**mbo-lob-reconstructor** v0.2.1 (Rust edition 2021, MSRV 1.82) converts Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshots. It is the order-book ingestion front-end of the **intraday trading research pipeline** (origin: HFT microstructure; names historical, mission now general — see root `CLAUDE.md` §Research Scope & Charter), consumed directly by `feature-extractor-MBO-LOB` (which depends on it via `.cargo/config.toml` path override).
 
 The crate provides:
 
@@ -105,7 +105,7 @@ All trackers are composable: each consumes `MboMessage` independently and can be
 | `src/lib.rs` | 242 | Crate root; module declarations, feature gates, re-exports | -- |
 | `src/types.rs` | 1377 | Core data types: messages, book state, enums | `MboMessage`, `LobState`, `Action`, `Side`, `BookConsistency`, `Order`, `MAX_LOB_LEVELS` |
 | `src/constants.rs` | 104 | Named domain constants with citations | All 10 constants (see Section 12) |
-| `src/error.rs` | 103 | Error types using `thiserror` | `TlobError` (12 variants), `Result<T>` |
+| `src/error.rs` | 103 | Error types using `thiserror` | `TlobError` (13 variants), `Result<T>` |
 | `src/source.rs` | 598 | Data source abstraction trait | `MarketDataSource` (trait), `SourceMetadata`, `VecSource`, `DbnSource` [databento] |
 | `src/statistics.rs` | 826 | Running stats (Welford), day stats, normalization params | `RunningStats`, `DayStats`, `NormalizationParams` |
 | `src/analytics.rs` | 566 | Advanced analytics: depth, impact, liquidity | `DepthStats`, `MarketImpact`, `LiquidityMetrics` |
@@ -116,7 +116,7 @@ All trackers are composable: each consumes `MboMessage` independently and can be
 | File | Lines | Purpose | Key Public Types |
 |------|-------|---------|-----------------|
 | `src/lob/mod.rs` | 100 | Module declarations and re-exports | -- |
-| `src/lob/reconstructor.rs` | 2557 | Single-symbol LOB reconstruction engine | `LobReconstructor`, `LobConfig`, `LobStats`, `CrossedQuotePolicy` |
+| `src/lob/reconstructor.rs` | 3293 | Single-symbol LOB reconstruction engine | `LobReconstructor`, `LobConfig`, `LobStats`, `CrossedQuotePolicy` |
 | `src/lob/price_level.rs` | 430 | Orders at a price with O(1) cached total_size | `PriceLevel` |
 | `src/lob/queue_position.rs` | 1683 | FIFO queue position tracking | `QueuePositionTracker`, `QueuePositionConfig`, `QueuePositionInfo`, `PositionChange`, `PositionChangeReason`, `QueueStats` |
 | `src/lob/order_lifecycle.rs` | 1637 | Order lifecycle Add->Modify->Cancel/Fill | `OrderLifecycleTracker`, `OrderLifecycleConfig`, `OrderLifecycle`, `LifecycleEvent`, `LifecycleStats`, `OrderOrigin`, `TerminalState`, `OrderModification`, `ActiveOrderFeatures`, `CompletionStats` |
@@ -345,7 +345,7 @@ Preset: `dbn_defaults(dir)` sets `.dbn.zst` -> `.dbn`.
 
 ### Stats Structs
 
-**LobStats** (`src/lob/reconstructor.rs`) -- 17 fields:
+**LobStats** (`src/lob/reconstructor.rs`) -- 18 fields:
 
 ```
 pub struct LobStats {
@@ -354,7 +354,6 @@ pub struct LobStats {
     pub active_orders: usize,
     pub bid_levels: usize,
     pub ask_levels: usize,
-    pub errors: u64,
     pub crossed_quotes: u64,
     pub locked_quotes: u64,
     pub last_timestamp: Option<i64>,
@@ -365,6 +364,9 @@ pub struct LobStats {
     pub trade_order_not_found: u64,
     pub trade_price_level_missing: u64,
     pub trade_order_at_level_missing: u64,
+    // Fall-through observability counters (Phase M M.A.4, F-013):
+    pub modify_order_not_found: u64,
+    pub add_order_id_collision: u64,
     // Additional:
     pub book_clears: u64,
     pub noop_messages: u64,
@@ -577,7 +579,7 @@ Validation rules include: levels in [1, 20], max_warnings > 0, batch_size > 0, a
 
 ## 9. Error Handling
 
-**`TlobError`** (`src/error.rs`) -- 12 variants:
+**`TlobError`** (`src/error.rs`) -- 13 variants:
 
 | Variant | Payload | Category |
 |---------|---------|----------|
@@ -585,6 +587,7 @@ Validation rules include: levels in [1, 20], max_warnings > 0, batch_size > 0, a
 | `OrderNotFound(u64)` | order_id | Hard |
 | `InvalidPrice(i64)` | price | Hard (validation) |
 | `InvalidSize(u32)` | size | Hard (validation) |
+| `InvalidTimestamp(i64)` | timestamp | Hard (decode) — DBN ts_event ≤ 0 / u64→i64 overflow (M.A.6 F-023) |
 | `InvalidAction(u8)` | byte | Hard (decode) |
 | `InvalidSide(u8)` | byte | Hard (decode) |
 | `SymbolNotFound(String)` | symbol | Hard (multi-symbol) |
