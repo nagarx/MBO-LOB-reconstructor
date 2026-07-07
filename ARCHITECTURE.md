@@ -1,6 +1,6 @@
 # ARCHITECTURE.md -- MBO-LOB-Reconstructor
 
-Primary technical reference for LLM coders. Every claim verified against source code as of 2026-04-30 (post Phase M REV 3 — Boundary Discipline cycle).
+Primary technical reference for LLM coders. Baseline: every claim verified against source code as of 2026-04-30 (post Phase M REV 3 — Boundary Discipline cycle). Partial re-verification 2026-07-07 (Phase-2 doc-truth pass — §2 Feature Flags, §3 Ingestion APIs, §4 Module Map; `src/` unchanged since 2026-05-03): sections not named there carry the 2026-04-30 baseline.
 
 ---
 
@@ -26,7 +26,8 @@ Defined in `Cargo.toml`:
 
 | Feature | Default | Gates | Dependencies |
 |---------|---------|-------|--------------|
-| `databento` | Yes | `loader.rs`, `hotstore.rs`, `dbn_bridge.rs`, `DbnSource` in `source.rs` | `dbn` (git tag v0.20.0), `zstd` 0.13 |
+| `databento` | Yes | `loader/`, `hotstore.rs`, `dbn_bridge.rs`, `DbnSource` in `source.rs` | `dbn` (git tag v0.20.0), `zstd` 0.13 |
+| `legacy-iterator-api` | Yes | The **deprecated** legacy untyped ingestion API (`iter_messages()` / `MessageIterator` + the legacy read-all/count helpers), all `#[deprecated]`. Removal scheduled for the next MAJOR (0.3.0; calendar 2026-10-29) — new code uses `iter_messages_typed()` (see §3 Ingestion APIs) | implies `databento` |
 | `export` | No | `export/` module (mod.rs, schema.rs, lob_writer.rs, mbo_writer.rs, batch.rs) | `arrow` 55, `parquet` 55, `toml` 0.8 |
 
 Build without Databento: `cargo build --no-default-features`
@@ -109,57 +110,57 @@ Two ingestion entry points read MBO into the pipeline; they are **not interchang
 
 ### Core Library
 
-| File | Lines | Purpose | Key Public Types |
-|------|-------|---------|-----------------|
-| `src/lib.rs` | 242 | Crate root; module declarations, feature gates, re-exports | -- |
-| `src/types.rs` | 1377 | Core data types: messages, book state, enums | `MboMessage`, `LobState`, `Action`, `Side`, `BookConsistency`, `Order`, `MAX_LOB_LEVELS` |
-| `src/constants.rs` | 104 | Named domain constants with citations | All 10 constants (see Section 12) |
-| `src/error.rs` | 103 | Error types using `thiserror` | `TlobError` (13 variants), `Result<T>` |
-| `src/source.rs` | 598 | Data source abstraction trait | `MarketDataSource` (trait), `SourceMetadata`, `VecSource`, `DbnSource` [databento] |
-| `src/statistics.rs` | 826 | Running stats (Welford), day stats, normalization params | `RunningStats`, `DayStats`, `NormalizationParams` |
-| `src/analytics.rs` | 566 | Advanced analytics: depth, impact, liquidity | `DepthStats`, `MarketImpact`, `LiquidityMetrics` |
-| `src/warnings.rs` | 717 | Warning tracking with categories and deduplication | `WarningTracker`, `Warning`, `WarningCategory`, `WarningSummary`, `WarningTrackerConfig` |
+| File | Purpose | Key Public Types |
+|------|---------|-----------------|
+| `src/lib.rs` | Crate root; module declarations, feature gates, re-exports | -- |
+| `src/types.rs` | Core data types: messages, book state, enums | `MboMessage`, `LobState`, `Action`, `Side`, `BookConsistency`, `Order`, `MAX_LOB_LEVELS` |
+| `src/constants.rs` | Named domain constants with citations | All 10 constants (see Section 12) |
+| `src/error.rs` | Error types using `thiserror` | `TlobError` (13 variants), `Result<T>` |
+| `src/source.rs` | Data source abstraction trait | `MarketDataSource` (trait), `SourceMetadata`, `VecSource`, `DbnSource` [databento] |
+| `src/statistics.rs` | Running stats (Welford), day stats, normalization params | `RunningStats`, `DayStats`, `NormalizationParams` |
+| `src/analytics.rs` | Advanced analytics: depth, impact, liquidity | `DepthStats`, `MarketImpact`, `LiquidityMetrics` |
+| `src/warnings.rs` | Warning tracking with categories and deduplication | `WarningTracker`, `Warning`, `WarningCategory`, `WarningSummary`, `WarningTrackerConfig` |
 
 ### LOB Module (`src/lob/`)
 
-| File | Lines | Purpose | Key Public Types |
-|------|-------|---------|-----------------|
-| `src/lob/mod.rs` | 100 | Module declarations and re-exports | -- |
-| `src/lob/reconstructor.rs` | 3293 | Single-symbol LOB reconstruction engine | `LobReconstructor`, `LobConfig`, `LobStats`, `CrossedQuotePolicy` |
-| `src/lob/price_level.rs` | 430 | Orders at a price with O(1) cached total_size | `PriceLevel` |
-| `src/lob/queue_position.rs` | 1683 | FIFO queue position tracking | `QueuePositionTracker`, `QueuePositionConfig`, `QueuePositionInfo`, `PositionChange`, `PositionChangeReason`, `QueueStats` |
-| `src/lob/order_lifecycle.rs` | 1637 | Order lifecycle Add->Modify->Cancel/Fill | `OrderLifecycleTracker`, `OrderLifecycleConfig`, `OrderLifecycle`, `LifecycleEvent`, `LifecycleStats`, `OrderOrigin`, `TerminalState`, `OrderModification`, `ActiveOrderFeatures`, `CompletionStats` |
-| `src/lob/trade_aggregator.rs` | 943 | Fills to trades with aggressor detection | `TradeAggregator`, `TradeAggregatorConfig`, `Trade`, `Fill` |
-| `src/lob/day_boundary.rs` | 614 | Trading day boundary detection | `DayBoundaryDetector`, `DayBoundaryConfig`, `DayBoundary`, `DayBoundaryStats` |
-| `src/lob/multi_symbol.rs` | 385 | Multi-symbol LOB manager | `MultiSymbolLob` |
+| File | Purpose | Key Public Types |
+|------|---------|-----------------|
+| `src/lob/mod.rs` | Module declarations and re-exports | -- |
+| `src/lob/reconstructor.rs` | Single-symbol LOB reconstruction engine | `LobReconstructor`, `LobConfig`, `LobStats`, `CrossedQuotePolicy` |
+| `src/lob/price_level.rs` | Orders at a price with O(1) cached total_size | `PriceLevel` |
+| `src/lob/queue_position.rs` | FIFO queue position tracking | `QueuePositionTracker`, `QueuePositionConfig`, `QueuePositionInfo`, `PositionChange`, `PositionChangeReason`, `QueueStats` |
+| `src/lob/order_lifecycle.rs` | Order lifecycle Add->Modify->Cancel/Fill | `OrderLifecycleTracker`, `OrderLifecycleConfig`, `OrderLifecycle`, `LifecycleEvent`, `LifecycleStats`, `OrderOrigin`, `TerminalState`, `OrderModification`, `ActiveOrderFeatures`, `CompletionStats` |
+| `src/lob/trade_aggregator.rs` | Fills to trades with aggressor detection | `TradeAggregator`, `TradeAggregatorConfig`, `Trade`, `Fill` |
+| `src/lob/day_boundary.rs` | Trading day boundary detection | `DayBoundaryDetector`, `DayBoundaryConfig`, `DayBoundary`, `DayBoundaryStats` |
+| `src/lob/multi_symbol.rs` | Multi-symbol LOB manager | `MultiSymbolLob` |
 
 ### Databento Integration (`databento` feature)
 
-| File | Lines | Purpose | Key Public Types |
-|------|-------|---------|-----------------|
-| `src/dbn_bridge.rs` | 481 | `dbn::MboMsg` to `MboMessage` conversion (3-case timestamp dispatch — M.A.6/M.A.9 F-023 fold) | `DbnBridge` |
-| `src/loader/mod.rs` | 1183 | Streaming DBN file reader with 1MB I/O buffer + typed iterator API (M.A.3) + bytes_read counting (M.A.2 F-008) + mid_record_eof counter (M.A.3 F-024) + system_messages_seen producer counter (M.A.7 F-010) | `DbnLoader`, `TypedMessageIterator`, `MessageIterator` (legacy, gated `legacy-iterator-api`), `LoaderStats` (`#[non_exhaustive]`), `IO_BUFFER_SIZE` |
-| `src/loader/error.rs` | 132 | BoundaryError peer enum — typed-error-domain for the loader yield path (M.A.1) | `BoundaryError` (`#[non_exhaustive]`, Clone-derived: `Decode(String)`, `Convert(TlobError)`) |
-| `src/hotstore.rs` | 857 | Decompressed file management for fast I/O | `HotStoreManager`, `HotStoreConfig` |
+| File | Purpose | Key Public Types |
+|------|---------|-----------------|
+| `src/dbn_bridge.rs` | `dbn::MboMsg` to `MboMessage` conversion (3-case timestamp dispatch — M.A.6/M.A.9 F-023 fold) | `DbnBridge` |
+| `src/loader/mod.rs` | Streaming DBN file reader with 1MB I/O buffer + typed iterator API (M.A.3) + bytes_read counting (M.A.2 F-008) + mid_record_eof counter (M.A.3 F-024) + system_messages_seen producer counter (M.A.7 F-010) | `DbnLoader`, `TypedMessageIterator`, `MessageIterator` (legacy, gated `legacy-iterator-api`), `LoaderStats` (`#[non_exhaustive]`), `IO_BUFFER_SIZE` |
+| `src/loader/error.rs` | BoundaryError peer enum — typed-error-domain for the loader yield path (M.A.1) | `BoundaryError` (`#[non_exhaustive]`, Clone-derived: `Decode(String)`, `Convert(TlobError)`) |
+| `src/hotstore.rs` | Decompressed file management for fast I/O | `HotStoreManager`, `HotStoreConfig` |
 
 ### Export System (`export` feature)
 
-| File | Lines | Purpose | Key Public Types |
-|------|-------|---------|-----------------|
-| `src/export/mod.rs` | 183 | Export config, downsampling, stats | `ExportConfig`, `DownsampleConfig`, `DownsampleStrategy`, `ParquetExportStats`, `SCHEMA_VERSION` |
-| `src/export/schema.rs` | 347 | Arrow schema definitions (SSoT for data contract) | `lob_snapshot_schema()`, `mbo_event_schema()`, `book_consistency_to_u8()` |
-| `src/export/lob_writer.rs` | 260 | LOB snapshot Parquet writer | `LobSnapshotWriter` |
-| `src/export/mbo_writer.rs` | 198 | MBO event Parquet writer | `MboEventWriter` |
-| `src/export/batch.rs` | 327 | Column-oriented batch buffers for Arrow conversion | `LobBatch` (pub(crate)), `MboBatch` (pub(crate)) |
+| File | Purpose | Key Public Types |
+|------|---------|-----------------|
+| `src/export/mod.rs` | Export config, downsampling, stats | `ExportConfig`, `DownsampleConfig`, `DownsampleStrategy`, `ParquetExportStats`, `SCHEMA_VERSION` |
+| `src/export/schema.rs` | Arrow schema definitions (SSoT for data contract) | `lob_snapshot_schema()`, `mbo_event_schema()`, `book_consistency_to_u8()` |
+| `src/export/lob_writer.rs` | LOB snapshot Parquet writer | `LobSnapshotWriter` |
+| `src/export/mbo_writer.rs` | MBO event Parquet writer | `MboEventWriter` |
+| `src/export/batch.rs` | Column-oriented batch buffers for Arrow conversion | `LobBatch` (pub(crate)), `MboBatch` (pub(crate)) |
 
 ### CLI Binaries
 
-| File | Lines | Purpose | Required Features |
-|------|-------|---------|-------------------|
-| `src/bin/export_to_parquet.rs` | 677 | Export LOB snapshots and MBO events to Parquet | `databento`, `export` |
-| `src/bin/decompress_to_hot_store.rs` | 379 | Pre-decompress `.dbn.zst` files for faster I/O | `databento` |
+| File | Purpose | Required Features |
+|------|---------|-------------------|
+| `src/bin/export_to_parquet.rs` | Export LOB snapshots and MBO events to Parquet | `databento`, `export` |
+| `src/bin/decompress_to_hot_store.rs` | Pre-decompress `.dbn.zst` files for faster I/O | `databento` |
 
-**Total**: ~17,000 lines of Rust across 26 source files.
+**Line counts**: intentionally not hand-maintained here (hft-rules §11 — they drift with every commit). For live per-file and total counts run: `find src -name '*.rs' | xargs wc -l`.
 
 ---
 

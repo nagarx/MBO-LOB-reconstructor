@@ -1168,7 +1168,9 @@ impl LobReconstructor {
         // match dispatch below UNREACHABLE for default-config callers
         // (`LobConfig::default()` sets `skip_system_messages: true`).
         // The companion Phase O B.2b fix in the extractor's outer
-        // filter (`feature-extractor-MBO-LOB/.../pipeline.rs:253`) is
+        // filter (`feature-extractor-MBO-LOB/crates/hft-extractor/src/
+        // pipeline.rs:346` as of 2026-07-07 — grep `msg.action !=
+        // Action::Clear` there if the line drifts) is
         // the operator-visible counter side; B.2a is the load-bearing
         // book-state fix. `Action::None` is intentionally NOT exempted
         // — it has identical zero-field shape but per types.rs:48 is a

@@ -73,7 +73,9 @@ src/
 │   └── batch.rs        # Column-oriented batching (LobBatch, MboBatch)
 ├── source.rs           # MarketDataSource trait, DbnSource, VecSource
 ├── hotstore.rs         # HotStoreConfig, HotStoreManager
-├── loader.rs           # DbnLoader for file I/O (auto-detects compression)
+├── loader/
+│   ├── mod.rs          # DbnLoader for file I/O (auto-detects compression); TypedMessageIterator (preferred) + legacy MessageIterator
+│   └── error.rs        # BoundaryError — typed error domain for the loader yield path
 ├── dbn_bridge.rs       # Databento format conversion
 ├── constants.rs        # Domain constants: NANODOLLARS_PER_DOLLAR, NS_PER_SECOND, BASIS_POINTS_PER_UNIT, DIVISION_GUARD_EPS (10 total)
 ├── statistics.rs       # RunningStats, DayStats, NormalizationParams
@@ -130,7 +132,7 @@ src/
 | `lob/trade_aggregator` | Trade aggregation | `TradeAggregator`, `Trade`, `Fill` |
 | `source` | Provider abstraction | `MarketDataSource`, `SourceMetadata`, `DbnSource`, `VecSource` |
 | `hotstore` | Decompressed data caching | `HotStoreConfig`, `HotStoreManager` |
-| `loader` | DBN file streaming | `DbnLoader`, `MessageIterator`, `LoaderStats` |
+| `loader` | DBN file streaming | `DbnLoader`, `TypedMessageIterator` (preferred: `iter_messages_typed()` → `Result<MboMessage, BoundaryError>`), `BoundaryError` (`loader/error.rs`), `LoaderStats`, `MessageIterator` (legacy — `#[deprecated]`, gated behind default-on `legacy-iterator-api`; removal 0.3.0 / 2026-10-29) |
 | `dbn_bridge` | DBN → internal conversion | `DbnBridge` |
 | `statistics` | ML statistics | `RunningStats`, `DayStats`, `NormalizationParams` |
 | `analytics` | Market microstructure | `DepthStats`, `MarketImpact`, `LiquidityMetrics` |
@@ -610,12 +612,19 @@ Aggregates LOB state statistics over a trading day:
 
 ```rust
 let mut day_stats = DayStats::new("2025-02-03");
-for msg in loader.iter_messages()? {
-    let state = lob.process_message(&msg)?;
+let mut iter = loader.iter_messages_typed()?;  // preferred typed API
+for msg_result in &mut iter {
+    let state = lob.process_message(&msg_result?)?;
     day_stats.update(&state);
 }
+let stats = iter.finalize();  // clean-EOF vs torn-stream check: stats.is_clean_eof()
 // Access: day_stats.mid_price.mean, day_stats.spread_bps.std(), etc.
 ```
+
+> **Ingestion API note**: all examples in this document use `iter_messages_typed()`
+> (yields `Result<MboMessage, BoundaryError>`). The older `iter_messages()` is
+> `#[deprecated]` behind the default-on `legacy-iterator-api` feature — removal scheduled
+> for the next MAJOR (0.3.0; calendar 2026-10-29). Do not write new code against it.
 
 ### Analytics (src/analytics.rs)
 
@@ -686,16 +695,19 @@ fn test_system_messages_skipped_by_default() {
 fn test_with_real_data() {
     let loader = DbnLoader::new("path/to/data.dbn.zst")
         .expect("Failed to open")
-        .skip_invalid(true);
+        .skip_invalid(true);  // decode errors logged + counted instead of yielded
 
     let mut lob = LobReconstructor::new(10);
     let mut processed = 0u64;
 
-    for msg in loader.iter_messages().expect("Failed to iterate") {
+    let mut iter = loader.iter_messages_typed().expect("Failed to open iterator");
+    for msg_result in &mut iter {
+        let msg = msg_result.expect("decode/convert boundary error");
         if let Ok(_state) = lob.process_message(&msg) {
             processed += 1;
         }
     }
+    assert!(iter.finalize().is_clean_eof());  // torn-stream guard
 
     assert!(processed > 0);
     assert!(lob.stats().crossed_quotes < processed / 100);  // <1% crossed
@@ -747,14 +759,17 @@ fn bench_process_message(b: &mut Bencher) {
 ### Pattern: Processing a Day of Data
 
 ```rust
-let loader = DbnLoader::new(path)?.skip_invalid(true);
+let loader = DbnLoader::new(path)?;
 let mut lob = LobReconstructor::new(10);
 let mut day_stats = DayStats::new(date);
 
-for msg in loader.iter_messages()? {
-    let state = lob.process_message(&msg)?;
+let mut iter = loader.iter_messages_typed()?;
+for msg_result in &mut iter {
+    let state = lob.process_message(&msg_result?)?;
     day_stats.update(&state);
 }
+let stats = iter.finalize();
+assert!(stats.is_clean_eof(), "torn DBN: mid_record_eof={}", stats.mid_record_eof);
 
 // End of day
 let norm_params = NormalizationParams::from_day_stats(&day_stats, 10);
@@ -768,10 +783,12 @@ for day_file in day_files {
     lob.full_reset();  // Clear state AND stats
     day_stats = DayStats::new(extract_date(&day_file));
 
-    for msg in DbnLoader::new(&day_file)?.iter_messages()? {
-        let state = lob.process_message(&msg)?;
+    let mut iter = DbnLoader::new(&day_file)?.iter_messages_typed()?;
+    for msg_result in &mut iter {
+        let state = lob.process_message(&msg_result?)?;
         day_stats.update(&state);
     }
+    assert!(iter.finalize().is_clean_eof());
 
     all_day_stats.push(day_stats);
 }
@@ -807,20 +824,26 @@ This library is designed to work with [feature-extractor-MBO-LOB](https://github
 
 ### Recommended: Use Feature Extractor Pipeline
 
-The feature extractor's `Pipeline` handles LOB reconstruction internally:
+The extractor is a **9-crate Cargo workspace** whose facade crate is `hft-extractor` (it
+depends on this library via git tag `v0.2.1` + a monorepo `.cargo/config.toml` path
+override). Its `Pipeline` handles LOB reconstruction internally; the production entry point
+is the config-driven `export_dataset` CLI (`cargo run --release --features parallel --bin
+export_dataset -- --config configs/<name>.toml`). Programmatically:
 
 ```rust
-use feature_extractor::prelude::*;
+use hft_extractor::config::DatasetConfig;
 
-let mut pipeline = PipelineBuilder::new()
-    .with_levels(10)
-    .with_derived_features()
-    .window(100, 10)
-    .build()?;
+let config = DatasetConfig::load_toml("configs/nvda_98feat.toml")?;
+let layout = config.build_layout()?;
+let mut pipeline = config.build_pipeline(&layout);
 
-// Pipeline internally uses LobReconstructor
+// Pipeline internally uses LobReconstructor (typed iterator ingestion)
 let output = pipeline.process("data/NVDA.mbo.dbn.zst")?;
 ```
+
+> **Archived-API note**: the `feature_extractor::prelude` / `PipelineBuilder` fluent API
+> shown here in earlier revisions exists only in the extractor's archived monolith
+> (`feature-extractor-MBO-LOB/archive/monolith-v1/` — historical reference, not compiled).
 
 ### Advanced: Manual Integration with Zero-Copy API
 
@@ -835,21 +858,26 @@ let mut state = LobState::new(10);  // Stack-allocated, reused across all messag
 
 let loader = DbnLoader::new("data/NVDA.mbo.dbn.zst")?;
 
-for msg in loader.iter_messages()? {
+let mut iter = loader.iter_messages_typed()?;
+for msg_result in &mut iter {
+    let msg = msg_result?;  // BoundaryError::Decode/Convert propagates via ?
+
     // Zero-allocation: fills existing state buffer in-place
     lob.process_message_into(&msg, &mut state)?;
-    
+
     // Access temporal information
     if let Some(delta_s) = state.delta_seconds() {
         let intensity = state.event_intensity().unwrap_or(0.0);
         // Use state.triggering_action, state.triggering_side, etc.
     }
-    
+
     // State is ready for feature extraction
     if state.is_valid() {
         // Extract features from state...
     }
 }
+let stats = iter.finalize();
+assert!(stats.is_clean_eof(), "torn DBN: mid_record_eof={}", stats.mid_record_eof);
 ```
 
 ### Key Integration Points
@@ -1185,7 +1213,7 @@ lob.stats().total_warnings()
 
 ### Overview
 
-The `export` module provides a feature-gated Parquet export for raw LOB snapshots and MBO events. It writes data that has **not** been transformed by sampling, normalization, or labeling, making it suitable for unbiased statistical analysis in the `raw-lob-analyzer` Python repository.
+The `export` module provides a feature-gated Parquet export for raw LOB snapshots and MBO events. It writes data that has **not** been transformed by sampling, normalization, or labeling, making it suitable for unbiased statistical analysis in the `MBO-LOB-analyzer` Python repository.
 
 ### Dependencies
 
@@ -1196,7 +1224,7 @@ The `export` module provides a feature-gated Parquet export for raw LOB snapshot
 
 | File | Purpose |
 |------|---------|
-| `export/mod.rs` | `ExportConfig`, `DownsampleConfig`, `DownsampleStrategy`, `ParquetExportStats` |
+| `export/mod.rs` | `ExportConfig`, `DownsampleConfig`, `DownsampleStrategy`, `ParquetExportStats`, `DownsampleStats` (Phase O B.3 out-of-order observability) |
 | `export/schema.rs` | `lob_snapshot_schema()`, `mbo_event_schema()` — single source of truth for column definitions |
 | `export/batch.rs` | `LobBatch`, `MboBatch` — column-oriented buffers that convert to Arrow `RecordBatch` |
 | `export/lob_writer.rs` | `LobSnapshotWriter` — buffers `LobState` and writes Parquet row groups |
@@ -1285,12 +1313,14 @@ ExportConfig {
 
 ### Testing
 
-45 tests cover the export module:
-- 10 inline unit tests in `schema.rs` (schema construction, metadata, nullability)
-- 35 integration tests in `tests/export_test.rs` (round-trip, edge cases, batching, downsampling, metadata, numerical precision)
+The export module is covered by inline unit tests in `schema.rs` (schema construction,
+metadata, nullability) plus integration tests in `tests/export_test.rs` (round-trip, edge
+cases, batching, downsampling incl. the Phase O B.3 out-of-order suite, metadata, numerical
+precision). Counts are intentionally not hand-maintained here (hft-rules §11) — run
+`cargo test --features "databento export" 2>&1 | grep "test result"` for the live count.
 
 ---
 
-*Last updated: 2026-04-30 (post Phase M REV 3 — Boundary Discipline cycle)*
+*Last updated: 2026-07-07 (Phase-2 doc-truth pass: typed-iterator ingestion API coverage + live extractor-workspace integration sections; content baseline 2026-04-30, post Phase M REV 3 — Boundary Discipline cycle)*
 *Crate version: 0.2.1*
 

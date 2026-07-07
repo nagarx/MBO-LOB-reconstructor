@@ -34,6 +34,7 @@ Additional standalone modules that can be used alongside LOB reconstruction:
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `databento` | Yes | Enable Databento DBN file support |
+| `legacy-iterator-api` | Yes | Gates the **deprecated** legacy `iter_messages()` API (implies `databento`). New code should use `iter_messages_typed()` instead; scheduled for removal in the next MAJOR release (0.3.0; calendar removal 2026-10-29) |
 | `export` | No | Enable Apache Parquet export for raw LOB snapshots and MBO events (+ TOML config for CLI) |
 
 ## Quick Start
@@ -69,22 +70,28 @@ println!("Best Ask: ${:.2}", state.best_ask.unwrap() as f64 / NANODOLLARS_PER_DO
 use mbo_lob_reconstructor::{DbnLoader, LobReconstructor, DayStats, NormalizationParams};
 
 // Load compressed DBN file
-let loader = DbnLoader::new("data/NVDA.mbo.dbn.zst")?
-    .skip_invalid(true);
+let loader = DbnLoader::new("data/NVDA.mbo.dbn.zst")?;
 
 let mut lob = LobReconstructor::new(10);
 let mut day_stats = DayStats::new("2025-02-03");
 
-// Process all messages
-for msg in loader.iter_messages()? {
+// Process all messages — preferred typed API (yields Result<MboMessage, BoundaryError>,
+// so decode/convert failures surface as typed errors at the boundary)
+let mut iter = loader.iter_messages_typed()?;
+for msg_result in &mut iter {
+    let msg = msg_result?;
     let state = lob.process_message(&msg)?;
     day_stats.update(&state);
-    
+
     // Use enriched analytics
     if let Some(microprice) = state.microprice() {
         println!("Microprice: ${:.4}", microprice);
     }
 }
+
+// Distinguish clean EOF from a torn (mid-record) stream
+let stats = iter.finalize();
+assert!(stats.is_clean_eof(), "torn DBN: mid_record_eof={}", stats.mid_record_eof);
 
 // Get normalization parameters for ML (standalone usage).
 // Note: feature-extractor-MBO-LOB provides its own NormalizationParams
@@ -93,90 +100,91 @@ let norm_params = NormalizationParams::from_day_stats(&day_stats, 10);
 norm_params.save_json("normalization.json")?;
 ```
 
+> **Legacy API note**: the older `iter_messages()` (yielding `MboMessage` directly) is
+> `#[deprecated]` and gated behind the default-on `legacy-iterator-api` feature. It is
+> scheduled for removal in the next MAJOR release (0.3.0; calendar 2026-10-29) — do not
+> write new code against it.
+
 ## Using with Feature Extractor
 
 This library is designed to work with [feature-extractor-MBO-LOB](https://github.com/nagarx/feature-extractor-MBO-LOB) for complete ML preprocessing pipelines.
 
 ### Combined Usage (Recommended)
 
-```rust
-use feature_extractor::prelude::*;
+The extractor is a **9-crate Cargo workspace**; its facade crate is `hft-extractor`, which
+depends on this library via git tag (`crates/hft-extractor/Cargo.toml`:
+`mbo-lob-reconstructor = { git = ..., tag = "v0.2.1" }`, with a `.cargo/config.toml` path
+override inside the monorepo). The **production path** is the config-driven `export_dataset`
+CLI:
 
-fn main() -> Result<()> {
-    // Build pipeline with fluent API
-    let mut pipeline = PipelineBuilder::new()
-        .lob_levels(10)           // Uses MBO-LOB-reconstructor internally
-        .with_derived_features()  // +8 derived features
-        .window(100, 10)          // 100 snapshots per sequence
-        .event_sampling(1000)     // Sample every 1000 events
-        .build()?;
-
-    // Process MBO data through complete pipeline
-    let output = pipeline.process("data/SYMBOL.mbo.dbn.zst")?;
-
-    println!("Processed {} messages", output.messages_processed);
-    println!("Generated {} sequences", output.sequences_generated);
-
-    // Export to NumPy for Python/PyTorch
-    let exporter = NumpyExporter::new("output/");
-    exporter.export_day("2025-02-03", &output)?;
-
-    Ok(())
-}
+```bash
+cd feature-extractor-MBO-LOB
+cargo run --release --features parallel --bin export_dataset -- --config configs/<name>.toml
 ```
+
+For programmatic use, the facade's entry points are `DatasetConfig` (TOML → components) and
+`Pipeline` (messages → LOB reconstruction → sampling → features → sequences):
+
+```rust
+use hft_extractor::config::DatasetConfig;
+
+// Config-driven construction (preferred)
+let config = DatasetConfig::load_toml("configs/nvda_98feat.toml")?;
+let layout = config.build_layout()?;
+let mut pipeline = config.build_pipeline(&layout); // Uses MBO-LOB-reconstructor internally
+
+// Process one day of MBO data through the complete pipeline
+let output = pipeline.process("data/SYMBOL.mbo.dbn.zst")?;
+println!("Processed {} messages", output.messages_processed);
+println!("Generated {} sequences", output.sequences.len());
+```
+
+Multi-day parallel processing lives in `hft_extractor::batch` (`BatchProcessor`,
+`process_files_parallel` — feature `parallel`); NPY export in `hft-export-pipeline`
+(`ExportPipeline`, re-exported by the facade).
+
+> **Archived-API note**: earlier revisions of this section showed a
+> `feature_extractor::prelude` / `PipelineBuilder` / `FeatureExtractor` fluent API. That API
+> exists only in the extractor's **archived monolith**
+> (`feature-extractor-MBO-LOB/archive/monolith-v1/` — kept for historical reference, not
+> compiled) and is absent from the live workspace. Do not write new code against it.
 
 ### Manual Component Control
 
-For fine-grained control, use the components directly:
+For fine-grained control, drive this library's zero-allocation API directly and hand the
+resulting `LobState` to the extractor workspace's live components — `FeatureEngine`
+(`hft-feature-core`), `FeatureLayoutBuilder` (`hft-feature-layout`), and `SequenceBuilder`
+(`hft-sequence-engine`, all re-exported by the `hft_extractor` facade):
 
 ```rust
 use mbo_lob_reconstructor::{DbnLoader, LobReconstructor, LobConfig, LobState, CrossedQuotePolicy};
-use feature_extractor::{FeatureExtractor, FeatureConfig, SequenceBuilder, SequenceConfig};
-use std::sync::Arc;
 
 // Configure LOB reconstruction
 let lob_config = LobConfig::new(10)
     .with_crossed_quote_policy(CrossedQuotePolicy::UseLastValid);
 let mut reconstructor = LobReconstructor::with_config(lob_config);
 
-// Configure feature extraction
-let feature_config = FeatureConfig::default().with_derived(true);
-let mut extractor = FeatureExtractor::with_config(feature_config.clone());
-
-// Configure sequence building (feature count auto-computed)
-let seq_config = SequenceConfig::from_feature_config(100, 10, &feature_config);
-let mut sequence_builder = SequenceBuilder::with_config(seq_config);
-
-// Reusable buffers for zero-allocation processing
+// Reusable buffer for zero-allocation processing
 let mut lob_state = LobState::new(10);
-let mut feature_buffer = Vec::with_capacity(feature_config.feature_count());
 
-// Collect sequences during streaming (IMPORTANT: avoids buffer eviction)
-let mut sequences = Vec::new();
-
-// Process messages
+// Process messages (typed iterator: decode/convert failures surface as BoundaryError)
 let loader = DbnLoader::new("data/SYMBOL.mbo.dbn.zst")?;
-for msg in loader.iter_messages()? {
+let mut iter = loader.iter_messages_typed()?;
+for msg_result in &mut iter {
+    let msg = msg_result?;
+
     // Zero-allocation LOB update
     reconstructor.process_message_into(&msg, &mut lob_state)?;
-    
-    // Zero-allocation feature extraction
-    extractor.extract_into(&lob_state, &mut feature_buffer)?;
-    
-    // Wrap in Arc for zero-copy sharing
-    let features = Arc::new(std::mem::take(&mut feature_buffer));
-    feature_buffer = Vec::with_capacity(feature_config.feature_count());
-    
-    // Push with Arc (8-byte clone instead of 672-byte clone)
-    sequence_builder.push_arc(msg.timestamp.unwrap_or(0) as u64, features)?;
-    
-    // IMPORTANT: Build sequences during streaming to avoid buffer eviction
-    if let Some(seq) = sequence_builder.try_build_sequence() {
-        sequences.push(seq);
-    }
-}
 
-println!("Generated {} sequences", sequences.len());
+    // `lob_state` is now ready for downstream feature computation:
+    // feed it to the extractor's FeatureEngine, then push the feature
+    // vector into SequenceBuilder (`push_arc` + `try_build_sequence`).
+    // The canonical wiring of this exact loop is
+    // feature-extractor-MBO-LOB/crates/hft-extractor/src/pipeline.rs
+    // (`Pipeline::process_messages`).
+}
+let stats = iter.finalize();
+assert!(stats.is_clean_eof(), "torn DBN: mid_record_eof={}", stats.mid_record_eof);
 ```
 
 > **Note**: Using `try_build_sequence()` during streaming is critical. The deprecated
@@ -358,8 +366,8 @@ let denormalized = params.denormalize(normalized, feature_idx);
 ## Parquet Export (feature: `export`)
 
 Export raw LOB snapshots and MBO events to Apache Parquet files for downstream
-statistical analysis (e.g., `raw-lob-analyzer`). This captures the unbiased
-LOB state before any feature extraction transforms.
+statistical analysis (e.g., the `MBO-LOB-analyzer` Python repository). This captures the
+unbiased LOB state before any feature extraction transforms.
 
 ### CLI
 
@@ -404,7 +412,7 @@ println!("Wrote {} snapshots", stats.rows_written);
 | `{date}_lob_snapshots.parquet` | per day | Full LOB state at each message (~7M rows/day) |
 | `{date}_mbo_events.parquet` | per day | Raw MBO messages (order_id, action, side, price, size). Omitted with `--no-mbo`. |
 | `{date}_reconstruction_stats.json` | per day | Schema-versioned reconstruction / provenance stats — a `LobStatsExportEnvelope` (`{ schema_version, stats }`) written atomically (tmp + fsync + rename). Re-exported at the crate root and read by external consumers. |
-| `_export_summary.json` | per run | Run-level summary across all days: totals, throughput, and per-category skipped-row anomaly counts (hft-rules §8 fail-loud observability). |
+| `_export_summary.json` | per run | Run-level summary across all days: totals, throughput, and per-category skipped-row anomaly counts (fail-loud observability per the monorepo development rule "hft-rules §8 — Data Integrity & Error Policy"; that rules file lives at the monorepo root, not in this repo). |
 
 ### Data Contract
 
@@ -441,7 +449,9 @@ mbo_lob_reconstructor/
         batch.rs          # Column-oriented row batching
     source.rs         # MarketDataSource trait, DbnSource, VecSource
     dbn_bridge.rs     # Databento format conversion
-    loader.rs         # DBN file streaming (zero-copy message iteration)
+    loader/
+        mod.rs        # DBN file streaming (typed iterator API preferred; zero-copy; auto-detects compression)
+        error.rs      # BoundaryError — typed error domain for the loader yield path
     hotstore.rs       # HotStoreManager: decompressed file cache (~30% faster)
     statistics.rs     # DayStats, RunningStats, NormalizationParams
     analytics.rs      # DepthStats, MarketImpact, LiquidityMetrics

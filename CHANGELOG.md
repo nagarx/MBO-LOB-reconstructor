@@ -7,15 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added — Phase O Cycle 1 (2026-05-03, 2 commits + this docs sweep)
+Post-`v0.2.1`-tag changes (the tag was cut at commit `28a9a22`, 2026-05-03):
+
+- **Changed**: `Cargo.toml` version aligned `0.2.0` → `0.2.1` to match the
+  `v0.2.1` tag (commit `4cddcd3`). Release-hygiene note: the tag itself was
+  cut with `Cargo.toml` still reading `0.2.0`; this alignment landed
+  immediately after.
+- **Added**: `rust-toolchain.toml` pinning the Rust toolchain to 1.94.0
+  (#PY-220, commit `2b74523`).
+- **Docs**: truth passes 2026-07-06/07 (ARCHITECTURE count reconciliation;
+  ingestion-API / export-artifact coverage; the Phase-2 doc-drift sweep that
+  moved the Phase O Cycle 1 content below out of `[Unreleased]` into its
+  proper `[0.2.1]` section).
+
+## [0.2.1] — 2026-05-03
+
+Phase O Cycle 1. Tagged `v0.2.1` at commit `28a9a22`; the sibling extractor
+pins this tag at `feature-extractor-MBO-LOB/crates/hft-extractor/Cargo.toml:35`.
+
+### Added — Phase O Cycle 1 (2026-05-03, 2 commits + docs sweep)
 
 **Producer-side correctness cycle** — closes the Action::Clear silent-
 passthrough class (NEW-AUDIT-A3 / FIND-NEW-6 follow-up) that was
 DEFERRED from Phase K K.5 and previously documented in the sibling
 `feature-extractor-MBO-LOB` repo's CLAUDE.md / EXPORT_INDEX.md /
 diagnostics.rs as "remains OPEN — out of K.5 scope" at the (phantom)
-`adapters.rs:123` location. Plan + per-commit ship-ledger at
-`/Users/knight/.claude/plans/spicy-tickling-mist.md` §"Phase O".
+`adapters.rs:123` location. (The plan + per-commit ship-ledger lived in an
+agent-local plan file, `~/.claude/plans/spicy-tickling-mist.md` §"Phase O",
+which was not preserved — this CHANGELOG section is the surviving
+per-commit record.)
 
 - **B.1** `29a3c96` — fix(export): single source of truth for
   `LobBatch::push` `level_count` column. Pre-B.1 the metadata-data
@@ -54,16 +74,21 @@ diagnostics.rs as "remains OPEN — out of K.5 scope" at the (phantom)
 
   Companion fix in extractor `feature-extractor-MBO-LOB` commit
   `ab52176` (B.2b) exempts Clear from the OUTER filter at
-  `crates/hft-extractor/src/pipeline.rs:273`. Together: `Action::Clear`
-  now flows through both filter layers → reconstructor's Clear handler
-  fires → `self.reset()` clears the book → downstream features reflect
-  the post-Clear empty book correctly.
+  `crates/hft-extractor/src/pipeline.rs:346` (live line as of
+  2026-07-07 — grep `msg.is_system_message() && msg.action !=
+  Action::Clear`; the file has grown since the fix landed). Together:
+  `Action::Clear` now flows through both filter layers → reconstructor's
+  Clear handler fires → `self.reset()` clears the book → downstream
+  features reflect the post-Clear empty book correctly.
 
-  **Mid-cycle 6-agent adversarial validation**
-  (`/Users/knight/code_local/HFT-pipeline-v2/PHASE_O_VALIDATION_FINDINGS_2026_05_03.md`)
-  surfaced 9 BLOCKING items + 9 follow-up items. This commit (B-1
-  reconstructor docs sweep) is one of the Stage E-pre BLOCKING items
-  the validation surfaced.
+  **Mid-cycle 6-agent adversarial validation** (recorded in the
+  monorepo-root working doc `PHASE_O_VALIDATION_FINDINGS_2026_05_03.md`
+  — since DELETED, not archived; the durable surviving records are
+  hft-wiki `FINDING-038-legacy-export-clear-corruption-use-v3p0-only`
+  and the sibling `feature-extractor-MBO-LOB/EXPORT_INDEX.md` Phase O
+  banner) surfaced 9 BLOCKING items + 9 follow-up items. This commit
+  (B-1 reconstructor docs sweep) is one of the Stage E-pre BLOCKING
+  items the validation surfaced.
 
 ### Changed — User-visible behavior shift (default-config callers)
 
@@ -90,8 +115,12 @@ that this commit closes.
 sibling `feature-extractor-MBO-LOB` consumer) of trading days containing
 `Action::Clear` messages have silently corrupt book state for the
 post-Clear segment. A two-class corpus inventory + remediation plan is
-scheduled separately (Phase O follow-up **F-9** per
-`PHASE_O_VALIDATION_FINDINGS_2026_05_03.md` §"FOLLOW-UP Items").
+scheduled separately (Phase O follow-up **F-9**; its source doc
+`PHASE_O_VALIDATION_FINDINGS_2026_05_03.md` §"FOLLOW-UP Items" has since
+been deleted — the remediation class survives as hft-wiki
+`FINDING-038-legacy-export-clear-corruption-use-v3p0-only` [the
+train-only-on-`*_v3p0`-exports rule] plus the corpus-inventory task in
+`feature-extractor-MBO-LOB/EXPORT_INDEX.md`).
 
 ### Notes
 
@@ -104,15 +133,15 @@ scheduled separately (Phase O follow-up **F-9** per
   `GOLDEN_HASH_LABELS_NPY = 0x5dcf907068fcadcc` UNCHANGED across B.1 +
   B.2a (synthetic-fixture argument: zero-Clear-message fixtures make
   B.2a exemption a structural no-op).
-- Cycle 1 close push will tag this as `v0.2.1` and the extractor will
-  bump its `Cargo.toml:35` pin from `tag = "v0.2.0"` to
-  `tag = "v0.2.1"` per the standard 5-repo atomic-coordinated cross-repo
-  pattern. Pre-push extractor CI on its own HEAD currently tests
-  against OLD `v0.2.0` (which does NOT contain B.1 or B.2a); end-to-end
-  Clear-handling correctness verified locally but the cross-repo CI
-  Green Badge does NOT prove it until the cycle-close push completes
-  (B-4 in `PHASE_O_VALIDATION_FINDINGS`). Stage E-pre B-2 cross-repo
-  E2E integration test (separate Stage E-pre commit) closes this gap.
+- Cycle 1 close COMPLETED (verified 2026-07-07): this content shipped as
+  the `v0.2.1` tag (commit `28a9a22`) and the extractor bumped its
+  `Cargo.toml:35` pin from `tag = "v0.2.0"` to `tag = "v0.2.1"` per the
+  standard 5-repo atomic-coordinated cross-repo pattern. (Write-time
+  caveat, now resolved: pre-push extractor CI tested against OLD
+  `v0.2.0`, so the cross-repo CI Green Badge did not yet prove B.1/B.2a
+  end-to-end — flagged as B-4 in the Phase O validation-findings doc
+  [since deleted; see the pointer note in the B.2a entry above]; the
+  Stage E-pre B-2 cross-repo E2E integration test closed that gap.)
 
 ### Fixed — Phase O Cycle 1: B.3 MinIntervalNs wraparound + DownsampleStats observability (2026-05-03, 1 commit)
 
@@ -800,6 +829,8 @@ F-007/F-008/F-010/F-013/F-021/F-023/F-024/F-031/F-034 + DESIGN-1).
 - 19+ integration tests with real market data
 - 8+ edge case tests for robustness
 
-[Unreleased]: https://github.com/nagarx/MBO-LOB-reconstructor/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/nagarx/MBO-LOB-reconstructor/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/nagarx/MBO-LOB-reconstructor/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/nagarx/MBO-LOB-reconstructor/releases/tag/v0.2.0
 [0.1.1]: https://github.com/nagarx/MBO-LOB-reconstructor/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/nagarx/MBO-LOB-reconstructor/releases/tag/v0.1.0
