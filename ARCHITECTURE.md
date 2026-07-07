@@ -94,6 +94,15 @@ MboMessage (src/types.rs)               -- Core event: order_id, action, side, p
 
 All trackers are composable: each consumes `MboMessage` independently and can be used alongside or without `LobReconstructor`.
 
+### Ingestion APIs (which entry point to use)
+
+Two ingestion entry points read MBO into the pipeline; they are **not interchangeable**:
+
+- **`DbnLoader`** (`src/loader/mod.rs`) — the **canonical** streaming reader for Databento `.dbn`/`.dbn.zst`. Preferred API: `iter_messages_typed()`, which yields `Result<MboMessage, BoundaryError>` so decode/convert failures surface as a **typed error at the boundary** (propagate via `?`). The older `iter_messages()` is **deprecated** and gated behind the `legacy-iterator-api` feature (default-on during transition; slated for removal in the next MAJOR — see `Cargo.toml` `[features]` and `CHANGELOG.md`). **Reach for `DbnLoader` in pipeline / ingestion code.**
+- **`MarketDataSource`** (`src/source.rs`) — a **provider-agnostic** trait (`SourceMetadata` + `messages()`) for ingestion code that must not be Databento-specific or needs an in-memory source. `DbnSource` is a thin wrapper over `DbnLoader`; `VecSource` wraps an in-memory `Vec<MboMessage>` (mocks / tests). **Reach for `MarketDataSource` in provider-agnostic or testable code.**
+
+**Migration status**: the `MarketDataSource for DbnSource` impl is currently gated behind `legacy-iterator-api` and returns the legacy (non-typed) iterator; it migrates to the typed iterator once the trait's associated `Item` becomes `Result<MboMessage, BoundaryError>`. Until then, code needing typed boundary errors from a Databento file should call `DbnLoader::iter_messages_typed()` directly rather than routing through the trait.
+
 ---
 
 ## 4. Module Map
@@ -611,6 +620,8 @@ Validation rules include: levels in [1, 20], max_warnings > 0, batch_size > 0, a
 
 `From` implementations: `std::io::Error`, `String`, `&str` all convert to `TlobError::Generic`.
 
+**Warnings / data-quality diagnostics**: soft errors and real-market anomalies are surfaced through the warnings subsystem (`src/warnings.rs` — `WarningTracker`, `WarningCategory`). See **`WARNINGS.md`** for the `WarningCategory` taxonomy and the catalog of real-market data-quality edge cases (the first stop when debugging a preprocessing anomaly).
+
 ---
 
 ## 10. Reset Semantics
@@ -759,7 +770,16 @@ cargo run --release --features export --bin export_to_parquet -- \
     --compression snappy
 ```
 
-Supports TOML config files with `[export]`, `[input]`, `[output]` sections. CLI flags override TOML values. Options include `--levels`, `--include-derived`, `--include-mbo`, `--batch-size`, `--compression`, `--downsample-every`, `--downsample-interval-ns`, `--hot-store`, `--verbose`.
+Supports TOML config files with `[export]`, `[input]`, `[output]` sections. CLI flags override TOML values. Options include `--levels`, `--no-derived`, `--no-mbo`, `--batch-size`, `--compression`, `--downsample-every`, `--downsample-interval-ns`, `--hot-store`, `--verbose` (derived features and MBO export are ON by default; the `--no-*` flags opt out).
+
+**Output artifacts (per run)**, written to the output directory:
+
+| File | Scope | Notes |
+|------|-------|-------|
+| `{date}_lob_snapshots.parquet` | per day | LOB state at each message |
+| `{date}_mbo_events.parquet` | per day | Raw MBO events; omitted with `--no-mbo` |
+| `{date}_reconstruction_stats.json` | per day | `LobStatsExportEnvelope` — schema-versioned via `LOB_STATS_SCHEMA_VERSION` (independent of §13's Parquet `SCHEMA_VERSION`), atomic-write (tmp + fsync + rename, with a direct-write fallback of identical envelope shape). Re-exported at the crate root; read by external consumers for provenance auditing |
+| `_export_summary.json` | per run | Aggregate summary across all days: symbol, days processed/failed, totals, throughput, and per-category skipped-row anomaly counts (hft-rules §8 fail-loud observability — e.g. `decode_or_convert_error`, `downsample_out_of_order`) |
 
 ### `decompress_to_hot_store`
 

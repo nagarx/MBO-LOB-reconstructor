@@ -399,19 +399,22 @@ println!("Wrote {} snapshots", stats.rows_written);
 
 ### Output Files (per day)
 
-| File | Description |
-|------|-------------|
-| `{date}_lob_snapshots.parquet` | Full LOB state at each message (~7M rows/day) |
-| `{date}_mbo_events.parquet` | Raw MBO messages (order_id, action, side, price, size) |
+| File | Scope | Description |
+|------|-------|-------------|
+| `{date}_lob_snapshots.parquet` | per day | Full LOB state at each message (~7M rows/day) |
+| `{date}_mbo_events.parquet` | per day | Raw MBO messages (order_id, action, side, price, size). Omitted with `--no-mbo`. |
+| `{date}_reconstruction_stats.json` | per day | Schema-versioned reconstruction / provenance stats — a `LobStatsExportEnvelope` (`{ schema_version, stats }`) written atomically (tmp + fsync + rename). Re-exported at the crate root and read by external consumers. |
+| `_export_summary.json` | per run | Run-level summary across all days: totals, throughput, and per-category skipped-row anomaly counts (hft-rules §8 fail-loud observability). |
 
 ### Data Contract
 
 - **Prices**: `Int64` in nanodollars (divide by 1e9 for dollars)
 - **Sizes**: `UInt32` in shares
 - **Timestamps**: `Int64` nanoseconds since epoch
-- **Schema version**: `1.0` (embedded in file metadata)
+- **Parquet schema version**: `1.0` (embedded in file metadata)
+- **Reconstruction-stats JSON**: carries its **own** `LOB_STATS_SCHEMA_VERSION` — independent of the Parquet version above (bumped on any change to the stats envelope). See `CHANGELOG.md` / `src/lob/reconstructor.rs` for the current value.
 
-See `src/export/schema.rs` for the authoritative column definitions.
+See `src/export/schema.rs` for the authoritative Parquet column definitions.
 
 ## Architecture
 
@@ -499,6 +502,18 @@ cargo bench
 - Data Validation: Detect and handle data quality issues
 - Normalization: Generate consistent normalization parameters across datasets
 - Research: Analyze order book dynamics and market microstructure
+
+## Auxiliary Documentation
+
+Living references (kept current — read these for module behavior):
+
+- **`ARCHITECTURE.md`** — data flow, ingestion APIs, module map, core types, export system, CLI binaries.
+- **`CODEBASE.md`** — deeper per-module technical reference + integration patterns.
+- **`WARNINGS.md`** — `WarningCategory` taxonomy + real-market data-quality edge-case catalog (start here when debugging a preprocessing anomaly).
+- **`CHANGELOG.md`** — versioned change history (schema-version constants, feature-flag deprecations).
+- **`CLAUDE.md`** — agent session orientation.
+
+Dated historical snapshots (point-in-time audits/plans — **not** current architecture; do not treat as authoritative for present behavior): `BACKBONE_AUDIT_VALIDATED_2026_04.md`, `FOUNDATION_INTEGRITY_PLAN_2026_05.md`.
 
 ## Related Libraries
 

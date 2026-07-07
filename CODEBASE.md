@@ -892,6 +892,8 @@ for msg in loader.iter_messages()? {
 // crossed_quotes: 100 (~0.001%) - Normal!
 ```
 
+See **`WARNINGS.md`** for the full `WarningCategory` taxonomy and the catalog of real-market data-quality edge cases (e.g. pre-market session start, partial-cancel handling) — the authoritative reference when triaging a preprocessing anomaly.
+
 ---
 
 ## 14. Composable Tracking Modules
