@@ -1,0 +1,524 @@
+{
+  "schema_version": "1.0",
+  "artifact_id": "MBO_SEMANTICS_BLOCKER_V1",
+  "artifact_kind": "terminal_blocker",
+  "generated_at_utc": "2026-07-29T16:44:25Z",
+  "status": "BLOCKED_SPECIFICATION_CONTRADICTION",
+  "terminal_for_current_authority": true,
+  "summary": "DECISION-030 cannot be implemented literally for the pinned XNAS MBO bytes because one normalized Nasdaq execution can contain same-sequence T, F, and C records that each carry LAST. Immediate LAST closure would split one execution into three completed groups, count two execution groups, and publish pre-cancel book state. A terminal-sequence-block repair changes both the accepted closure rule and causal availability rule, so it requires separate operator authority.",
+  "authority": {
+    "candidate_commit": "44dca9115cf820e9c36d4b688d7e4230965ce623",
+    "candidate_tree": "f611615a6185f39f6244fb87347d5aff5e6a555b",
+    "local_acceptance_commit": "26c351bddc995e9dac5cd2aa6ac2413b72b7f25e",
+    "local_acceptance_tree": "fff35b05646cdc3d0ee8ddbd92fb7191a12f5954",
+    "accepted_decision_path": "hft-wiki/ledgers/decisions/DECISION-030-bounded-f064-corrected-vertical-slice.md",
+    "accepted_decision_sha256": "c4ed26a0733fd89d1a3dfc8ab706d5498c44f89ddf991da5864784a7a915bb8b",
+    "acceptance_record_path": "hft-wiki/meta/2026-07-29-bounded-f064-corrected-vertical-slice-acceptance.md",
+    "acceptance_record_sha256": "2ec893944bccdd9cf2ce7e7e88b4dd99619b40ee57c258829a8b0a1af874118a",
+    "blocking_clauses": [
+      "DECISION-030 section 5: LAST closes only its publisher/instrument group",
+      "DECISION-030 section 5: group availability is max valid ts_recv among group members",
+      "DECISION-030 sections 5-6: one normalized event and one execution group for a T/F plus C execution event",
+      "DECISION-030 section 7: available_ns equals max valid member ts_recv for downstream cutoff"
+    ],
+    "permitted_termination_clause": "DECISION-030 authorizes the bounded slice to end when a terminal blocker artifact is emitted."
+  },
+  "implementation_boundary": {
+    "repository": "MBO-LOB-reconstructor",
+    "baseline_commit": "f45ad0233e4c21e0030ba0c438f1b5d750a0a5ec",
+    "baseline_tree": "11dbbfffcd88d9311fad9d1c1eb2ebe04a9a4f40",
+    "branch": "codex/mbo-completed-event-semantics-20260729",
+    "normative_dbn_crate_version": "0.20.0",
+    "normative_dbn_source_commit": "d9fad40a9916d6f0e2c0267831e94eb393bc0161",
+    "completed_event_code_changed": false,
+    "legacy_code_changed": false,
+    "reason_no_code_change": "The contradiction is in the accepted event-boundary specification, not a remediable implementation defect. Encoding a terminal-sequence lookahead without new authority would silently change the estimand and its causal timing."
+  },
+  "reference_decoder": {
+    "executable": "/Users/knight/.cargo/bin/dbn",
+    "version": "dbn-cli 0.20.1",
+    "sha256": "21863a4a05c85584a9195897e1c7f7c4e54322875a8268f4d92c4594fd0ddc9f",
+    "output_encoding": "NDJSON",
+    "timestamps_and_prices": "raw integer strings",
+    "source_ordinal_definition": "One-based body-record position in reference CLI NDJSON output."
+  },
+  "sources": {
+    "mbo": {
+      "workspace_path": "data/XNAS_ITCH/NVDA/mbo_2025-02-03_to_2026-01-07/xnas-itch-20250703.mbo.dbn.zst",
+      "resolved_storage_root": "/Volumes/WD_Black/HFT-data",
+      "size_bytes": 78975669,
+      "sha256": "8e81bc0ec98581d4cc661b2e448f257d8832dcc9373eb4260ac0abd2345f82e6",
+      "manifest_path": "data/XNAS_ITCH/NVDA/mbo_2025-02-03_to_2026-01-07/manifest.json",
+      "manifest_sha256": "f7f7b29706b6cd809a2ebfb4d232eda7753e86b9e244953a3206165925638c65",
+      "manifest_size_and_hash_match": true,
+      "dataset": "XNAS.ITCH",
+      "schema": "mbo",
+      "dbn_version": 1,
+      "start_ns": "1751500800000000000",
+      "end_ns": "1751587200000000000",
+      "raw_symbol": "NVDA",
+      "instrument_id": 11667,
+      "publisher_id": 2
+    },
+    "mbp10": {
+      "workspace_path": "data/NVDA_MBP10_2025-07/xnas-itch-20250703.mbp-10.dbn.zst",
+      "resolved_storage_root": "/Volumes/WD_Black/HFT-data",
+      "size_bytes": 62293248,
+      "sha256": "4a9eed0cd2021156f2f2b4128ca3215e07240dc8e777408c34d65ccd1eb1003b",
+      "manifest_path": "data/NVDA_MBP10_2025-07/manifest.json",
+      "manifest_sha256": "c88c4d09abecb56234b0940091ed7470804e859cebd8259f4ccb0e3654568dd7",
+      "manifest_size_and_hash_match": true,
+      "dataset": "XNAS.ITCH",
+      "schema": "mbp-10",
+      "dbn_version": 1,
+      "start_ns": "1751500800000000000",
+      "end_ns": "1751587200000000000",
+      "raw_symbol": "NVDA",
+      "instrument_id": 11667,
+      "publisher_id": 2
+    }
+  },
+  "measurement_definition": {
+    "population": "Every decoded body record in both pinned 2025-07-03 files.",
+    "reference_decode_commands": {
+      "mbo": "/Users/knight/.cargo/bin/dbn -J data/XNAS_ITCH/NVDA/mbo_2025-02-03_to_2026-01-07/xnas-itch-20250703.mbo.dbn.zst",
+      "mbp10": "/Users/knight/.cargo/bin/dbn -J data/NVDA_MBP10_2025-07/xnas-itch-20250703.mbp-10.dbn.zst",
+      "mbo_projection": "jq -r '[.hd.publisher_id,.hd.instrument_id,.channel_id,.sequence,.action,.flags,.hd.ts_event,.ts_recv] | @tsv'",
+      "mbp10_projection": "jq -r '[.hd.publisher_id,.hd.instrument_id,.sequence,.action,.flags,.hd.ts_event,.ts_recv] | @tsv'"
+    },
+    "reducer": {
+      "language": "single-pass AWK over projected TSV",
+      "ordering": "Reference decoder source order; no sort, join, deduplication, or timestamp reordering.",
+      "flush_rule": "Flush the current sequence block when the projected block key changes and once at clean EOF.",
+      "record_count": "Increment once for every projected body record.",
+      "sequence_blocks": "Increment once for every flushed nonempty maximal contiguous block.",
+      "multi_record_sequence_blocks": "Increment when block_record_count > 1.",
+      "repeated_last_sequence_blocks": "Increment when sum((flags div 128) mod 2) > 1 inside the block.",
+      "tfc_sequence_blocks": "Increment when the MBO block contains at least one T, at least one F, and at least one C.",
+      "tfc_all_last_sequence_blocks": "Increment when the MBO block is T/F/C-bearing and last_count == block_record_count.",
+      "tfc_no_last_sequence_blocks": "Increment when the MBO block is T/F/C-bearing and last_count == 0.",
+      "execution_bearing_terminal_sequence_blocks": "Increment when the MBO block contains T or F and last_count > 0.",
+      "tc_sequence_blocks": "Increment when the MBP-10 block contains at least one T and at least one C.",
+      "tc_all_last_sequence_blocks": "Increment when the MBP-10 block is T/C-bearing and last_count == block_record_count."
+    },
+    "sequence_block_key_mbo": [
+      "publisher_id",
+      "instrument_id",
+      "channel_id",
+      "sequence"
+    ],
+    "sequence_block_key_mbp10": [
+      "publisher_id",
+      "instrument_id",
+      "sequence"
+    ],
+    "sequence_block_definition": "A maximal contiguous source-order run with the stated key.",
+    "last_test": "(flags & 128) != 0",
+    "tfc_all_last_definition": "A sequence block contains T, F, and C and every member has LAST set.",
+    "tfc_no_last_definition": "A sequence block contains T, F, and C and no member has LAST set.",
+    "tc_all_last_definition": "An MBP-10 sequence block contains T and C and every member has LAST set.",
+    "sorting_or_reordering_applied": false,
+    "nearest_timestamp_matching_applied": false
+  },
+  "full_source_file_measurements": {
+    "mbo": {
+      "decoded_records": 5098240,
+      "sequence_blocks": 3933349,
+      "multi_record_sequence_blocks": 948705,
+      "repeated_last_sequence_blocks": 79460,
+      "tfc_sequence_blocks": 216186,
+      "tfc_all_last_sequence_blocks": 79460,
+      "tfc_no_last_sequence_blocks": 136726,
+      "execution_bearing_terminal_sequence_blocks": 117423,
+      "tfc_all_last_share_of_tfc": 0.367553865653,
+      "tfc_no_last_share_of_tfc": 0.632446134347,
+      "repeated_last_share_of_all_sequence_blocks": 0.020201614451
+    },
+    "mbp10": {
+      "decoded_records": 2328521,
+      "sequence_blocks": 2249061,
+      "multi_record_sequence_blocks": 79460,
+      "repeated_last_sequence_blocks": 79460,
+      "tc_sequence_blocks": 79460,
+      "tc_all_last_sequence_blocks": 79460
+    },
+    "cross_schema_checks": {
+      "mbo_tfc_all_last_equals_mbp10_tc_all_last": true,
+      "mbo_repeated_last_equals_mbp10_repeated_last": true,
+      "count_value": 79460,
+      "interpretation": "The repeated-LAST pattern is systematic and corroborated in the separately encoded provider-derived MBP-10 companion. The two schemas share upstream venue/provider lineage and are not statistically independent. The agreement rules out an isolated malformed MBO record."
+    }
+  },
+  "flag_semantics": {
+    "raw_value": 130,
+    "hex_value": "0x82",
+    "last_mask": 128,
+    "last_set": true,
+    "other_set_mask": 2,
+    "pinned_dbn_v0_20_0_interpretation": "The pinned source names bit 0x80 as LAST but does not name bit 0x02.",
+    "current_databento_documentation_interpretation": "Current Databento documentation names bit 0x02 F_PUBLISHER_SPECIFIC and states that its meaning depends on the publisher.",
+    "qualification": "The XNAS meaning of bit 0x02 is unresolved under the pinned decoder contract. The blocker uses only the raw byte and the pinned LAST mask; it does not infer closure semantics from the publisher-specific bit.",
+    "impact": "The unresolved publisher-specific bit strengthens the fail-closed disposition and forbids generalizing the observed pattern to another publisher."
+  },
+  "contradictory_windows": {
+    "same_sequence_repeated_last_mbo": {
+      "identity": {
+        "publisher_id": 2,
+        "instrument_id": 11667,
+        "channel_id": 0
+      },
+      "sequence": 348451,
+      "ts_event_ns": "1751529621220785979",
+      "ts_recv_ns": "1751529621220951900",
+      "records": [
+        {
+          "source_ordinal": 338,
+          "action": "T",
+          "side": "A",
+          "price_nanos": "157570000000",
+          "size": 7,
+          "order_id": "0",
+          "flags": 130,
+          "last_set": true,
+          "ts_in_delta_ns": 165921
+        },
+        {
+          "source_ordinal": 339,
+          "action": "F",
+          "side": "B",
+          "price_nanos": "157570000000",
+          "size": 7,
+          "order_id": "352103",
+          "flags": 130,
+          "last_set": true,
+          "ts_in_delta_ns": 165921
+        },
+        {
+          "source_ordinal": 340,
+          "action": "C",
+          "side": "B",
+          "price_nanos": "157570000000",
+          "size": 7,
+          "order_id": "352103",
+          "flags": 130,
+          "last_set": true,
+          "ts_in_delta_ns": 165921
+        }
+      ],
+      "next_same_identity_record": {
+        "source_ordinal": 341,
+        "sequence": 348803,
+        "ts_event_ns": "1751529621378002483",
+        "ts_recv_ns": "1751529621378167834",
+        "action": "A",
+        "flags": 130
+      }
+    },
+    "same_endpoint_mbp10": {
+      "identity": {
+        "publisher_id": 2,
+        "instrument_id": 11667
+      },
+      "sequence": 348451,
+      "ts_event_ns": "1751529621220785979",
+      "ts_recv_ns": "1751529621220951900",
+      "records": [
+        {
+          "source_ordinal": 167,
+          "action": "T",
+          "side": "A",
+          "price_nanos": "157570000000",
+          "size": 7,
+          "flags": 130,
+          "last_set": true,
+          "level_0_bid_price_nanos": "157570000000",
+          "level_0_bid_size": 100,
+          "level_0_bid_order_count": 1
+        },
+        {
+          "source_ordinal": 168,
+          "action": "C",
+          "side": "B",
+          "price_nanos": "157570000000",
+          "size": 7,
+          "flags": 130,
+          "last_set": true,
+          "level_0_bid_price_nanos": "157570000000",
+          "level_0_bid_size": 93,
+          "level_0_bid_order_count": 1
+        }
+      ],
+      "next_same_identity_record": {
+        "source_ordinal": 169,
+        "sequence": 350013,
+        "ts_event_ns": "1751529622008068625",
+        "ts_recv_ns": "1751529622008233926",
+        "action": "A",
+        "flags": 130
+      }
+    },
+    "multi_sequence_terminal_event_mbo": {
+      "identity": {
+        "publisher_id": 2,
+        "instrument_id": 11667,
+        "channel_id": 0
+      },
+      "ts_event_ns": "1751529633823886806",
+      "ts_recv_ns": "1751529633824055504",
+      "records": [
+        {
+          "source_ordinal": 566,
+          "sequence": 372624,
+          "action": "T",
+          "side": "A",
+          "price_nanos": "157600000000",
+          "size": 298,
+          "order_id": "0",
+          "flags": 0,
+          "last_set": false
+        },
+        {
+          "source_ordinal": 567,
+          "sequence": 372624,
+          "action": "F",
+          "side": "B",
+          "price_nanos": "157600000000",
+          "size": 298,
+          "order_id": "405675",
+          "flags": 0,
+          "last_set": false
+        },
+        {
+          "source_ordinal": 568,
+          "sequence": 372624,
+          "action": "C",
+          "side": "B",
+          "price_nanos": "157600000000",
+          "size": 298,
+          "order_id": "405675",
+          "flags": 0,
+          "last_set": false
+        },
+        {
+          "source_ordinal": 569,
+          "sequence": 372625,
+          "action": "T",
+          "side": "A",
+          "price_nanos": "157590000000",
+          "size": 50,
+          "order_id": "0",
+          "flags": 0,
+          "last_set": false
+        },
+        {
+          "source_ordinal": 570,
+          "sequence": 372625,
+          "action": "F",
+          "side": "B",
+          "price_nanos": "157590000000",
+          "size": 50,
+          "order_id": "401355",
+          "flags": 0,
+          "last_set": false
+        },
+        {
+          "source_ordinal": 571,
+          "sequence": 372625,
+          "action": "C",
+          "side": "B",
+          "price_nanos": "157590000000",
+          "size": 50,
+          "order_id": "401355",
+          "flags": 0,
+          "last_set": false
+        },
+        {
+          "source_ordinal": 572,
+          "sequence": 372626,
+          "action": "T",
+          "side": "N",
+          "price_nanos": "157590000000",
+          "size": 70,
+          "order_id": "0",
+          "flags": 130,
+          "last_set": true
+        }
+      ],
+      "next_same_identity_record": {
+        "source_ordinal": 573,
+        "sequence": 372627,
+        "ts_event_ns": "1751529633823912462",
+        "ts_recv_ns": "1751529633824077619",
+        "action": "A",
+        "flags": 130
+      },
+      "interpretation_limit": "This window proves that sequence cannot be a universal completed-event key. It does not by itself authorize a new grouping rule."
+    }
+  },
+  "literal_spec_failure": {
+    "same_sequence_348451_immediate_last_result": {
+      "completed_groups": 3,
+      "execution_groups": 2,
+      "raw_execution_carriers_retained": 2,
+      "book_mutation_groups": 1,
+      "state_after_first_last_bid_size_at_157570000000": 100,
+      "terminal_state_after_cancel_bid_size_at_157570000000": 93
+    },
+    "required_result": {
+      "completed_groups": 1,
+      "execution_groups": 1,
+      "raw_execution_carriers_retained": 2,
+      "terminal_state_after_cancel_bid_size_at_157570000000": 93
+    },
+    "failed_invariants": [
+      "One normalized event per qualified completed venue event.",
+      "One execution group when the completed event contains T or F.",
+      "No published event or book state before the completed event boundary.",
+      "MBO and MBP-10 endpoint comparison at the same completed venue event.",
+      "Correct event intensity and execution_price_change_proxy_v1 inputs."
+    ]
+  },
+  "rejected_silent_repairs": [
+    {
+      "repair": "Treat every LAST-bearing record as an independent completed event.",
+      "reason": "Splits one normalized Nasdaq execution, double-counts executions, and exposes the pre-C book."
+    },
+    {
+      "repair": "Group every record with the same venue sequence.",
+      "reason": "Fails the observed multi-sequence event and contradicts DECISION-030's instruction that sequence is validation evidence rather than the sole group identity."
+    },
+    {
+      "repair": "Treat repeated LAST inside a terminal sequence block as one terminator and close on the next different-sequence record.",
+      "reason": "Scientifically plausible for pinned XNAS bytes, but it changes the accepted closure rule and requires a later closure witness."
+    },
+    {
+      "repair": "Use max member ts_recv after terminal-sequence lookahead.",
+      "reason": "Backdates knowledge of closure. If the later boundary witness is required, causal availability must include the witness observation time."
+    },
+    {
+      "repair": "Infer closure at EOF.",
+      "reason": "EOF provides no timestamped causal market-data witness and cannot safely be backdated."
+    }
+  ],
+  "remediation_accounting": {
+    "implementation_remediation_attempts": 0,
+    "authorized_code_remediation_available": false,
+    "reason": "Every candidate that joins repeated-LAST records changes the accepted event-boundary rule. Every causal implementation that waits for a boundary witness also changes the accepted availability rule. Neither change is an implementation-only remediation authorized by the accepted bytes.",
+    "decision_030_second_failure_clause": "Section 6 allows one remediation and requires the named blocker after a second conformance failure; it does not require an unavailable or specification-changing remediation.",
+    "controlling_terminal_authority": "Section 2 ends the bounded authorization when a terminal blocker is emitted, the required-artifact order allows each cycle to end with one explicit blocker, and the acceptance record states that the first gate either passes or records one terminal blocker.",
+    "classification": "PRE_IMPLEMENTATION_SPECIFICATION_BLOCKER",
+    "why_terminal_now": "No conforming completed-event implementation can be written under current authority. Continuing would either knowingly emit false groups or silently supersede accepted governance."
+  },
+  "minimum_superseding_clarification": {
+    "scope": "Pinned XNAS.ITCH normalization only; no cross-publisher generalization.",
+    "required_points": [
+      "Define a same-identity terminal sequence block and the handling of repeated LAST inside it.",
+      "Permit an open venue event to contain preceding non-LAST sequence blocks.",
+      "Specify whether block contiguity is global or per publisher/instrument identity.",
+      "Define the exact timestamped boundary witness that makes closure causally observable.",
+      "Set publishable availability to max(member ts_recv, closure-witness observation time) unless an independently pinned atomic envelope proves immediate closure.",
+      "Quarantine an EOF candidate without an authorized timestamped closure witness.",
+      "Add same-sequence T/F/C-all-LAST, MBP T/C-all-LAST, multi-sequence terminal-block, cross-identity, and one-nanosecond cutoff goldens."
+    ],
+    "operator_acceptance_required": true,
+    "accepted_decision_must_not_be_edited_in_place": true
+  },
+  "adversarial_review": {
+    "independent_reviewers": [
+      {
+        "task_id": "/root/mbo_semantics_vendor",
+        "role": "microstructure_quant_theorist",
+        "disposition": "REVISE-ONCE",
+        "completed_by_utc": "2026-07-29T16:55:56Z",
+        "exact_completion_time_available": false,
+        "reviewed_scope": "Accepted DECISION-030 clauses, pinned DBN source semantics, exact MBO/MBP contradictory windows supplied by the main thread, and the proposed XNAS terminal-sequence repair.",
+        "reviewed_artifact_sha256": null
+      },
+      {
+        "task_id": "/root/mbo_semantics_api",
+        "role": "independent_api_and_code_reviewer",
+        "disposition": "REVISE-ONCE",
+        "completed_by_utc": "2026-07-29T16:55:56Z",
+        "exact_completion_time_available": false,
+        "reviewed_scope": "Accepted DECISION-030 clauses, live Rust API/code boundaries, exact MBO/MBP contradictory windows supplied by the main thread, and causal availability implications.",
+        "reviewed_artifact_sha256": null
+      },
+      {
+        "task_id": "/root/mbo_semantics_adversary",
+        "role": "hft_architect_adversary",
+        "disposition": "REVISE-ONCE",
+        "completed_by_utc": "2026-07-29T16:55:56Z",
+        "exact_completion_time_available": false,
+        "reviewed_scope": "Accepted DECISION-030 clauses, live Rust architecture and legacy defects, exact MBO/MBP contradictory windows supplied by the main thread, and termination gates.",
+        "reviewed_artifact_sha256": null
+      }
+    ],
+    "consensus": "No production completed-event implementation can both obey DECISION-030 literally and qualify the observed XNAS execution blocks. Under current authority, emit the blocker and stop.",
+    "disagreement": null,
+    "scope_clarification": "These three reviewers adjudicated the semantic contradiction and stop decision before this JSON existed; they did not review exact artifact bytes.",
+    "post_cycle_reviews": [
+      {
+        "task_id": "/root/mbo_blocker_metrics_final",
+        "role": "metrics_validator",
+        "disposition": "PASS",
+        "completed_by_utc": "2026-07-29T16:55:56Z",
+        "exact_completion_time_available": false,
+        "reviewed_artifact_sha256": "98a477b1a43a028ce01fda358ac40742f25d80581ef823e7c309225b874045d0",
+        "reviewed_scope": "Two complete decoder lanes, every stored count and proportion, 144 disputed-window fields, source/manifest/CLI/authority hashes, and the immediate-LAST numerical consequence.",
+        "correction_required": false
+      },
+      {
+        "task_id": "/root/mbo_blocker_authority_final",
+        "role": "doc_alignment_auditor",
+        "disposition": "REVISE",
+        "completed_by_utc": "2026-07-29T16:55:56Z",
+        "exact_completion_time_available": false,
+        "reviewed_artifact_sha256": "98a477b1a43a028ce01fda358ac40742f25d80581ef823e7c309225b874045d0",
+        "reviewed_scope": "Line-by-line authority, archival completeness, live identity, prohibition compliance, and claim calibration.",
+        "required_revision_topics": [
+          "measurement provenance and counter formulas",
+          "flags-130 publisher-specific ambiguity",
+          "remediation threshold accounting",
+          "review traceability",
+          "claim calibration",
+          "local named-file sealing"
+        ]
+      }
+    ]
+  },
+  "termination": {
+    "mbo_semantics_conformance_v1_emitted": false,
+    "f064_row_v1_emitted": false,
+    "f064_three_session_golden_v1_emitted": false,
+    "f064_source_cohort_v1_emitted": false,
+    "f064_r1_result_v1_emitted": false,
+    "f064_r1_independent_verification_v1_emitted": false,
+    "corrected_market_row_count": 0,
+    "model_training_run": false,
+    "backtest_run": false,
+    "data_purchase_made": false,
+    "production_activation_made": false,
+    "empirical_wiki_registration_made": false,
+    "historical_artifact_overwritten": false,
+    "claude_surface_changed": false,
+    "push_made": false,
+    "next_action": "Obtain exact operator acceptance of a narrow immutable superseding clarification, then restart MBO Cycle 1 from the pinned sources. Without that authority, the bounded F064 slice remains terminated."
+  },
+  "documentation_evidence": [
+    {
+      "source": "Databento XNAS.ITCH venue and dataset specification",
+      "url": "https://databento.com/docs/venues-and-datasets/xnas-itch",
+      "use": "XNAS Order Executed normalization emits execution and book-removal records with shared venue sequence evidence."
+    },
+    {
+      "source": "Databento common fields, enums, and types",
+      "url": "https://databento.com/docs/standards-and-conventions/common-fields-enums-types",
+      "use": "LAST is documented as the final record in a venue event for an instrument."
+    },
+    {
+      "source": "Pinned dbn v0.20.0 flags.rs",
+      "path": "/Users/knight/.cargo/git/checkouts/dbn-2a1f7b3a87238bdb/d9fad40/rust/dbn/src/flags.rs",
+      "use": "Raw LAST mask 0x80 and pinned flag semantics."
+    }
+  ]
+}
