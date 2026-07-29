@@ -1395,6 +1395,34 @@ impl LobReconstructor {
         self.orders.len()
     }
 
+    /// Snapshot per-level order counts in the same price order as [`LobState`].
+    ///
+    /// This additive view is used by the bounded XNAS MBO-versus-MBP-10
+    /// conformance lane.  It does not alter reconstruction or legacy export
+    /// behavior.
+    pub fn level_order_counts(
+        &self,
+    ) -> (
+        [usize; crate::types::MAX_LOB_LEVELS],
+        [usize; crate::types::MAX_LOB_LEVELS],
+    ) {
+        let mut bid_counts = [0; crate::types::MAX_LOB_LEVELS];
+        let mut ask_counts = [0; crate::types::MAX_LOB_LEVELS];
+        for (idx, level) in self
+            .bids
+            .values()
+            .rev()
+            .take(self.config.levels)
+            .enumerate()
+        {
+            bid_counts[idx] = level.order_count();
+        }
+        for (idx, level) in self.asks.values().take(self.config.levels).enumerate() {
+            ask_counts[idx] = level.order_count();
+        }
+        (bid_counts, ask_counts)
+    }
+
     /// Get number of price levels on bid side.
     pub fn bid_levels(&self) -> usize {
         self.bids.len()
