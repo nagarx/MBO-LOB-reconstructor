@@ -1,0 +1,133 @@
+{
+  "schema_version": "1.0",
+  "artifact_id": "MBO_SEMANTICS_BLOCKER_V2",
+  "artifact_kind": "terminal_blocker",
+  "status": "BLOCKED_SPECIFICATION_CONTRADICTION",
+  "created_at_utc": "2026-07-29T23:46:55Z",
+  "terminal_for_current_authority": true,
+  "failure_stage": "PRE_COMPUTE_EXECUTABLE_GATE_DEFINITION",
+  "failure_code": "UNPINNED_MBO_MBP_SECONDARY_ESTIMANDS_AND_INFERENCE",
+  "authority": {
+    "decision_030": {
+      "repository_commit": "529895a199d543247412b9d54f605572b2c953c9",
+      "path": "ledgers/decisions/DECISION-030-bounded-f064-corrected-vertical-slice.md",
+      "live_file_sha256": "c4ed26a0733fd89d1a3dfc8ab706d5498c44f89ddf991da5864784a7a915bb8b"
+    },
+    "decision_031": {
+      "repository_commit": "529895a199d543247412b9d54f605572b2c953c9",
+      "path": "ledgers/decisions/DECISION-031-xnas-terminal-sequence-block-causal-clarification.md",
+      "live_file_sha256": "f2ebbad328baea41e1afc292f97420a77e8e609258ffcf2009be8098dd961c5b"
+    },
+    "decision_030_acceptance": {
+      "path": "meta/2026-07-29-bounded-f064-corrected-vertical-slice-acceptance.md",
+      "live_file_sha256": "2ec893944bccdd9cf2ce7e7e88b4dd99619b40ee57c258829a8b0a1af874118a"
+    },
+    "decision_031_acceptance": {
+      "path": "meta/2026-07-29-xnas-terminal-sequence-block-causal-clarification-acceptance.md",
+      "live_file_sha256": "f6b4b9875cea55e5af62b73f576486ef3811498db6cc25a84b5a58586e058b3b"
+    },
+    "preserved_blocker_v1": {
+      "commit": "f3bc6ff58bbfd2342f36ee31cb67860cb3b52b58",
+      "path": "results/MBO_SEMANTICS_BLOCKER_V1.json",
+      "sha256": "4b56c89b5e2b8796e9badc1a6af01ad78208accbbe02fb74bcee0ebf08b51e51"
+    },
+    "mbo_repository_head_at_detection": {
+      "commit": "d622b3c71e1bb341613cd4fdc8f27fba24256db5",
+      "tree": "36c0cec7be45893141de7fdedd8c13b4c8f18727"
+    }
+  },
+  "contradiction": {
+    "required_but_undefined": [
+      "An executable warm-and-clean eligibility predicate for the MBO/MBP-10 comparator population.",
+      "An executable predicate defining when provider MBP-10 order counts and independently reconstructed active-order counts are semantically comparable.",
+      "Whether L1 means level-one size or an l1 depth norm, including the exact bid/ask/level aggregation.",
+      "The baseline comparator, paired observational unit, normalization, aggregation, and zero-denominator policy for relative size improvement.",
+      "The confidence level, sidedness, estimator, resampling unit, serial-dependence treatment, block length, random seed, and finite-sample rule for the required positive paired lower confidence bound.",
+      "The price-match numerator and denominator and whether the 0.1-percentage-point noninferiority margin applies to a point estimate or a confidence bound.",
+      "The treatment of unmatched, ambiguous, and flagged endpoints, including whether each class enters or is excluded from each denominator and how each class affects every pass-fail gate."
+    ],
+    "why_exact_parity_is_not_a_resolution": [
+      "Primary/reference parity compares two implementations within one schema; it does not establish MBO-versus-MBP-10 equality.",
+      "Exact ten-level equality on a matched subset does not define the warm-clean or semantically-comparable population.",
+      "Exact equality cannot imply a strictly positive paired improvement lower bound. Against an exact baseline the improvement is zero; without a pinned baseline it is undefined.",
+      "DECISION-030 calls the quantitative gates secondary only in the sense that they cannot rescue an unexplained absolute mismatch; it does not make them optional.",
+      "DECISION-031 explicitly preserves the original comparable-count, anomaly, warm-clean, primary-reference, and residual-classification gates."
+    ],
+    "why_defaults_are_forbidden": [
+      "Treating endpoint observations as iid without a pinned dependence assessment and dependence-aware uncertainty rule could produce anti-conservative uncertainty; neither the qualified endpoint population nor its dependence has been computed.",
+      "Choosing a bootstrap, block length, confidence level, denominator, or comparator after seeing the source would introduce researcher degrees of freedom.",
+      "A separately labelled forensic comparison with the legacy R0 bridge is not categorically forbidden, but the bridge was never pinned as the pass-fail baseline and cannot acquire that authority by analyst choice."
+    ]
+  },
+  "definition_search": {
+    "searched_live_roots": [
+      "hft-wiki",
+      ".worktrees/rederive-f064-p12-lean-20260728",
+      ".worktrees/mbo-completed-event-semantics-20260729",
+      "glbx_discovery",
+      "MBO-LOB-reconstructor",
+      "xsec_equity_discovery",
+      "hft-metrics"
+    ],
+    "file_types": [
+      "md",
+      "json",
+      "rs",
+      "py"
+    ],
+    "case_insensitive_terms": [
+      "warm.?clean",
+      "relative L1 size",
+      "paired lower confidence",
+      "price non.?inferiority",
+      "semantically comparable"
+    ],
+    "matching_line_count": 4,
+    "matching_lines_sha256": "4f206e2589158486513bf08a4a935b28867c2633d915802327d7a011b692d940",
+    "result": "Only the requirement prose in DECISION-030 and DECISION-031 matched; no executable definition, configuration, test, or accepted statistical specification was found.",
+    "git_history_result": "The terms enter hft-wiki history at commit 7a8098fff13b5c9687fc1cdac2d761ebef922ce7 without the missing definitions; no relevant implementation history was found in the named owner repositories."
+  },
+  "independent_reviews": [
+    {
+      "scope": "source_semantics_and_microstructure",
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "ultra",
+      "verdict": "TERMINAL_SPEC_GAP",
+      "conclusion": "No unique implementable interpretation is derivable, and exact parity cannot make the preserved gates vacuous."
+    },
+    {
+      "scope": "statistics_and_inference",
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "ultra",
+      "verdict": "TERMINAL_SPEC_GAP",
+      "conclusion": "No estimator or dependence-aware confidence procedure is pinned; choosing one now would create post-specification researcher degrees of freedom."
+    }
+  ],
+  "compute_boundary": {
+    "ssd_market_source_opened": false,
+    "market_record_decoded": false,
+    "market_statistic_computed": false,
+    "source_data_modified": false,
+    "data_purchase_requested": false,
+    "reason": "The contradiction is upstream of any truthful pass-fail market computation."
+  },
+  "required_resolution": {
+    "operator_or_accepted_decision_must_choose_one": [
+      "Pin every missing population, estimand, comparator, denominator, uncertainty, dependence, seed, and threshold definition before restarting conformance.",
+      "Explicitly amend the accepted authority so the three underdefined quantitative measures are report-only diagnostics with no pass-fail authority, while still pinning warm-clean and comparable-count predicates."
+    ],
+    "forbidden_resolution": "Do not infer defaults from observed 2025-07-03 data, a prior percentage, the legacy R0 path, or an iid endpoint bootstrap."
+  },
+  "stopping_rule": {
+    "authority": "DECISION-031 section 9",
+    "effect": "This further specification contradiction emits MBO_SEMANTICS_BLOCKER_V2.json and terminates the restarted MBO Cycle 1. MBO_SEMANTICS_CONFORMANCE_V1.json and every later F064 artifact are ineligible under the current authority."
+  },
+  "claim_boundary": {
+    "empirical_result": false,
+    "finding_064_rederived": false,
+    "market_edge_claim": false,
+    "profitability_claim": false,
+    "tradeability_claim": false,
+    "wiki_registration_authorized": false
+  }
+}
