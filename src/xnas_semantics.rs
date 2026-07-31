@@ -11,12 +11,8 @@
 //! not a generic MBO packet or economic-execution boundary.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::io::{BufReader, Read};
 use std::num::NonZeroU64;
-use std::path::Path;
 
 use crate::{
     Action, BookConsistency, LobConfig, LobReconstructor, LobState, MboMessage, Side, TlobError,
@@ -265,33 +261,23 @@ impl RawMbp10RecordV1 {
     }
 }
 
+/// Return the receive-clock contribution admitted to the MBP-10 causal
+/// watermark. Undefined and BAD_TS_RECV clocks contribute nothing;
+/// MAYBE_BAD_BOOK remains a timestamped source record and contributes before
+/// its semantic quarantine.
+pub(crate) fn xnas_mbp10_watermark_contribution(record: &RawMbp10RecordV1) -> Option<u64> {
+    if record.ts_recv == DBN_UNDEF_TIMESTAMP || record.flags & DBN_FLAG_BAD_TS_RECV != 0 {
+        None
+    } else {
+        Some(record.ts_recv)
+    }
+}
+
 /// The two schemas admitted by the bounded conformance lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum XnasSchemaV1 {
     Mbo,
     Mbp10,
-}
-
-/// Expected source/metadata facts read from the sealed conformance authority.
-///
-/// The conformance runner must populate these expected values directly from
-/// the accepted blocker.  [`XnasDailySourceQualificationV1::verify_local_files`]
-/// independently reads and hashes both local files; callers cannot supply
-/// "observed" values.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct XnasSourceEvidenceInputV1 {
-    pub dataset: String,
-    pub schema: XnasSchemaV1,
-    pub dbn_version: u8,
-    pub ts_out: bool,
-    pub partial_symbols: Vec<String>,
-    pub not_found_symbols: Vec<String>,
-    pub manifest_path: String,
-    pub expected_manifest_sha256: String,
-    pub source_path: String,
-    pub expected_source_size: u64,
-    pub expected_source_sha256: String,
-    pub expected_identities: BTreeSet<XnasIdentityV1>,
 }
 
 /// Opaque evidence token required by each strict stream.
@@ -306,50 +292,37 @@ pub struct XnasDailySourceQualificationV1 {
 }
 
 impl XnasDailySourceQualificationV1 {
-    /// Bind the opaque token to bytes read from the named local files.
+    /// Construct the strict token from source and manifest images that were
+    /// already read once and verified against the accepted authority.
     ///
-    /// This is an evidence check, not an authority selector.  The accepted
-    /// blocker remains the sole source of the expected hashes, size, schema,
-    /// and identities used by the conformance runner.
-    pub fn verify_local_files(
-        input: XnasSourceEvidenceInputV1,
+    /// This internal constructor performs no path I/O.  Its caller must own
+    /// the immutable byte images used by every decoder lane.
+    pub(crate) fn from_verified_images(
+        schema: XnasSchemaV1,
+        expected_identities: BTreeSet<XnasIdentityV1>,
+        source_path: String,
+        source_sha256: String,
+        manifest_path: String,
+        manifest_sha256: String,
     ) -> Result<Self, XnasSemanticsError> {
-        if input.dataset != "XNAS.ITCH"
-            || input.dbn_version != 1
-            || input.ts_out
-            || !input.partial_symbols.is_empty()
-            || !input.not_found_symbols.is_empty()
-            || input.expected_source_size == 0
-            || !is_lower_hex_sha256(&input.expected_source_sha256)
-            || !is_lower_hex_sha256(&input.expected_manifest_sha256)
-            || input.manifest_path.is_empty()
-            || input.source_path.is_empty()
-            || input.expected_identities.is_empty()
-            || input
-                .expected_identities
+        if expected_identities.is_empty()
+            || expected_identities
                 .iter()
                 .any(|identity| identity.publisher_id != XNAS_ITCH_PUBLISHER_ID)
-        {
-            return Err(XnasSemanticsError::SourceNotQualified);
-        }
-        let observed_source_size = std::fs::metadata(&input.source_path)
-            .map_err(source_evidence_io)?
-            .len();
-        let observed_source_sha256 = sha256_file(&input.source_path)?;
-        let observed_manifest_sha256 = sha256_file(&input.manifest_path)?;
-        if observed_source_size != input.expected_source_size
-            || observed_source_sha256 != input.expected_source_sha256
-            || observed_manifest_sha256 != input.expected_manifest_sha256
+            || source_path.is_empty()
+            || manifest_path.is_empty()
+            || !is_lower_hex_sha256(&source_sha256)
+            || !is_lower_hex_sha256(&manifest_sha256)
         {
             return Err(XnasSemanticsError::SourceNotQualified);
         }
         Ok(Self {
-            schema: input.schema,
-            expected_identities: input.expected_identities,
-            source_path: input.source_path,
-            source_sha256: observed_source_sha256,
-            manifest_path: input.manifest_path,
-            manifest_sha256: observed_manifest_sha256,
+            schema,
+            expected_identities,
+            source_path,
+            source_sha256,
+            manifest_path,
+            manifest_sha256,
         })
     }
 
@@ -376,25 +349,6 @@ impl XnasDailySourceQualificationV1 {
     pub fn manifest_sha256(&self) -> &str {
         &self.manifest_sha256
     }
-}
-
-fn sha256_file(path: impl AsRef<Path>) -> Result<String, XnasSemanticsError> {
-    let file = File::open(path.as_ref()).map_err(source_evidence_io)?;
-    let mut reader = BufReader::new(file);
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut buffer).map_err(source_evidence_io)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn source_evidence_io(error: std::io::Error) -> XnasSemanticsError {
-    XnasSemanticsError::SourceEvidenceIo(error.kind().to_string())
 }
 
 fn is_lower_hex_sha256(value: &str) -> bool {
@@ -473,8 +427,6 @@ pub enum XnasSemanticsError {
     SourceOrdinalMismatch { expected: u64, observed: u64 },
     #[error("source qualification failed")]
     SourceNotQualified,
-    #[error("source evidence I/O failed: {0}")]
-    SourceEvidenceIo(String),
     #[error("record type {observed:#04x} does not match expected {expected:#04x}")]
     WrongRecordType { expected: u8, observed: u8 },
     #[error("unexpected identity: publisher={publisher_id}, instrument={instrument_id}")]
@@ -570,7 +522,6 @@ impl XnasSemanticsError {
             Self::ZeroSourceOrdinal => "ZERO_SOURCE_ORDINAL",
             Self::SourceOrdinalMismatch { .. } => "SOURCE_ORDINAL_MISMATCH",
             Self::SourceNotQualified => "SOURCE_NOT_QUALIFIED",
-            Self::SourceEvidenceIo(_) => "SOURCE_EVIDENCE_IO",
             Self::WrongRecordType { .. } => "WRONG_RECORD_TYPE",
             Self::UnexpectedIdentity { .. } => "UNEXPECTED_IDENTITY",
             Self::InitialClearSignatureMismatch => "INITIAL_CLEAR_SIGNATURE_MISMATCH",
@@ -1158,7 +1109,7 @@ impl XnasMboStreamV1 {
     /// ordering violation, which invalidates every owned series and is
     /// artifact-terminal.  No public API exposes either the raw reducer
     /// transition or a separately mutable causal series.
-    pub fn push_causally(
+    pub(crate) fn push_causally(
         &mut self,
         record: RawMboRecordV1,
     ) -> Result<MboIngestOutcomeV1, XnasSemanticsError> {
@@ -1186,7 +1137,7 @@ impl XnasMboStreamV1 {
     /// lookahead and call this only while holding the first record that would
     /// lift the receive-time watermark above `decision_ns`.
     #[cfg_attr(not(test), allow(dead_code))]
-    fn emit_causal_midpoint_after_complete_prefix(
+    pub(crate) fn emit_causal_midpoint_after_complete_prefix(
         &mut self,
         identity: XnasIdentityV1,
         decision_ns: u64,
@@ -1305,11 +1256,13 @@ impl XnasMboStreamV1 {
 
         // Every finite, non-BAD receive clock in the decoded global prefix
         // contributes to H_n even when later semantic validation quarantines
-        // the record.
-        self.global_watermark = Some(
-            self.global_watermark
-                .map_or(record.ts_recv, |prior| prior.max(record.ts_recv)),
-        );
+        // the record. The source cursor uses this same helper before deciding
+        // whether the record lies inside N(t).
+        let receive_watermark_ns = xnas_mbo_watermark_contribution(&record)
+            .expect("the exact initial clear returned before receive-clock validation");
+        self.global_watermark = Some(self.global_watermark.map_or(receive_watermark_ns, |prior| {
+            prior.max(receive_watermark_ns)
+        }));
         {
             let state = self
                 .identities
@@ -1669,6 +1622,21 @@ fn is_initial_xnas_clear_control(record: &RawMboRecordV1) -> bool {
         && record.flags == DBN_FLAG_BAD_TS_RECV
 }
 
+/// Return the only receive-clock contribution admitted to the global causal
+/// watermark. The exact source-initial control and every undefined or
+/// BAD_TS_RECV clock contribute nothing. MAYBE_BAD_BOOK remains a timestamped
+/// source record and therefore contributes before its semantic quarantine.
+pub(crate) fn xnas_mbo_watermark_contribution(record: &RawMboRecordV1) -> Option<u64> {
+    if is_initial_xnas_clear_control(record)
+        || record.ts_recv == DBN_UNDEF_TIMESTAMP
+        || record.flags & DBN_FLAG_BAD_TS_RECV != 0
+    {
+        None
+    } else {
+        Some(record.ts_recv)
+    }
+}
+
 fn validate_receive_clock(ts_recv: u64, flags: u8) -> Result<(), XnasSemanticsError> {
     if ts_recv == DBN_UNDEF_TIMESTAMP {
         return Err(XnasSemanticsError::UndefinedTsRecv);
@@ -1859,6 +1827,10 @@ impl XnasMbp10StreamV1 {
         self.global_watermark
     }
 
+    pub(crate) fn terminal_error(&self) -> Option<&XnasSemanticsError> {
+        self.terminal_error.as_ref()
+    }
+
     /// Check both raw-record conservation and the live pending population.
     pub fn population_reconciles(&self) -> bool {
         self.counts.population_reconciles()
@@ -1918,10 +1890,11 @@ impl XnasMbp10StreamV1 {
             return self.fail_identity_with_current(identity, error);
         }
 
-        self.global_watermark = Some(
-            self.global_watermark
-                .map_or(record.ts_recv, |prior| prior.max(record.ts_recv)),
-        );
+        let receive_watermark_ns = xnas_mbp10_watermark_contribution(&record)
+            .expect("validated MBP record has a finite non-BAD receive clock");
+        self.global_watermark = Some(self.global_watermark.map_or(receive_watermark_ns, |prior| {
+            prior.max(receive_watermark_ns)
+        }));
         {
             let state = self.identities.get(&identity).expect("MBP identity exists");
             if let Some(last) = state.last_valid_ts_recv {
@@ -2340,14 +2313,14 @@ const XNAS_CAUSAL_STALENESS_NS: u64 = 5_000_000_000;
 /// explicit denominator of two avoids introducing binary floating-point into
 /// the conformance lane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct CausalBinnedMidpointV1 {
-    identity: XnasIdentityV1,
-    bin_start_ns: u64,
-    bin_available_ns: u64,
-    effective_available_ns: u64,
-    endpoint_ns: u64,
-    witness_source_ordinal: SourceOrdinal,
-    midpoint_twice: i128,
+pub(crate) struct CausalBinnedMidpointV1 {
+    pub(crate) identity: XnasIdentityV1,
+    pub(crate) bin_start_ns: u64,
+    pub(crate) bin_available_ns: u64,
+    pub(crate) effective_available_ns: u64,
+    pub(crate) endpoint_ns: u64,
+    pub(crate) witness_source_ordinal: SourceOrdinal,
+    pub(crate) midpoint_twice: i128,
 }
 
 /// One-identity causal midpoint adapter for the corrected F064 row.

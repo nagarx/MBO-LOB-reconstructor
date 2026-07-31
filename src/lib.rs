@@ -163,6 +163,16 @@ pub mod types;
 pub mod warnings;
 pub mod xnas_semantics;
 
+#[cfg(test)]
+mod xnas_semantics_integration_tests;
+
+#[cfg(feature = "databento")]
+#[cfg_attr(docsrs, doc(cfg(feature = "databento")))]
+pub mod xnas_conformance;
+
+#[cfg(feature = "databento")]
+mod xnas_reference;
+
 #[cfg(feature = "databento")]
 #[cfg_attr(docsrs, doc(cfg(feature = "databento")))]
 pub mod dbn_bridge;
@@ -233,10 +243,10 @@ pub use xnas_semantics::{
     Mbp10SemanticsFinishReportV1, PublishedMboBookV1, QuarantinePopulationV1, RawMboRecordV1,
     RawMbp10RecordV1, SourceOrdinal, XnasBoundaryV1, XnasCompletedUpdateEnvelopeV1,
     XnasDailySourceQualificationV1, XnasEndpointMatchKeyV1, XnasIdentityV1, XnasMboStreamV1,
-    XnasMbp10StreamV1, XnasSchemaV1, XnasSemanticsError, XnasSourceEvidenceInputV1,
-    AUTHORITATIVE_XNAS_RESET_V1, DBN_FLAG_BAD_TS_RECV, DBN_FLAG_LAST, DBN_FLAG_MAYBE_BAD_BOOK,
-    DBN_FLAG_SNAPSHOT, DBN_RTYPE_MBO, DBN_RTYPE_MBP_10, DBN_UNDEF_PRICE, DBN_UNDEF_TIMESTAMP,
-    INITIAL_XNAS_CLEAR_CONTROL_V1, XNAS_COMPLETED_UPDATE_ENVELOPE_V1, XNAS_ITCH_PUBLISHER_ID,
+    XnasMbp10StreamV1, XnasSchemaV1, XnasSemanticsError, AUTHORITATIVE_XNAS_RESET_V1,
+    DBN_FLAG_BAD_TS_RECV, DBN_FLAG_LAST, DBN_FLAG_MAYBE_BAD_BOOK, DBN_FLAG_SNAPSHOT, DBN_RTYPE_MBO,
+    DBN_RTYPE_MBP_10, DBN_UNDEF_PRICE, DBN_UNDEF_TIMESTAMP, INITIAL_XNAS_CLEAR_CONTROL_V1,
+    XNAS_COMPLETED_UPDATE_ENVELOPE_V1, XNAS_ITCH_PUBLISHER_ID,
 };
 
 // Re-exports - Source abstraction

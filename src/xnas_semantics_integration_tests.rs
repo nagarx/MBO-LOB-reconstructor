@@ -1,18 +1,14 @@
 use std::collections::BTreeSet;
-use std::fs::File;
-use std::io::Write;
 
-use mbo_lob_reconstructor::{
+use crate::{
     LobState, MboCausalInvalidationScopeV1, MboIngestDispositionV1, MboIngestOutcomeV1,
     Mbp10CompletedEndpointV1, Mbp10LevelV1, PublishedMboBookV1, RawMboRecordV1, RawMbp10RecordV1,
     SourceOrdinal, XnasBoundaryV1, XnasCompletedUpdateEnvelopeV1, XnasDailySourceQualificationV1,
     XnasEndpointMatchKeyV1, XnasIdentityV1, XnasMboStreamV1, XnasMbp10StreamV1, XnasSchemaV1,
-    XnasSemanticsError, XnasSourceEvidenceInputV1, DBN_FLAG_BAD_TS_RECV, DBN_FLAG_LAST,
-    DBN_FLAG_MAYBE_BAD_BOOK, DBN_FLAG_SNAPSHOT, DBN_RTYPE_MBO, DBN_RTYPE_MBP_10, DBN_UNDEF_PRICE,
-    DBN_UNDEF_TIMESTAMP, XNAS_ITCH_PUBLISHER_ID,
+    XnasSemanticsError, DBN_FLAG_BAD_TS_RECV, DBN_FLAG_LAST, DBN_FLAG_MAYBE_BAD_BOOK,
+    DBN_FLAG_SNAPSHOT, DBN_RTYPE_MBO, DBN_RTYPE_MBP_10, DBN_UNDEF_PRICE, DBN_UNDEF_TIMESTAMP,
+    XNAS_ITCH_PUBLISHER_ID,
 };
-use sha2::{Digest, Sha256};
-use tempfile::TempDir;
 
 const INSTRUMENT: u32 = 11_667;
 const OTHER_INSTRUMENT: u32 = 22_001;
@@ -34,50 +30,20 @@ fn ordinal(value: u64) -> SourceOrdinal {
     SourceOrdinal::new(value).unwrap()
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
-fn source_evidence(
-    schema: XnasSchemaV1,
-    identities: &[u32],
-) -> (TempDir, XnasSourceEvidenceInputV1) {
-    let directory = tempfile::tempdir().unwrap();
-    let source_bytes = b"qualified synthetic DBN source bytes";
-    let manifest_bytes = b"{\"qualified\":true}";
-    let source_path = directory.path().join("source.dbn.zst");
-    let manifest_path = directory.path().join("manifest.json");
-    File::create(&source_path)
-        .unwrap()
-        .write_all(source_bytes)
-        .unwrap();
-    File::create(&manifest_path)
-        .unwrap()
-        .write_all(manifest_bytes)
-        .unwrap();
-    let evidence = XnasSourceEvidenceInputV1 {
-        dataset: "XNAS.ITCH".to_owned(),
-        schema,
-        dbn_version: 1,
-        ts_out: false,
-        partial_symbols: Vec::new(),
-        not_found_symbols: Vec::new(),
-        manifest_path: manifest_path.to_string_lossy().into_owned(),
-        expected_manifest_sha256: sha256_hex(manifest_bytes),
-        source_path: source_path.to_string_lossy().into_owned(),
-        expected_source_size: source_bytes.len() as u64,
-        expected_source_sha256: sha256_hex(source_bytes),
-        expected_identities: identities
-            .iter()
-            .map(|instrument_id| XnasIdentityV1::new(XNAS_ITCH_PUBLISHER_ID, *instrument_id))
-            .collect::<BTreeSet<_>>(),
-    };
-    (directory, evidence)
-}
-
 fn qualification(schema: XnasSchemaV1, identities: &[u32]) -> XnasDailySourceQualificationV1 {
-    let (_directory, evidence) = source_evidence(schema, identities);
-    XnasDailySourceQualificationV1::verify_local_files(evidence).unwrap()
+    let identities = identities
+        .iter()
+        .map(|instrument_id| XnasIdentityV1::new(XNAS_ITCH_PUBLISHER_ID, *instrument_id))
+        .collect::<BTreeSet<_>>();
+    XnasDailySourceQualificationV1::from_verified_images(
+        schema,
+        identities,
+        "verified-source-image".to_owned(),
+        "0".repeat(64),
+        "verified-manifest-image".to_owned(),
+        "1".repeat(64),
+    )
+    .unwrap()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -346,41 +312,11 @@ fn local_dbn_constants_match_the_pinned_dependency() {
 }
 
 #[test]
-fn source_evidence_is_verified_instead_of_caller_asserted() {
-    let (_directory, mut mismatched) = source_evidence(XnasSchemaV1::Mbo, &[INSTRUMENT]);
-    mismatched.expected_source_sha256 = "c".repeat(64);
-    assert_eq!(
-        XnasDailySourceQualificationV1::verify_local_files(mismatched).unwrap_err(),
-        XnasSemanticsError::SourceNotQualified
-    );
-
+fn stream_rejects_a_qualification_for_the_wrong_schema() {
     let mbp_token = qualification(XnasSchemaV1::Mbp10, &[INSTRUMENT]);
     let mut stream = XnasMboStreamV1::new(mbp_token);
     assert_eq!(
         stream.push(control(1, INSTRUMENT)).unwrap_err(),
-        XnasSemanticsError::SourceNotQualified
-    );
-}
-
-#[test]
-fn source_and_manifest_byte_mutations_fail_qualification() {
-    let (source_directory, source_input) = source_evidence(XnasSchemaV1::Mbo, &[INSTRUMENT]);
-    File::create(source_directory.path().join("source.dbn.zst"))
-        .unwrap()
-        .write_all(b"mutated source bytes")
-        .unwrap();
-    assert_eq!(
-        XnasDailySourceQualificationV1::verify_local_files(source_input).unwrap_err(),
-        XnasSemanticsError::SourceNotQualified
-    );
-
-    let (manifest_directory, manifest_evidence) = source_evidence(XnasSchemaV1::Mbo, &[INSTRUMENT]);
-    File::create(manifest_directory.path().join("manifest.json"))
-        .unwrap()
-        .write_all(b"{\"qualified\":false}")
-        .unwrap();
-    assert_eq!(
-        XnasDailySourceQualificationV1::verify_local_files(manifest_evidence).unwrap_err(),
         XnasSemanticsError::SourceNotQualified
     );
 }
