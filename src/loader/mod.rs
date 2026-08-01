@@ -511,6 +511,29 @@ impl DbnLoader {
 
         // Use DynDecoder to auto-detect compression
         // Handles both .dbn (uncompressed) and .dbn.zst (compressed) files
+        //
+        // `VersionUpgradePolicy::AsIs` is LOAD-BEARING and must stay EXPLICIT.
+        // It is not the crate default and never has been: dbn v0.20.0 defaulted
+        // to `Upgrade` (-> DBN v2), and dbn 0.35.0 (2025-05-28, CHANGELOG
+        // "Changed the default `VersionUpgradePolicy` to `UpgradeToV3`")
+        // moved the default to v3. The variant set moved too — 0.25.0
+        // (2024-12-17) renamed `Upgrade` to `UpgradeToV2`. `AsIs` survives both
+        // changes with unchanged semantics, and it is the policy that produced
+        // every number currently on disk; all on-disk files are DBN version 1.
+        //
+        // Under an upgrade policy the decoder rewrites records via the dispatch
+        // at dbn `rust/dbn/src/decode/dbn/fsm.rs:847`, whose match arms are ONLY
+        // InstrumentDef / Statistics / SymbolMapping / Error / System. MBO
+        // (rtype 0xA0) appears in no arm at any policy, so MBO would be spared
+        // even under `UpgradeToV3` — but Metadata.version WOULD change, and
+        // relying on a decoder default that upstream has already moved once is
+        // exactly the kind of silent flip this pin's Cargo.toml note warns about.
+        //
+        // Safe today because `inferred_with_buffer` takes the policy as a
+        // REQUIRED positional argument in both v0.20.0 and v0.64.0 — there is no
+        // defaulting path here. If a future dbn release adds a defaulting
+        // constructor and someone migrates to it, this argument disappears and
+        // the policy flips silently. Keep it explicit.
         let decoder = DynDecoder::inferred_with_buffer(counting_reader, VersionUpgradePolicy::AsIs)
             .map_err(|e| TlobError::generic(format!("Failed to create decoder: {e}")))?;
 

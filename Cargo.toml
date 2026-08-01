@@ -30,7 +30,27 @@ legacy-iterator-api = ["databento"]
 
 [dependencies]
 # DBN decoding (optional, enabled by default)
-dbn = { git = "https://github.com/databento/dbn.git", tag = "v0.20.0", optional = true }
+#
+# Pin bumped v0.20.0 -> v0.64.0 on 2026-08-01. Justification is empirical, not
+# aspirational: a two-arm differential harness (`scripts/ci/dbn_version_diff/`,
+# monorepo root) decoded the SAME bytes under BOTH crate versions and compared
+# raw per-record FNV-1a-64 digests. Across 296,675,250 records spanning every
+# schema this pipeline reads — 55,997,458 of them XNAS.ITCH MBO over 5 full days
+# — the two decoders produced a BYTE-IDENTICAL record stream, with zero decode
+# errors, zero skipped records and zero unmapped rtypes on either arm.
+# `MboMsg` field names, types and `offset_of` are identical across all 57 tags.
+# Full evidence: `.session_state/2026-08-01-blast-radius/DBN_VERSION_DIFF.md`.
+#
+# READ THIS BEFORE TOUCHING THE DECODER CONSTRUCTION AT `src/loader/mod.rs`:
+# dbn 0.35.0 (2025-05-28) "Changed the default `VersionUpgradePolicy` to
+# `UpgradeToV3`"; 0.25.0 (2024-12-17) had already renamed the `Upgrade` variant
+# to `UpgradeToV2`. v0.20.0's default was `Upgrade` (i.e. to v2). NEITHER default
+# is `AsIs`, and `AsIs` is what produced every number on disk. We are safe only
+# because `DynDecoder::inferred_with_buffer` takes the policy as a REQUIRED
+# positional argument in both versions and we pass `AsIs` explicitly. Any future
+# migration to a constructor that DEFAULTS the policy would silently switch us to
+# `UpgradeToV3`. Keep it explicit. See the comment at that call site.
+dbn = { git = "https://github.com/databento/dbn.git", tag = "v0.64.0", optional = true }
 zstd = { version = "0.13", optional = true }
 
 # Parquet/Arrow export (optional, requires `export` feature)
