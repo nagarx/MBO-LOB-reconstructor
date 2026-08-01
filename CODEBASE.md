@@ -2,7 +2,7 @@
 
 > **Purpose**: This document provides complete technical details for LLMs and developers to understand, modify, and extend the codebase without prior context.
 
-> **Pipeline scope (2026-06-02).** This module is part of an **intraday trading research pipeline** — an experiment-first platform for discovering and validating *any* profitable **intraday** trading edge (no overnight positions), across approach classes (microstructure/HFT, scalping, intraday momentum, intraday statistical arbitrage, …) and instruments (equities, futures, same-day options). The pipeline *originated* as a high-frequency NVDA MBO/LOB microstructure system — that origin explains the "HFT" / "LOB" / "MBO" naming here — and that microstructure-direction program is now one (largely-closed) track among many. **Names are historical; the mission is general.** This module's role: the Rust ingestion front-end — reconstructs limit-order-book state (`LobState`) from raw Market-By-Order `.dbn.zst` events (~1M msg/s, BBO 99.17%); the order-book source feeding feature extraction. For the full mission + approach taxonomy + capability-readiness boundary, see root `CLAUDE.md` §Research Scope & Charter (+ `CROSS_ASSET_OFI_FINDINGS_AND_ISSUES_2026_06_01.md` §9).
+> **Pipeline scope (2026-06-02).** This module is part of an **intraday trading research pipeline** — an experiment-first platform for discovering and validating *any* profitable **intraday** trading edge (no overnight positions), across approach classes (microstructure/HFT, scalping, intraday momentum, intraday statistical arbitrage, …) and instruments (equities, futures, same-day options). The pipeline *originated* as a high-frequency NVDA MBO/LOB microstructure system — that origin explains the "HFT" / "LOB" / "MBO" naming here — and that microstructure-direction program is now one (largely-closed) track among many. **Names are historical; the mission is general.** This module's role: the Rust ingestion front-end — reconstructs limit-order-book state (`LobState`) from raw Market-By-Order `.dbn.zst` events (~1M msg/s; **BBO accuracy CORRECTED 2026-08-01: the long-quoted "99.17%" is not in its own source artifact — `data/validation_results_july2025.json` reports best-price exact match 95.56% bid / 95.73% ask and best-size exact match 83.66% / 83.06%. See `WARNINGS.md` §Validation Results Summary**); the order-book source feeding feature extraction. For the full mission + approach taxonomy + capability-readiness boundary, see root `CLAUDE.md` §Research Scope & Charter (+ `CROSS_ASSET_OFI_FINDINGS_AND_ISSUES_2026_06_01.md` §9).
 
 ---
 
@@ -916,9 +916,23 @@ assert!(stats.is_clean_eof(), "torn DBN: mid_record_eof={}", stats.mid_record_eo
 // Typical stats from one day of NVDA data:
 // messages_processed: 10,000,000
 // system_messages_skipped: 1,393,000 (~14%)
-// cancel_order_not_found: 50,000 (~0.5%) - Normal!
+// cancel_order_not_found: 50,000 (~0.5%) - NOT normal. See correction below.
 // crossed_quotes: 100 (~0.001%) - Normal!
 ```
+
+> ⚠️ **CORRECTION 2026-08-01 — `cancel_order_not_found` / `trade_order_not_found` are NOT normal
+> market properties.** OLD claim: "~0.5% — Normal!". NEW: **100% of the mass is an artifact of the
+> `b'T' | b'F' => Action::Trade` merge at `src/dbn_bridge.rs:125`.** Evidence: 473,410/473,410
+> (100.000%) of `F` rows on 2025-02-03 are followed by a `C` carrying an identical
+> order_id/size/timestamp/side — the `F` has already deleted (full fill) or exhausted (partial fill)
+> the order, so the paired `C` finds nothing. A corrected replay that treats `F` as a book no-op
+> gives **exactly zero** on both counters, on two independent days:
+> `cancel_order_not_found` 393,790 → **0** and `trade_order_not_found` 33,293 → **0** (2025-02-03);
+> 261,386 → **0** and 18,061 → **0** (2025-07-01).
+> **These five counters are therefore the free acceptance test for the pending decoder fix: they must
+> read EXACTLY 0 afterwards, not "≈0" or "reduced".** (Corollary: the 2026-04 backbone audit §3.5
+> attributed a residual BBO mismatch to `cancel_order_not_found` "upstream data quality" — that
+> attribution is falsified, since the counter is itself 100% this bug.)
 
 See **`WARNINGS.md`** for the full `WarningCategory` taxonomy and the catalog of real-market data-quality edge cases (e.g. pre-market session start, partial-cancel handling) — the authoritative reference when triaging a preprocessing anomaly.
 

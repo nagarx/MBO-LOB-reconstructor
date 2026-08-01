@@ -115,6 +115,42 @@ impl DbnBridge {
     ///
     /// DBN uses single-character codes for actions.
     /// We map them to our internal enum representation.
+    ///
+    /// # ⚠ KNOWN DEFECT — the `b'T' | b'F'` arm below is WRONG (documented 2026-08-01)
+    ///
+    /// The comment on that arm used to read "'F' = fill, treat as trade". That is contradicted by
+    /// the vendor spec and by measurement, on two independent counts:
+    ///
+    /// 1. **`side` means opposite things on the two record types.** DBN defines `side` on a **Trade**
+    ///    (`T`) as the AGGRESSOR's side and on a **Fill** (`F`) as the RESTING order's side. Merging
+    ///    them puts two opposite conventions into one population with no disambiguating column.
+    ///    Measured on NVDA 2025-02-03: signed volume from true-`T` alone `+325,282`, from ex-`F`
+    ///    alone `−325,282`, **combined exactly 0** — 100% of the signed directional signal is
+    ///    annihilated on the raw tape. Side counts transpose exactly (A/B 258,355 ↔ 215,055).
+    ///    A directional feature built on the merged stream reads as "no signal", which is
+    ///    indistinguishable from a genuine null.
+    /// 2. **Both `T` and `F` are documented "does not affect the book"**, yet `Action::Trade` mutates
+    ///    it here. Consequence: every `F` deletes (full fill) or exhausts (partial fill) the resting
+    ///    order, so its paired `C` — which arrives with identical order_id/size/timestamp/side in
+    ///    473,410/473,410 = 100.000% of cases — finds nothing. That is the entire mass of
+    ///    `LobStats.cancel_order_not_found` / `trade_order_not_found` (see `WARNINGS.md` §1).
+    ///
+    /// Databento's own MBP-10 contains **zero `F` records**, and treating `F` as a book no-op
+    /// reproduces that vendor book **bit-exactly on 100.000%** of book-affecting records
+    /// (2025-07-01, 4,214,602 RTH comparisons). So the correct decode is
+    /// `b'F' => Action::Fill` **with `Fill` as a book no-op**.
+    ///
+    /// **The code is deliberately UNCHANGED here.** The fix is a separate authorised change under
+    /// DECISION-033 / Phase 1, and it MUST land in one commit together with the consumer match arms
+    /// (`hft-feature-core` `mbo/window.rs:183`, `order_tracker.rs:345`) and the test at `:245` in
+    /// this file, which currently asserts the buggy mapping. Splitting `F` off on its own routes
+    /// fills into `_ => {}` and silently zeroes nine feature columns (52, 53, 56, 57, 80, 81, 86, 88
+    /// and 79) with no error raised. Also note the fix does NOT recover the `side == 'N'` prints —
+    /// 21.27% of trade count but **50.33% of traded volume** — which die independently at the
+    /// consumer's `order_id == 0` filter.
+    ///
+    /// Recovery needs no re-extraction: `order_id == 0` separates the two populations perfectly
+    /// (601,292/601,292 true-`T` and 0/473,410 `F` on 2025-02-03).
     #[inline]
     fn convert_action(action: u8) -> Result<Action> {
         match action {
@@ -122,7 +158,10 @@ impl DbnBridge {
             b'M' => Ok(Action::Modify),
             b'C' => Ok(Action::Cancel),
             b'R' => Ok(Action::Clear),
-            b'T' | b'F' => Ok(Action::Trade), // 'F' = fill, treat as trade
+            // ⚠ DEFECT, do not copy: 'F' is a FILL and must be a book no-op with the RESTING
+            // side; merging it with 'T' (AGGRESSOR side) annihilates signed flow. See the
+            // "KNOWN DEFECT" note above. Fix is gated on DECISION-033 / Phase 1.
+            b'T' | b'F' => Ok(Action::Trade),
             b'N' => Ok(Action::None),
             _ => Err(TlobError::InvalidAction(action)),
         }
@@ -243,6 +282,10 @@ mod tests {
         assert_eq!(DbnBridge::convert_action(b'C').unwrap(), Action::Cancel);
         assert_eq!(DbnBridge::convert_action(b'R').unwrap(), Action::Clear);
         assert_eq!(DbnBridge::convert_action(b'T').unwrap(), Action::Trade);
+        // ⚠ THIS ASSERTION LOCKS A KNOWN BUG (documented 2026-08-01). It pins the incorrect
+        // 'F' -> Action::Trade mapping; any correct fix (b'F' => Action::Fill, book no-op) will
+        // fail here BY DESIGN. Update it as part of the DECISION-033 / Phase 1 commit, not before.
+        // See the "KNOWN DEFECT" note on convert_action above.
         assert_eq!(DbnBridge::convert_action(b'F').unwrap(), Action::Trade);
         assert_eq!(DbnBridge::convert_action(b'N').unwrap(), Action::None);
 
