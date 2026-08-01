@@ -1,6 +1,6 @@
 [package]
 name = "mbo-lob-reconstructor"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.82"
 authors = ["nagarx"]
@@ -25,7 +25,10 @@ export = ["dep:arrow", "dep:parquet", "dep:toml"]
 # Phase M M.A.3 (REV 3): legacy `Iterator<Item = MboMessage>` API.
 # Default-ON for transition; `iter_messages_typed()` is the new preferred API
 # (`Iterator<Item = Result<MboMessage, BoundaryError>>`).
-# Removable in next MAJOR release (0.3.0). Calendar removal: 2026-10-29.
+# Removal is CALENDAR-driven: 2026-10-29. (An earlier note called this "the next
+# MAJOR release (0.3.0)"; 0.3.0 shipped 2026-08-01 as a MINOR bump under
+# VERSIONING.md R7 — outputs byte-identical — and did NOT remove the feature.
+# The calendar date is the trigger; the version label was aspirational.)
 legacy-iterator-api = ["databento"]
 
 [dependencies]

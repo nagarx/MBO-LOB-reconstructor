@@ -7,7 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Post-`v0.2.1`-tag changes (the tag was cut at commit `28a9a22`, 2026-05-03):
+## [0.3.0] — 2026-08-01
+
+**MINOR under `VERSIONING.md` R7 — outputs proven byte-identical, not asserted.**
+
+`0.2.1` is DEAD and must never be reused as a pin: the `v0.2.1` tag was cut at
+`28a9a22`, whose `Cargo.toml` still read `0.2.0`. That one-version skew silently
+disabled `feature-extractor-MBO-LOB`'s `.cargo/config.toml` `[patch]` override —
+cargo reported *"patch was not used in the crate graph"* — so the extractor and
+`mbo-statistical-profiler` were building against **remote snapshots** (package
+`0.2.0` and `0.1.0` respectively), not the local tree being edited and audited.
+`0.3.0` is a clean, R1-valid version: tag `v0.3.0` points at a commit whose
+manifest declares exactly `0.3.0`.
+
+- **Changed**: DBN decoder pin `v0.20.0` → `v0.64.0` (commit `6e22345`).
+  Byte-identity **measured on real data**, per R8: NVDA 2025-07-01, 9,314,830
+  messages, same HEAD source under both decoders →
+  `lob_snapshots.parquet` `49ffaab3…`, `mbo_events.parquet` `e5fcd3b1…`,
+  `reconstruction_stats.json` `6926ca6b…` all SHA-256 identical. Full record in
+  the monorepo's `.session_state/2026-08-01-blast-radius/DBN_UPGRADE_LOG.md`.
+- **Changed**: version `0.2.1` → `0.3.0`. Note this is *observable in output*:
+  `env!("CARGO_PKG_VERSION")` is embedded as the `reconstructor_version`
+  Parquet key-value at `src/export/schema.rs:160` and as `"version"` in
+  `_export_summary.json` (`src/bin/export_to_parquet.rs:633`). Parquet **column
+  data** is unchanged; only that metadata key moves.
+- **Docs**: `legacy-iterator-api`'s "removable in next MAJOR (0.3.0)" note
+  corrected in `Cargo.toml`, `CLAUDE.md`. The feature is STILL PRESENT at
+  0.3.0; its removal trigger is the calendar date 2026-10-29, not this version.
+- **Docs**: `README.md` consumer-pin example `v0.2.1` → `v0.3.0`.
+
+Post-`v0.2.1`-tag changes (the tag was cut at commit `28a9a22`, 2026-05-03),
+all of which ship in 0.3.0:
 
 - **Changed**: `Cargo.toml` version aligned `0.2.0` → `0.2.1` to match the
   `v0.2.1` tag (commit `4cddcd3`). Release-hygiene note: the tag itself was

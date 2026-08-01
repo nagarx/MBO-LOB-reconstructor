@@ -113,7 +113,7 @@ This library is designed to work with [feature-extractor-MBO-LOB](https://github
 
 The extractor is a **9-crate Cargo workspace**; its facade crate is `hft-extractor`, which
 depends on this library via git tag (`crates/hft-extractor/Cargo.toml`:
-`mbo-lob-reconstructor = { git = ..., tag = "v0.2.1" }`, with a `.cargo/config.toml` path
+`mbo-lob-reconstructor = { git = ..., tag = "v0.3.0" }`, with a `.cargo/config.toml` path
 override inside the monorepo). The **production path** is the config-driven `export_dataset`
 CLI:
 
