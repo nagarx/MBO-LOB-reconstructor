@@ -23,10 +23,18 @@
 13. [Known Limitations and Edge Cases](#13-known-limitations-and-edge-cases)
 14. [Composable Tracking Modules](#14-composable-tracking-modules)
 15. [Parquet Export Module](#15-parquet-export-module-feature-export)
+16. [Strict XNAS Replay Boundary](#16-strict-xnas-replay-boundary)
 
 ---
 
 ## 1. Project Overview
+
+> **Strict backbone boundary (1.0.0 candidate).** New XNAS MBO backbone
+> consumers must use the exact strict replay contract documented in
+> [`docs/STRICT_XNAS_REPLAY_CONTRACT.md`](docs/STRICT_XNAS_REPLAY_CONTRACT.md).
+> The legacy convenience reconstruction path remains available but does not
+> establish the strict source identity, quarantine, causal availability,
+> terminal receipt, or two-pass staging invariants.
 
 ### What This Library Does
 
@@ -1333,8 +1341,17 @@ cases, batching, downsampling incl. the Phase O B.3 out-of-order suite, metadata
 precision). Counts are intentionally not hand-maintained here (hft-rules §11) — run
 `cargo test --features "databento export" 2>&1 | grep "test result"` for the live count.
 
+## 16. Strict XNAS Replay Boundary
+
+The strict XNAS boundary is implemented by `src/canonical_dbn.rs`,
+`src/loader/strict.rs`, `crates/hft-mbo-event-contract`, and `src/xnas/`.
+Its public lifecycle, semantic ownership, digest domains, schema identifiers,
+authority limits, and downstream staging obligations are defined in
+[`docs/STRICT_XNAS_REPLAY_CONTRACT.md`](docs/STRICT_XNAS_REPLAY_CONTRACT.md).
+Treat that focused contract as authoritative for this new path; the legacy
+module descriptions elsewhere in this file describe separate convenience APIs.
+
 ---
 
-*Last updated: 2026-07-07 (Phase-2 doc-truth pass: typed-iterator ingestion API coverage + live extractor-workspace integration sections; content baseline 2026-04-30, post Phase M REV 3 — Boundary Discipline cycle)*
-*Crate version: 0.2.1*
-
+*Last updated: 2026-08-04 (strict XNAS replay contract candidate; legacy sections retain their prior content dates)*
+*Crate version: 1.0.0 candidate*

@@ -142,7 +142,7 @@
 //! | [`dbn_bridge`] | Databento format conversion (requires `databento` feature) |
 //! | [`warnings`] | Warning tracking: `WarningTracker`, `Warning`, `WarningCategory` |
 //! | [`constants`] | Domain constants: price/time conversion, financial units, numerical precision |
-//! | [`export`] | Parquet export for raw LOB/MBO data (requires `export` feature) |
+//! | `export` | Parquet export for raw LOB/MBO data (requires `export` feature) |
 //!
 //! ## Feature Flags
 //!
@@ -253,9 +253,11 @@ pub use xnas::{
     BookTransactionErrorV1, StrictXnasReplayV1, XnasBookCommitV1, XnasBookLevelV1,
     XnasBookSnapshotV1, XnasEnvelopeErrorV1, XnasEofTailQuarantineV1, XnasEofTailReasonV1,
     XnasIdentityReplayReceiptV1, XnasIdentityV1, XnasInvalidStateQuarantinedRecordV1,
-    XnasQuarantineReasonV1, XnasRecoveryQualificationV1, XnasRejectedRecordPhaseV1,
-    XnasRejectedRecordQuarantineV1, XnasReplayConfigV1, XnasReplayCountsV1, XnasReplayErrorV1,
-    XnasReplayPrefixFailureV1, XnasReplayReceiptV1, XnasReplayRunV1, XnasReplayTraceV1,
+    XnasPendingEnvelopeObservationV1, XnasQualifiedReplayPlanV1, XnasQuarantineReasonV1,
+    XnasRecoveryQualificationV1, XnasRejectedRecordPhaseV1, XnasRejectedRecordQuarantineV1,
+    XnasReplayBuildIdentityV1, XnasReplayConfigV1, XnasReplayCountsV1,
+    XnasReplayEquivalenceReceiptV1, XnasReplayErrorV1, XnasReplayPrefixFailureV1,
+    XnasReplayReceiptV1, XnasReplayRevalidationPassV1, XnasReplayRunV1, XnasReplayTraceV1,
     XnasResetBoundaryQuarantineV1, XnasSelectedOrdinalDispositionV1, XnasSelectedOrdinalRoleV1,
     XnasSemanticQuarantineIncidentV1, XnasTerminalDisqualificationReasonV1,
     XnasTerminalDisqualificationV1, XnasTerminalIdentityStatusV1, XnasValidityEpochQualificationV1,

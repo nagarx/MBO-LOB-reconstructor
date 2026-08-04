@@ -5,6 +5,12 @@
 
 High-performance MBO to LOB reconstruction and analytics for deep learning preprocessing.
 
+The exact, fail-loud XNAS MBO boundary and its two-pass downstream staging
+contract are specified in
+[`docs/STRICT_XNAS_REPLAY_CONTRACT.md`](docs/STRICT_XNAS_REPLAY_CONTRACT.md).
+The older convenience `LobReconstructor` API described below is not a substitute
+for that strict source-, identity-, epoch-, and receipt-bound path.
+
 Convert Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshots with enriched analytics, designed specifically as a preprocessing step for deep learning models (DeepLOB, TLOB, Transformers, CNN-LSTM, etc.).
 
 > **Pipeline scope (2026-06-02).** This module is part of an **intraday trading research pipeline** — an experiment-first platform for discovering and validating *any* profitable **intraday** trading edge (no overnight positions), across approach classes (microstructure/HFT, scalping, intraday momentum, intraday statistical arbitrage, …) and instruments (equities, futures, same-day options). The pipeline *originated* as a high-frequency NVDA MBO/LOB microstructure system — that origin explains the "HFT" / "LOB" / "MBO" naming here — and that microstructure-direction program is now one (largely-closed) track among many. **Names are historical; the mission is general.** This module's role: the Rust ingestion front-end — reconstructs limit-order-book state (`LobState`) from raw Market-By-Order `.dbn.zst` events (~1M msg/s; **BBO accuracy CORRECTED 2026-08-01: the long-quoted "99.17%" is not in its own source artifact — `data/validation_results_july2025.json` reports best-price exact match 95.56% bid / 95.73% ask and best-size exact match 83.66% / 83.06%. See `WARNINGS.md` §Validation Results Summary**); the order-book source feeding feature extraction. For the full mission + approach taxonomy + capability-readiness boundary, see root `CLAUDE.md` §Research Scope & Charter (+ `CROSS_ASSET_OFI_FINDINGS_AND_ISSUES_2026_06_01.md` §9).

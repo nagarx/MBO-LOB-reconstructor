@@ -1,4 +1,4 @@
-use super::envelope::ReadyEnvelopeTxnV1;
+use super::envelope::{ReadyEnvelopeCommitmentV2, ReadyEnvelopeTxnV1};
 use super::XnasIdentityV1;
 use ahash::AHashMap;
 use hft_mbo_event_contract::{BookCommandV1, RestingSideV1, Sha256DigestV1};
@@ -88,7 +88,9 @@ impl XnasBookSnapshotV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct XnasBookCommitV1 {
     commit_index: u64,
+    reset_epoch: u64,
     book_commands_committed: u64,
+    exact_endpoint_state_changed: bool,
     transition_chain_sha256: Sha256DigestV1,
     snapshot: XnasBookSnapshotV1,
 }
@@ -98,8 +100,24 @@ impl XnasBookCommitV1 {
         self.commit_index
     }
 
+    /// One-based reset epoch of the exact private book after this commit. It is
+    /// deliberately distinct from replay validity epochs, which count only
+    /// intervals that actually qualified for observation.
+    pub const fn reset_epoch(&self) -> u64 {
+        self.reset_epoch
+    }
+
     pub const fn book_commands_committed(&self) -> u64 {
         self.book_commands_committed
+    }
+
+    /// Whether the exact resting-order state changed, including a recovery
+    /// reset that advances the reset epoch. This is deliberately independent
+    /// of command count and visible snapshot equality: an execution-only or
+    /// add-then-cancel envelope is `false`, while a deeper-than-exported-depth
+    /// order change is `true`.
+    pub const fn exact_endpoint_state_changed(&self) -> bool {
+        self.exact_endpoint_state_changed
     }
 
     pub const fn transition_chain_sha256(&self) -> Sha256DigestV1 {
@@ -152,13 +170,23 @@ impl ExactBookProjectorV1 {
     /// checked arithmetic complete before live mutation. Allocator failure,
     /// process abort, and panic unwinding are not recoverable transaction modes;
     /// the owning replay exposes no success receipt in those cases.
+    pub(crate) fn apply_envelope_precommitted(
+        &mut self,
+        envelope: &ReadyEnvelopeTxnV1,
+        envelope_commitment: ReadyEnvelopeCommitmentV2,
+    ) -> Result<XnasBookCommitV1, BookTransactionErrorV1> {
+        self.validate_envelope_binding(envelope)?;
+        let prepared = PreparedBookTxnV1::prepare(self, envelope)?;
+        self.commit(prepared, envelope_commitment)
+    }
+
+    #[cfg(test)]
     pub(crate) fn apply_envelope(
         &mut self,
         envelope: &ReadyEnvelopeTxnV1,
     ) -> Result<XnasBookCommitV1, BookTransactionErrorV1> {
-        self.validate_envelope_binding(envelope)?;
-        let prepared = PreparedBookTxnV1::prepare(self, envelope)?;
-        self.commit(prepared, envelope)
+        let envelope_commitment = envelope.commitment(self.source_digest);
+        self.apply_envelope_precommitted(envelope, envelope_commitment)
     }
 
     /// Digest of exact resting state scoped to the current reset epoch. Two
@@ -249,7 +277,7 @@ impl ExactBookProjectorV1 {
     fn commit(
         &mut self,
         prepared: PreparedBookTxnV1,
-        envelope: &ReadyEnvelopeTxnV1,
+        envelope_commitment: ReadyEnvelopeCommitmentV2,
     ) -> Result<XnasBookCommitV1, BookTransactionErrorV1> {
         let next_commit_index = self
             .commit_index
@@ -261,6 +289,7 @@ impl ExactBookProjectorV1 {
             .ok_or(BookTransactionErrorV1::ResetEpochOverflow)?;
         let command_count = u64::try_from(prepared.command_count)
             .map_err(|_| BookTransactionErrorV1::CountOverflow)?;
+        let exact_endpoint_state_changed = prepared.exact_endpoint_state_changed;
         let transaction_digest = prepared.digest();
 
         if prepared.cleared {
@@ -292,14 +321,16 @@ impl ExactBookProjectorV1 {
         self.commit_index = next_commit_index;
         self.transition_chain = next_transition_chain(
             self.transition_chain,
-            envelope.digest(self.source_digest),
+            envelope_commitment.sha256(),
             transaction_digest,
             next_commit_index,
             command_count,
         );
         Ok(XnasBookCommitV1 {
             commit_index: next_commit_index,
+            reset_epoch: next_reset_epoch,
             book_commands_committed: command_count,
+            exact_endpoint_state_changed,
             transition_chain_sha256: self.transition_chain,
             snapshot: self.snapshot(),
         })
@@ -340,6 +371,7 @@ impl ExactBookProjectorV1 {
 struct PreparedBookTxnV1 {
     cleared: bool,
     command_count: usize,
+    exact_endpoint_state_changed: bool,
     order_changes: BTreeMap<u64, Option<RestingOrderV1>>,
     final_levels: BTreeMap<(LevelSideV1, i64), LevelAggregateV1>,
 }
@@ -355,6 +387,7 @@ impl PreparedBookTxnV1 {
         let mut prepared = Self {
             cleared: false,
             command_count: commands.len(),
+            exact_endpoint_state_changed: false,
             order_changes: BTreeMap::new(),
             final_levels: BTreeMap::new(),
         };
@@ -466,12 +499,17 @@ impl PreparedBookTxnV1 {
     ) -> Result<(), BookTransactionErrorV1> {
         let mut touched = BTreeSet::new();
         if self.cleared {
+            // A qualified recovery clear establishes a new exact-state epoch
+            // even when both pre- and post-reset visible books are empty.
+            self.exact_endpoint_state_changed = true;
             for final_order in self.order_changes.values().flatten() {
                 touched.insert((LevelSideV1::from(final_order.side), final_order.price_raw));
             }
         } else {
             for (&order_id, final_order) in &self.order_changes {
-                if let Some(original) = base.orders.get(&order_id) {
+                let original = base.orders.get(&order_id).copied();
+                self.exact_endpoint_state_changed |= original != *final_order;
+                if let Some(original) = original {
                     touched.insert((LevelSideV1::from(original.side), original.price_raw));
                 }
                 if let Some(order) = final_order {
@@ -690,7 +728,7 @@ fn initial_chain(
     snapshot_depth: usize,
 ) -> Sha256DigestV1 {
     let mut hasher = Sha256::new();
-    hasher.update(b"hft.xnas_book_transition_chain.seed.v1\0");
+    hasher.update(b"hft.xnas_book_transition_chain.seed.v2\0");
     hasher.update(source_digest.as_bytes());
     hasher.update(identity.publisher_id().to_le_bytes());
     hasher.update(identity.instrument_id().to_le_bytes());
@@ -704,15 +742,15 @@ fn initial_chain(
 
 fn next_transition_chain(
     prior: Sha256DigestV1,
-    envelope_digest: [u8; 32],
+    envelope_digest: Sha256DigestV1,
     transaction_digest: [u8; 32],
     commit_index: u64,
     command_count: u64,
 ) -> Sha256DigestV1 {
     let mut hasher = Sha256::new();
-    hasher.update(b"hft.xnas_book_transition_chain.v1\0");
+    hasher.update(b"hft.xnas_book_transition_chain.v2\0");
     hasher.update(prior.as_bytes());
-    hasher.update(envelope_digest);
+    hasher.update(envelope_digest.as_bytes());
     hasher.update(transaction_digest);
     hasher.update(commit_index.to_le_bytes());
     hasher.update(command_count.to_le_bytes());
@@ -979,17 +1017,68 @@ mod tests {
         assert_eq!(trade.execution_carriers().count(), 1);
         let trade_commit = book.apply_envelope(&trade).unwrap();
         assert_eq!(trade_commit.book_commands_committed(), 0);
+        assert!(!trade_commit.exact_endpoint_state_changed());
+        assert_eq!(trade_commit.reset_epoch(), 1);
         assert_eq!(book.state_digest(), before);
 
         let fill = txn(vec![event(ACTION_FILL, SIDE_BID, 1, BID, 40, 5, 5)], false);
         assert_eq!(fill.execution_carriers().count(), 1);
         let fill_commit = book.apply_envelope(&fill).unwrap();
         assert_eq!(fill_commit.book_commands_committed(), 0);
+        assert!(!fill_commit.exact_endpoint_state_changed());
+        assert_eq!(fill_commit.reset_epoch(), 1);
         assert_eq!(book.state_digest(), before);
         assert_eq!(
             fill_commit.snapshot().best_bid().unwrap().aggregate_size(),
             100
         );
+    }
+
+    #[test]
+    fn exact_state_change_is_not_command_count_or_visible_snapshot_change() {
+        let mut book = projector();
+        let before_flow_chain = book.transition_chain_sha256();
+        let add_then_cancel = txn(
+            vec![
+                event(ACTION_ADD, SIDE_BID, 99, BID - 1, 10, 1, 1),
+                event(ACTION_CANCEL, SIDE_BID, 99, BID - 1, 10, 2, 1),
+            ],
+            false,
+        );
+        let net_zero = book.apply_envelope(&add_then_cancel).unwrap();
+        assert_eq!(net_zero.book_commands_committed(), 2);
+        assert!(!net_zero.exact_endpoint_state_changed());
+        assert_eq!(net_zero.snapshot().live_orders(), 0);
+        assert_ne!(net_zero.transition_chain_sha256(), before_flow_chain);
+
+        for order_id in 1..=11 {
+            let commit = add(
+                &mut book,
+                order_id,
+                SIDE_BID,
+                BID - i64::try_from(order_id).unwrap() * 1_000_000_000,
+                10,
+                order_id * 2 + 1,
+            );
+            assert!(commit.exact_endpoint_state_changed());
+        }
+        let before_visible = book.snapshot();
+        let deeper = book
+            .apply_envelope(&txn(
+                vec![event(
+                    ACTION_MODIFY,
+                    SIDE_BID,
+                    11,
+                    BID - 20_000_000_000,
+                    20,
+                    31,
+                    31,
+                )],
+                false,
+            ))
+            .unwrap();
+        assert!(deeper.exact_endpoint_state_changed());
+        assert_eq!(deeper.snapshot(), &before_visible);
     }
 
     #[test]
@@ -1231,9 +1320,23 @@ mod tests {
             true,
         );
         let commit = book.apply_envelope(&recovery).unwrap();
+        assert!(commit.exact_endpoint_state_changed());
+        assert_eq!(commit.reset_epoch(), 2);
         assert!(commit.snapshot().best_bid().is_none());
         assert_eq!(commit.snapshot().best_ask().unwrap().aggregate_size(), 25);
         assert_eq!(commit.snapshot().live_orders(), 1);
+
+        let mut empty = projector();
+        let before_empty = empty.snapshot();
+        let empty_reset = empty
+            .apply_envelope(&txn(
+                vec![event(ACTION_CLEAR, SIDE_NONE, 0, UNDEF_PRICE, 0, 9, 9)],
+                true,
+            ))
+            .unwrap();
+        assert_eq!(empty_reset.snapshot(), &before_empty);
+        assert!(empty_reset.exact_endpoint_state_changed());
+        assert_eq!(empty_reset.reset_epoch(), 2);
     }
 
     #[test]
@@ -1260,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_digest_encoding_has_fixed_golden_vectors() {
+    fn digest_encodings_have_fixed_golden_vectors() {
         let mut book = projector();
         book.apply_envelope(&txn(
             vec![
@@ -1276,7 +1379,7 @@ mod tests {
         );
         assert_eq!(
             book.transition_chain_sha256().to_hex(),
-            "0788388849307d55719fac8d496517bc4a2100e20b8267696f549ca772b83579"
+            "188ce03ecf4c8507564c5973d369921a0644feb6cf14e641a5ba712e2f5282a2"
         );
     }
 

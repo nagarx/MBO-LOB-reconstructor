@@ -1,9 +1,8 @@
 use super::XnasIdentityV1;
 use ahash::AHashSet;
-#[cfg(test)]
-use hft_mbo_event_contract::ExecutionCarrierV1;
 use hft_mbo_event_contract::{
-    BookCommandV1, EventDispositionV1, RawMboEventV1, Sha256DigestV1, FLAG_LAST,
+    AggressorSideV1, BookCommandV1, EventDispositionV1, ExecutionCarrierV1, RawMboEventV1,
+    RestingSideV1, Sha256DigestV1, FLAG_LAST,
 };
 use sha2::{Digest, Sha256};
 
@@ -381,6 +380,12 @@ impl ReadyEnvelopeTxnV1 {
         })
     }
 
+    /// Move the two variable-length public observation populations without a
+    /// second allocation or per-envelope clone in the revalidation hot path.
+    pub(crate) fn into_sequences_and_events(self) -> (Vec<u32>, Vec<EventDispositionV1>) {
+        (self.ordered_distinct_sequences, self.events)
+    }
+
     #[cfg(test)]
     pub(crate) fn execution_carriers(&self) -> impl Iterator<Item = &ExecutionCarrierV1> {
         self.events.iter().filter_map(|event| match event {
@@ -389,9 +394,9 @@ impl ReadyEnvelopeTxnV1 {
         })
     }
 
-    pub(crate) fn digest(&self, source_digest: Sha256DigestV1) -> [u8; 32] {
+    pub(crate) fn commitment(&self, source_digest: Sha256DigestV1) -> ReadyEnvelopeCommitmentV2 {
         let mut hasher = Sha256::new();
-        hasher.update(b"hft.xnas_ready_envelope.v1\0");
+        hasher.update(b"hft.xnas_ready_envelope.v2\0");
         hasher.update(source_digest.as_bytes());
         hasher.update(self.identity.publisher_id().to_le_bytes());
         hasher.update(self.identity.instrument_id().to_le_bytes());
@@ -409,10 +414,76 @@ impl ReadyEnvelopeTxnV1 {
         hasher.update(self.witness_ts_recv.to_le_bytes());
         hasher.update(self.effective_available_ns.to_le_bytes());
         hasher.update([u8::from(self.recovery)]);
+        hasher.update(
+            u64::try_from(self.events.len())
+                .expect("usize always fits u64 on supported targets")
+                .to_le_bytes(),
+        );
         for event in &self.events {
-            hash_raw(&mut hasher, event.event().raw());
+            hash_event_semantics(&mut hasher, event);
+            hash_raw_event(&mut hasher, event.event().raw());
         }
-        hasher.finalize().into()
+        ReadyEnvelopeCommitmentV2(Sha256DigestV1::from_bytes(hasher.finalize().into()))
+    }
+}
+
+/// Private, typed custody for the canonical ready-envelope v2 encoding.
+///
+/// Construction is deliberately confined to `ReadyEnvelopeTxnV1`, so the
+/// book transition and exported observation must consume the exact same
+/// commitment rather than independently re-hashing or accepting arbitrary
+/// bytes from a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadyEnvelopeCommitmentV2(Sha256DigestV1);
+
+impl ReadyEnvelopeCommitmentV2 {
+    pub(crate) const fn sha256(self) -> Sha256DigestV1 {
+        self.0
+    }
+}
+
+/// Bind the interpreted public event lane separately from provider bytes.
+/// The encoding belongs to ready-envelope digest v2 and is intentionally
+/// exhaustive, so a new semantic variant cannot silently inherit an identity.
+pub(crate) fn hash_event_semantics(hasher: &mut Sha256, event: &EventDispositionV1) {
+    hasher.update(event_semantic_tag(event));
+}
+
+pub(crate) const fn event_semantic_tag(event: &EventDispositionV1) -> [u8; 3] {
+    match event {
+        EventDispositionV1::Book(BookCommandV1::Add(command)) => {
+            [0, 0, resting_side_code(command.resting_side())]
+        }
+        EventDispositionV1::Book(BookCommandV1::Modify(command)) => {
+            [0, 1, resting_side_code(command.resting_side())]
+        }
+        EventDispositionV1::Book(BookCommandV1::Cancel(command)) => {
+            [0, 2, resting_side_code(command.resting_side())]
+        }
+        EventDispositionV1::Book(BookCommandV1::Clear(_)) => [0, 3, 0],
+        EventDispositionV1::Execution(ExecutionCarrierV1::AggressorTrade(trade)) => {
+            let aggressor = match trade.aggressor() {
+                AggressorSideV1::Seller => 1,
+                AggressorSideV1::Buyer => 2,
+            };
+            [1, 0, aggressor]
+        }
+        EventDispositionV1::Execution(ExecutionCarrierV1::UnsignedTrade(_)) => [1, 1, 0],
+        EventDispositionV1::Execution(ExecutionCarrierV1::RestingFill(fill)) => {
+            let side = match fill.resting_side() {
+                None => 0,
+                Some(side) => resting_side_code(side),
+            };
+            [1, 2, side]
+        }
+        EventDispositionV1::Control(_) => [2, 0, 0],
+    }
+}
+
+const fn resting_side_code(side: RestingSideV1) -> u8 {
+    match side {
+        RestingSideV1::Ask => 1,
+        RestingSideV1::Bid => 2,
     }
 }
 
@@ -461,7 +532,7 @@ impl From<&RawMboEventV1> for ProviderPayloadKeyV1 {
     }
 }
 
-fn hash_raw(hasher: &mut Sha256, raw: &RawMboEventV1) {
+pub(crate) fn hash_raw_event(hasher: &mut Sha256, raw: &RawMboEventV1) {
     hasher.update(raw.source_object_sha256.as_bytes());
     hasher.update(raw.raw_ordinal.to_le_bytes());
     hasher.update(raw.subordinal.to_le_bytes());
@@ -478,6 +549,28 @@ fn hash_raw(hasher: &mut Sha256, raw: &RawMboEventV1) {
     hasher.update(raw.price_raw.to_le_bytes());
     hasher.update(raw.size_raw.to_le_bytes());
     hasher.update([raw.flags_raw, raw.action_raw, raw.side_raw]);
+}
+
+/// Append the canonical raw-event encoding without hashing it. This is the
+/// same byte sequence as `hash_raw_event` and allows callers to batch many
+/// small fields into one SHA-256 update without changing the digest contract.
+pub(crate) fn encode_raw_event(output: &mut Vec<u8>, raw: &RawMboEventV1) {
+    output.extend_from_slice(raw.source_object_sha256.as_bytes());
+    output.extend_from_slice(&raw.raw_ordinal.to_le_bytes());
+    output.extend_from_slice(&raw.subordinal.to_le_bytes());
+    output.push(raw.rtype);
+    output.extend_from_slice(&raw.record_size_bytes.to_le_bytes());
+    output.extend_from_slice(&raw.publisher_id.to_le_bytes());
+    output.extend_from_slice(&raw.instrument_id.to_le_bytes());
+    output.extend_from_slice(&raw.ts_event.to_le_bytes());
+    output.extend_from_slice(&raw.ts_recv.to_le_bytes());
+    output.extend_from_slice(&raw.ts_in_delta.to_le_bytes());
+    output.push(raw.channel_id);
+    output.extend_from_slice(&raw.sequence.to_le_bytes());
+    output.extend_from_slice(&raw.order_id.to_le_bytes());
+    output.extend_from_slice(&raw.price_raw.to_le_bytes());
+    output.extend_from_slice(&raw.size_raw.to_le_bytes());
+    output.extend_from_slice(&[raw.flags_raw, raw.action_raw, raw.side_raw]);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, thiserror::Error)]
@@ -520,7 +613,9 @@ mod tests {
     use hft_mbo_event_contract::{
         classify_full_order_book, validate_raw_event, BoundPublisherPolicyV1, LogicalSourceV1,
         OpenedReplicaV1, OpenedRepresentationV1, PublisherPolicyIdV1, SourceDescriptorV1,
-        ACTION_ADD, EXPECTED_MBO_RECORD_SIZE_BYTES, EXPECTED_MBO_RTYPE, SIDE_BID,
+        ACTION_ADD, ACTION_CANCEL, ACTION_CLEAR, ACTION_FILL, ACTION_MODIFY, ACTION_NONE,
+        ACTION_TRADE, EXPECTED_MBO_RECORD_SIZE_BYTES, EXPECTED_MBO_RTYPE, SIDE_ASK, SIDE_BID,
+        SIDE_NONE, UNDEF_PRICE,
     };
 
     fn digest(byte: u8) -> Sha256DigestV1 {
@@ -588,6 +683,66 @@ mod tests {
             &policy(source_digest),
         )
         .unwrap()
+    }
+
+    fn semantic_event(action_raw: u8, side_raw: u8) -> EventDispositionV1 {
+        let order_required = matches!(action_raw, ACTION_ADD | ACTION_MODIFY | ACTION_CANCEL);
+        let price_required = order_required || matches!(action_raw, ACTION_TRADE | ACTION_FILL);
+        classify_full_order_book(
+            validate_raw_event(RawMboEventV1 {
+                source_object_sha256: digest(1),
+                raw_ordinal: 1,
+                subordinal: 0,
+                rtype: EXPECTED_MBO_RTYPE,
+                record_size_bytes: EXPECTED_MBO_RECORD_SIZE_BYTES,
+                publisher_id: 2,
+                instrument_id: 101,
+                ts_event: 1_000,
+                ts_recv: 2_000,
+                ts_in_delta: 0,
+                channel_id: 0,
+                sequence: 10,
+                order_id: u64::from(order_required),
+                price_raw: if price_required {
+                    100_000_000_000
+                } else {
+                    UNDEF_PRICE
+                },
+                size_raw: u32::from(price_required),
+                flags_raw: FLAG_LAST,
+                action_raw,
+                side_raw,
+            })
+            .unwrap(),
+            &policy(digest(1)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn semantic_tags_are_stable_distinct_and_exhaustive_for_current_lanes() {
+        let cases = [
+            (ACTION_ADD, SIDE_ASK, [0, 0, 1]),
+            (ACTION_ADD, SIDE_BID, [0, 0, 2]),
+            (ACTION_MODIFY, SIDE_ASK, [0, 1, 1]),
+            (ACTION_MODIFY, SIDE_BID, [0, 1, 2]),
+            (ACTION_CANCEL, SIDE_ASK, [0, 2, 1]),
+            (ACTION_CANCEL, SIDE_BID, [0, 2, 2]),
+            (ACTION_CLEAR, SIDE_NONE, [0, 3, 0]),
+            (ACTION_TRADE, SIDE_ASK, [1, 0, 1]),
+            (ACTION_TRADE, SIDE_BID, [1, 0, 2]),
+            (ACTION_TRADE, SIDE_NONE, [1, 1, 0]),
+            (ACTION_FILL, SIDE_ASK, [1, 2, 1]),
+            (ACTION_FILL, SIDE_BID, [1, 2, 2]),
+            (ACTION_FILL, SIDE_NONE, [1, 2, 0]),
+            (ACTION_NONE, SIDE_NONE, [2, 0, 0]),
+        ];
+        let mut tags = AHashSet::new();
+        for (action, side, expected) in cases {
+            let tag = event_semantic_tag(&semantic_event(action, side));
+            assert_eq!(tag, expected);
+            assert!(tags.insert(tag));
+        }
     }
 
     #[test]

@@ -40,7 +40,7 @@ struct ProbeExpectationV1 {
 }
 
 #[derive(Serialize)]
-struct ProbeOutputV2 {
+struct ProbeOutputV3 {
     schema: &'static str,
     authority: &'static str,
     expectation_file_sha256: Sha256DigestV1,
@@ -129,8 +129,8 @@ fn run() -> Result<bool, Box<dyn Error>> {
         ),
         Err(error) => return Err(error.into()),
     };
-    let output = ProbeOutputV2 {
-        schema: "xnas_strict_replay_probe_v2",
+    let output = ProbeOutputV3 {
+        schema: "xnas_strict_replay_probe_v3",
         authority: "development_only_authorizes_nothing",
         expectation_file_sha256,
         expectation,

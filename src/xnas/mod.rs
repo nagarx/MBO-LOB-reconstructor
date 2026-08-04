@@ -1,6 +1,7 @@
 mod book;
 mod diagnostics;
 mod envelope;
+mod qualified;
 
 use crate::loader::{
     CanonicalReadReceiptV1, StrictBoundaryErrorV1, StrictMboEventIteratorV1,
@@ -8,7 +9,10 @@ use crate::loader::{
     XnasDailyMetadataBindingV1,
 };
 use book::ExactBookProjectorV1;
-use envelope::{EnvelopeAssemblyErrorV1, OpenEnvelopeV1, ReadyEnvelopeTxnV1};
+use envelope::{
+    encode_raw_event, event_semantic_tag, EnvelopeAssemblyErrorV1, OpenEnvelopeV1,
+    ReadyEnvelopeTxnV1,
+};
 use hft_mbo_event_contract::{
     BookCommandV1, EventDispositionV1, RawMboEventV1, Sha256DigestV1, ValidationBoundaryClassV1,
     ValidationFailureV1, ValidationReasonV1, ACTION_CLEAR, FLAG_BAD_TS_RECV, SIDE_NONE,
@@ -18,6 +22,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct XnasIdentityV1 {
@@ -45,6 +50,106 @@ impl XnasIdentityV1 {
 pub use book::{BookTransactionErrorV1, XnasBookCommitV1, XnasBookLevelV1, XnasBookSnapshotV1};
 pub use diagnostics::XnasReplayCountsV1;
 pub use envelope::EnvelopeAssemblyErrorV1 as XnasEnvelopeErrorV1;
+pub use qualified::{
+    XnasPendingEnvelopeObservationV1, XnasQualifiedReplayPlanV1, XnasReplayEquivalenceReceiptV1,
+    XnasReplayRevalidationPassV1,
+};
+
+const XNAS_REPLAY_ALGORITHM_ID_V2: &str = "hft.xnas.strict_replay.v2";
+
+/// Reconstructor package/build identity of the code that executed a replay.
+///
+/// The package lock is scoped to this repository. A final executable owner must
+/// separately bind its active workspace lockfile, invocation, and binary digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct XnasReplayBuildIdentityV1 {
+    package_version: &'static str,
+    git_commit: &'static str,
+    git_dirty: bool,
+    package_repository_cargo_lock_sha256: Sha256DigestV1,
+    rustc_command: &'static str,
+    rustc_version: &'static str,
+    rustc_verbose_sha256: Sha256DigestV1,
+    target: &'static str,
+    profile: &'static str,
+    enabled_features: &'static str,
+    replay_algorithm_id: &'static str,
+}
+
+impl XnasReplayBuildIdentityV1 {
+    fn current() -> Self {
+        Self {
+            package_version: env!("CARGO_PKG_VERSION"),
+            git_commit: env!("HFT_RECON_GIT_COMMIT"),
+            git_dirty: env!("HFT_RECON_GIT_DIRTY") == "true",
+            package_repository_cargo_lock_sha256: Sha256DigestV1::from_hex(env!(
+                "HFT_RECON_PACKAGE_LOCK_SHA256"
+            ))
+            .expect("build.rs emits a lowercase package-repository Cargo.lock digest"),
+            rustc_command: env!("HFT_RECON_RUSTC_COMMAND"),
+            rustc_version: env!("HFT_RECON_RUSTC_VERSION"),
+            rustc_verbose_sha256: Sha256DigestV1::from_hex(env!("HFT_RECON_RUSTC_VERBOSE_SHA256"))
+                .expect("build.rs emits a lowercase rustc -vV SHA-256 digest"),
+            target: env!("HFT_RECON_TARGET"),
+            profile: env!("HFT_RECON_PROFILE"),
+            enabled_features: env!("HFT_RECON_ENABLED_FEATURES"),
+            replay_algorithm_id: XNAS_REPLAY_ALGORITHM_ID_V2,
+        }
+    }
+
+    pub const fn package_version(&self) -> &'static str {
+        self.package_version
+    }
+    pub const fn git_commit(&self) -> &'static str {
+        self.git_commit
+    }
+    pub const fn git_dirty(&self) -> bool {
+        self.git_dirty
+    }
+    pub const fn package_repository_cargo_lock_sha256(&self) -> Sha256DigestV1 {
+        self.package_repository_cargo_lock_sha256
+    }
+    pub const fn rustc_command(&self) -> &'static str {
+        self.rustc_command
+    }
+    pub const fn rustc_version(&self) -> &'static str {
+        self.rustc_version
+    }
+    pub const fn rustc_verbose_sha256(&self) -> Sha256DigestV1 {
+        self.rustc_verbose_sha256
+    }
+    pub const fn target(&self) -> &'static str {
+        self.target
+    }
+    pub const fn profile(&self) -> &'static str {
+        self.profile
+    }
+    pub const fn enabled_features(&self) -> &'static str {
+        self.enabled_features
+    }
+    pub const fn replay_algorithm_id(&self) -> &'static str {
+        self.replay_algorithm_id
+    }
+    /// Whether every package-local identity component was captured rather than
+    /// replaced by an explicit unverified sentinel. This still does not bind a
+    /// final executable, consumer workspace lock, or invocation.
+    pub fn is_identity_complete(&self) -> bool {
+        self.git_commit.len() == 40
+            && self
+                .git_commit
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && !self.rustc_command.starts_with("unverified-")
+            && !self.rustc_version.starts_with("unverified-")
+            && !self.target.starts_with("unverified-")
+            && !self.profile.starts_with("unverified-")
+    }
+
+    /// Narrow local fact, not publication or scientific admission authority.
+    pub fn is_clean_git_release_profile(&self) -> bool {
+        self.profile == "release" && !self.git_dirty && self.is_identity_complete()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct XnasReplayConfigV1 {
@@ -81,9 +186,12 @@ impl XnasReplayConfigV1 {
 
 #[derive(Debug)]
 struct XnasStagedBookUpdateV1 {
-    symbol: String,
+    source_object_sha256: Sha256DigestV1,
+    validity_epoch_index: u64,
+    symbol: Arc<str>,
     envelope_sha256: Sha256DigestV1,
-    staged_update_chain_sha256: Sha256DigestV1,
+    committed_observation_sha256: Sha256DigestV1,
+    committed_observation_chain_sha256: Sha256DigestV1,
     envelope: ReadyEnvelopeTxnV1,
     book: XnasBookCommitV1,
 }
@@ -98,14 +206,18 @@ impl XnasStagedBookUpdateV1 {
     }
 }
 
-/// Bounded diagnostic view returned only together with a successful EOF-sealed
-/// replay receipt. No pre-EOF success-typed update leaves the replay owner.
+/// Bounded success trace returned only together with a successful EOF-sealed
+/// replay receipt. The two-pass API may expose the same data earlier only inside
+/// the explicitly non-publishable `XnasPendingEnvelopeObservationV1` wrapper.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct XnasReplayTraceV1 {
-    symbol: String,
+    source_object_sha256: Sha256DigestV1,
+    validity_epoch_index: u64,
+    symbol: Arc<str>,
     identity: XnasIdentityV1,
     envelope_sha256: Sha256DigestV1,
-    staged_update_chain_sha256: Sha256DigestV1,
+    committed_observation_sha256: Sha256DigestV1,
+    committed_observation_chain_sha256: Sha256DigestV1,
     ordered_distinct_sequences: Vec<u32>,
     events: Vec<EventDispositionV1>,
     terminal_sequence: u32,
@@ -123,23 +235,38 @@ pub struct XnasReplayTraceV1 {
 
 impl XnasReplayTraceV1 {
     fn from_staged(update: XnasStagedBookUpdateV1) -> Self {
+        let identity = update.envelope.identity();
+        let terminal_sequence = update.envelope.terminal_sequence();
+        let terminal_source_ordinal = update.envelope.terminal_source_ordinal();
+        let witness = *update.envelope.witness();
+        let endpoint_ns = update.envelope.endpoint_ns();
+        let witness_ts_recv = update.envelope.witness_ts_recv();
+        let effective_available_ns = update.envelope.effective_available_ns();
+        let closure_confirmation_delay_ns = update.envelope.closure_confirmation_delay_ns();
+        let execution_sequence_blocks = update.envelope.execution_sequence_blocks();
+        let execution_carriers = update.envelope.execution_carrier_count();
+        let recovery = update.envelope.is_recovery();
+        let (ordered_distinct_sequences, events) = update.envelope.into_sequences_and_events();
         Self {
+            source_object_sha256: update.source_object_sha256,
+            validity_epoch_index: update.validity_epoch_index,
             symbol: update.symbol,
-            identity: update.envelope.identity(),
+            identity,
             envelope_sha256: update.envelope_sha256,
-            staged_update_chain_sha256: update.staged_update_chain_sha256,
-            ordered_distinct_sequences: update.envelope.sequences().to_vec(),
-            terminal_sequence: update.envelope.terminal_sequence(),
-            terminal_source_ordinal: update.envelope.terminal_source_ordinal(),
-            witness: *update.envelope.witness(),
-            endpoint_ns: update.envelope.endpoint_ns(),
-            witness_ts_recv: update.envelope.witness_ts_recv(),
-            effective_available_ns: update.envelope.effective_available_ns(),
-            closure_confirmation_delay_ns: update.envelope.closure_confirmation_delay_ns(),
-            execution_sequence_blocks: update.envelope.execution_sequence_blocks(),
-            execution_carriers: update.envelope.execution_carrier_count(),
-            recovery: update.envelope.is_recovery(),
-            events: update.envelope.events().to_vec(),
+            committed_observation_sha256: update.committed_observation_sha256,
+            committed_observation_chain_sha256: update.committed_observation_chain_sha256,
+            ordered_distinct_sequences,
+            terminal_sequence,
+            terminal_source_ordinal,
+            witness,
+            endpoint_ns,
+            witness_ts_recv,
+            effective_available_ns,
+            closure_confirmation_delay_ns,
+            execution_sequence_blocks,
+            execution_carriers,
+            recovery,
+            events,
             book: update.book,
         }
     }
@@ -147,20 +274,53 @@ impl XnasReplayTraceV1 {
     pub const fn identity(&self) -> XnasIdentityV1 {
         self.identity
     }
+    pub const fn source_object_sha256(&self) -> Sha256DigestV1 {
+        self.source_object_sha256
+    }
+    /// One-based qualified-validity interval for this identity. This is not the
+    /// book reset epoch: an initially invalid identity can first qualify in
+    /// validity epoch 1 after the exact book has advanced to reset epoch 2.
+    pub const fn validity_epoch_index(&self) -> u64 {
+        self.validity_epoch_index
+    }
     pub fn symbol(&self) -> &str {
         &self.symbol
     }
     pub const fn envelope_sha256(&self) -> Sha256DigestV1 {
         self.envelope_sha256
     }
-    pub const fn staged_update_chain_sha256(&self) -> Sha256DigestV1 {
-        self.staged_update_chain_sha256
+    /// Digest of the exact consumer-visible committed observation, including
+    /// source/identity/epoch, envelope semantics, causal clocks, and exported
+    /// book snapshot values.
+    pub const fn committed_observation_sha256(&self) -> Sha256DigestV1 {
+        self.committed_observation_sha256
+    }
+    pub const fn committed_observation_chain_sha256(&self) -> Sha256DigestV1 {
+        self.committed_observation_chain_sha256
     }
     pub fn ordered_distinct_sequences(&self) -> &[u32] {
         &self.ordered_distinct_sequences
     }
+    /// Exact committed member population. Downstream analytical flow consumes
+    /// these events once, in source order.
     pub fn events(&self) -> &[EventDispositionV1] {
         &self.events
+    }
+    pub fn first_source_ordinal(&self) -> u64 {
+        self.events
+            .first()
+            .expect("a committed envelope always has at least one member")
+            .event()
+            .raw()
+            .raw_ordinal
+    }
+    pub fn last_source_ordinal(&self) -> u64 {
+        self.events
+            .last()
+            .expect("a committed envelope always has at least one member")
+            .event()
+            .raw()
+            .raw_ordinal
     }
     pub const fn terminal_sequence(&self) -> u32 {
         self.terminal_sequence
@@ -168,6 +328,8 @@ impl XnasReplayTraceV1 {
     pub const fn terminal_source_ordinal(&self) -> u64 {
         self.terminal_source_ordinal
     }
+    /// Closure evidence only. This is not a current-envelope member and
+    /// normally becomes a member of its own later envelope.
     pub const fn witness(&self) -> &EventDispositionV1 {
         &self.witness
     }
@@ -674,17 +836,25 @@ impl XnasIdentityReplayReceiptV1 {
 
 /// EOF-sealed replay receipt. This proves source and replay reconciliation; it
 /// does not authorize publication, admission, historical rewrite, or research use.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct XnasReplayReceiptV1 {
+    schema: &'static str,
+    build: XnasReplayBuildIdentityV1,
     source: CanonicalReadReceiptV1,
     config: XnasReplayConfigV1,
     counts: XnasReplayCountsV1,
     identities: Vec<XnasIdentityReplayReceiptV1>,
-    staged_update_chain_sha256: Sha256DigestV1,
+    committed_observation_chain_sha256: Sha256DigestV1,
     authority: &'static str,
 }
 
 impl XnasReplayReceiptV1 {
+    pub const fn schema(&self) -> &'static str {
+        self.schema
+    }
+    pub const fn build(&self) -> &XnasReplayBuildIdentityV1 {
+        &self.build
+    }
     pub const fn source(&self) -> &CanonicalReadReceiptV1 {
         &self.source
     }
@@ -701,8 +871,9 @@ impl XnasReplayReceiptV1 {
         &self.identities
     }
 
-    pub const fn staged_update_chain_sha256(&self) -> Sha256DigestV1 {
-        self.staged_update_chain_sha256
+    /// Chain over every exact committed observation in global replay order.
+    pub const fn committed_observation_chain_sha256(&self) -> Sha256DigestV1 {
+        self.committed_observation_chain_sha256
     }
 
     pub const fn authority(&self) -> &'static str {
@@ -750,16 +921,24 @@ pub enum XnasTerminalDisqualificationReasonV1 {
 /// physical EOF but failed a terminal scientific invariant.
 #[derive(Debug, Serialize)]
 pub struct XnasTerminalDisqualificationV1 {
+    schema: &'static str,
+    build: XnasReplayBuildIdentityV1,
     source: CanonicalReadReceiptV1,
     config: XnasReplayConfigV1,
     counts: XnasReplayCountsV1,
     identities: Vec<XnasIdentityReplayReceiptV1>,
-    staged_update_chain_sha256: Sha256DigestV1,
+    committed_observation_chain_sha256: Sha256DigestV1,
     reason: XnasTerminalDisqualificationReasonV1,
     authority: &'static str,
 }
 
 impl XnasTerminalDisqualificationV1 {
+    pub const fn schema(&self) -> &'static str {
+        self.schema
+    }
+    pub const fn build(&self) -> &XnasReplayBuildIdentityV1 {
+        &self.build
+    }
     pub const fn source(&self) -> &CanonicalReadReceiptV1 {
         &self.source
     }
@@ -772,8 +951,8 @@ impl XnasTerminalDisqualificationV1 {
     pub fn identities(&self) -> &[XnasIdentityReplayReceiptV1] {
         &self.identities
     }
-    pub const fn staged_update_chain_sha256(&self) -> Sha256DigestV1 {
-        self.staged_update_chain_sha256
+    pub const fn committed_observation_chain_sha256(&self) -> Sha256DigestV1 {
+        self.committed_observation_chain_sha256
     }
     pub const fn reason(&self) -> &XnasTerminalDisqualificationReasonV1 {
         &self.reason
@@ -793,6 +972,7 @@ impl std::fmt::Display for XnasTerminalDisqualificationV1 {
 /// open, but the bytes were not completely decoded or terminally re-hashed.
 #[derive(Debug)]
 pub struct XnasReplayPrefixFailureV1 {
+    build: XnasReplayBuildIdentityV1,
     source: hft_mbo_event_contract::SourceDescriptorV1,
     metadata_binding: XnasDailyMetadataBindingV1,
     config: XnasReplayConfigV1,
@@ -805,6 +985,9 @@ pub struct XnasReplayPrefixFailureV1 {
 }
 
 impl XnasReplayPrefixFailureV1 {
+    pub const fn build(&self) -> &XnasReplayBuildIdentityV1 {
+        &self.build
+    }
     pub const fn source(&self) -> &hft_mbo_event_contract::SourceDescriptorV1 {
         &self.source
     }
@@ -855,7 +1038,7 @@ enum IdentityLifecycleV1 {
 }
 
 struct IdentityReplayStateV1 {
-    symbol: String,
+    symbol: Arc<str>,
     initial_clear_control: Option<RawMboEventV1>,
     lifecycle: IdentityLifecycleV1,
     open: Option<OpenEnvelopeV1>,
@@ -881,6 +1064,7 @@ struct IdentityReplayStateV1 {
 /// returns the source-bound EOF receipt and a later publication transaction
 /// seals the staged generation.
 pub struct StrictXnasReplayV1 {
+    build: XnasReplayBuildIdentityV1,
     input: StrictMboEventIteratorV1,
     binding: XnasDailyMetadataBindingV1,
     source_digest: Sha256DigestV1,
@@ -889,7 +1073,8 @@ pub struct StrictXnasReplayV1 {
     next_raw_ordinal: u64,
     global_receive_watermark_ns: Option<u64>,
     counts: XnasReplayCountsV1,
-    staged_update_chain_sha256: Sha256DigestV1,
+    committed_observation_chain_sha256: Sha256DigestV1,
+    committed_observation_encoding: Vec<u8>,
     eof: bool,
     failed: bool,
 }
@@ -916,7 +1101,7 @@ impl StrictXnasReplayV1 {
             identities.insert(
                 identity,
                 IdentityReplayStateV1 {
-                    symbol: instrument.symbol.clone(),
+                    symbol: Arc::from(instrument.symbol.as_str()),
                     initial_clear_control: None,
                     lifecycle: IdentityLifecycleV1::Uninitialized,
                     open: None,
@@ -944,6 +1129,7 @@ impl StrictXnasReplayV1 {
             );
         }
         Ok(Self {
+            build: XnasReplayBuildIdentityV1::current(),
             input,
             binding,
             source_digest,
@@ -952,7 +1138,11 @@ impl StrictXnasReplayV1 {
             next_raw_ordinal: 1,
             global_receive_watermark_ns: None,
             counts: XnasReplayCountsV1::default(),
-            staged_update_chain_sha256: initial_staged_update_chain(source_digest, config),
+            committed_observation_chain_sha256: initial_committed_observation_chain(
+                source_digest,
+                config,
+            ),
+            committed_observation_encoding: Vec::with_capacity(1_024),
             eof: false,
             failed: false,
         })
@@ -1110,6 +1300,7 @@ impl StrictXnasReplayV1 {
 
     fn into_prefix_failure(self, cause: XnasReplayErrorV1) -> XnasReplayErrorV1 {
         XnasReplayErrorV1::PrefixFailed(Box::new(XnasReplayPrefixFailureV1 {
+            build: self.build,
             source: self.input.source().clone(),
             metadata_binding: self.binding,
             config: self.config,
@@ -1259,7 +1450,7 @@ impl StrictXnasReplayV1 {
                 };
                 XnasIdentityReplayReceiptV1 {
                     identity,
-                    symbol: state.symbol,
+                    symbol: state.symbol.to_string(),
                     initial_clear_control: state.initial_clear_control,
                     terminal_status,
                     last_committed_book_state_sha256: state.book.state_digest(),
@@ -1283,22 +1474,26 @@ impl StrictXnasReplayV1 {
         if let Some(reason) = disqualification {
             return Err(XnasReplayErrorV1::TerminalDisqualified(Box::new(
                 XnasTerminalDisqualificationV1 {
+                    schema: "xnas_terminal_disqualification_v1",
+                    build: self.build,
                     source,
                     config: self.config,
                     counts: self.counts,
                     identities,
-                    staged_update_chain_sha256: self.staged_update_chain_sha256,
+                    committed_observation_chain_sha256: self.committed_observation_chain_sha256,
                     reason,
                     authority: "nonconsumable_terminal_diagnostic",
                 },
             )));
         }
         Ok(XnasReplayReceiptV1 {
+            schema: "xnas_replay_receipt_v1",
+            build: self.build,
             source,
             config: self.config,
             counts: self.counts,
             identities,
-            staged_update_chain_sha256: self.staged_update_chain_sha256,
+            committed_observation_chain_sha256: self.committed_observation_chain_sha256,
             authority: "development_only_authorizes_nothing",
         })
     }
@@ -1613,8 +1808,8 @@ impl StrictXnasReplayV1 {
                             .map_err(XnasReplayErrorV1::CounterInvariant)?;
                     }
 
-                    let envelope_sha256 =
-                        Sha256DigestV1::from_bytes(ready.digest(self.source_digest));
+                    let envelope_commitment = ready.commitment(self.source_digest);
+                    let envelope_sha256 = envelope_commitment.sha256();
                     let terminal_source_ordinal = ready.terminal_source_ordinal();
                     let effective_available_ns = ready.effective_available_ns();
                     let witness = *ready.witness();
@@ -1655,24 +1850,17 @@ impl StrictXnasReplayV1 {
                         effective_available_ns,
                         recovery_reset_source_ordinal,
                     )?;
-                    let book = match state.book.apply_envelope(&ready) {
+                    let book = match state
+                        .book
+                        .apply_envelope_precommitted(&ready, envelope_commitment)
+                    {
                         Ok(book) => book,
                         Err(source) if is_quarantinable_book_error(&source) => {
                             return self.quarantine_failed_ready_envelope(state, ready, source)
                         }
                         Err(source) => return Err(XnasReplayErrorV1::Book(source)),
                     };
-                    let staged_update_chain_sha256 = next_staged_update_chain(
-                        self.staged_update_chain_sha256,
-                        envelope_sha256,
-                        book.transition_chain_sha256(),
-                        ready.identity(),
-                        terminal_source_ordinal,
-                        ready.witness().event().raw().raw_ordinal,
-                        effective_available_ns,
-                    );
                     self.counts = next_counts;
-                    self.staged_update_chain_sha256 = staged_update_chain_sha256;
                     state.lifecycle = IdentityLifecycleV1::Valid;
                     if let Some(reset_source_ordinal) = recovery_reset_source_ordinal {
                         let qualification = XnasRecoveryQualificationV1 {
@@ -1701,11 +1889,36 @@ impl StrictXnasReplayV1 {
                         recovery_reset_source_ordinal,
                         state.book.transition_chain_sha256(),
                     );
+                    let validity_epoch_index = u64::try_from(state.validity_epochs.len())
+                        .map_err(|_| {
+                            XnasReplayErrorV1::CounterInvariant("validity epoch index overflow")
+                        })?
+                        .checked_add(1)
+                        .ok_or(XnasReplayErrorV1::CounterInvariant(
+                            "validity epoch index overflow",
+                        ))?;
+                    let committed_observation_sha256 = committed_observation_digest(
+                        &mut self.committed_observation_encoding,
+                        self.source_digest,
+                        validity_epoch_index,
+                        state.symbol.as_ref(),
+                        envelope_sha256,
+                        &ready,
+                        &book,
+                    );
+                    let committed_observation_chain_sha256 = next_committed_observation_chain(
+                        self.committed_observation_chain_sha256,
+                        committed_observation_sha256,
+                    );
+                    self.committed_observation_chain_sha256 = committed_observation_chain_sha256;
                     state.open = Some(self.new_open_envelope(witness, false));
                     Ok(Some(XnasStagedBookUpdateV1 {
+                        source_object_sha256: self.source_digest,
+                        validity_epoch_index,
                         symbol: state.symbol.clone(),
                         envelope_sha256,
-                        staged_update_chain_sha256,
+                        committed_observation_sha256,
+                        committed_observation_chain_sha256,
                         envelope: ready,
                         book,
                     }))
@@ -2511,12 +2724,12 @@ fn validity_epoch_ledgers_reconcile(
     true
 }
 
-fn initial_staged_update_chain(
+fn initial_committed_observation_chain(
     source_digest: Sha256DigestV1,
     config: XnasReplayConfigV1,
 ) -> Sha256DigestV1 {
     let mut hasher = Sha256::new();
-    hasher.update(b"hft.xnas_staged_update_chain.seed.v1\0");
+    hasher.update(b"hft.xnas_committed_observation_chain.seed.v2\0");
     hasher.update(source_digest.as_bytes());
     hasher.update(
         u64::try_from(config.snapshot_depth.get())
@@ -2536,25 +2749,126 @@ fn initial_staged_update_chain(
     Sha256DigestV1::from_bytes(hasher.finalize().into())
 }
 
-fn next_staged_update_chain(
+fn next_committed_observation_chain(
     prior: Sha256DigestV1,
-    envelope: Sha256DigestV1,
-    book_transition: Sha256DigestV1,
-    identity: XnasIdentityV1,
-    terminal_source_ordinal: u64,
-    witness_source_ordinal: u64,
-    effective_available_ns: u64,
+    committed_observation: Sha256DigestV1,
 ) -> Sha256DigestV1 {
     let mut hasher = Sha256::new();
-    hasher.update(b"hft.xnas_staged_update_chain.v1\0");
+    hasher.update(b"hft.xnas_committed_observation_chain.v2\0");
     hasher.update(prior.as_bytes());
-    hasher.update(envelope.as_bytes());
-    hasher.update(book_transition.as_bytes());
-    hasher.update(identity.publisher_id().to_le_bytes());
-    hasher.update(identity.instrument_id().to_le_bytes());
-    hasher.update(terminal_source_ordinal.to_le_bytes());
-    hasher.update(witness_source_ordinal.to_le_bytes());
-    hasher.update(effective_available_ns.to_le_bytes());
+    hasher.update(committed_observation.as_bytes());
+    Sha256DigestV1::from_bytes(hasher.finalize().into())
+}
+
+fn committed_observation_digest(
+    encoding: &mut Vec<u8>,
+    source_digest: Sha256DigestV1,
+    validity_epoch_index: u64,
+    symbol: &str,
+    envelope_sha256: Sha256DigestV1,
+    envelope: &ReadyEnvelopeTxnV1,
+    book: &XnasBookCommitV1,
+) -> Sha256DigestV1 {
+    encoding.clear();
+    encoding.extend_from_slice(b"hft.xnas_committed_observation.v2\0");
+    encoding.extend_from_slice(source_digest.as_bytes());
+    encoding.extend_from_slice(&envelope.identity().publisher_id().to_le_bytes());
+    encoding.extend_from_slice(&envelope.identity().instrument_id().to_le_bytes());
+    encoding.extend_from_slice(&validity_epoch_index.to_le_bytes());
+    encoding.extend_from_slice(
+        &u64::try_from(symbol.len())
+            .expect("usize always fits u64 on supported targets")
+            .to_le_bytes(),
+    );
+    encoding.extend_from_slice(symbol.as_bytes());
+    encoding.extend_from_slice(envelope_sha256.as_bytes());
+    encoding.extend_from_slice(&envelope.terminal_sequence().to_le_bytes());
+    encoding.extend_from_slice(&envelope.terminal_source_ordinal().to_le_bytes());
+    encoding.extend_from_slice(&event_semantic_tag(envelope.witness()));
+    encode_raw_event(encoding, envelope.witness().event().raw());
+    encoding.extend_from_slice(&envelope.endpoint_ns().to_le_bytes());
+    encoding.extend_from_slice(&envelope.witness_ts_recv().to_le_bytes());
+    encoding.extend_from_slice(&envelope.effective_available_ns().to_le_bytes());
+    encoding.extend_from_slice(&envelope.closure_confirmation_delay_ns().to_le_bytes());
+    encoding.extend_from_slice(&envelope.execution_sequence_blocks().to_le_bytes());
+    encoding.extend_from_slice(&envelope.execution_carrier_count().to_le_bytes());
+    encoding.push(u8::from(envelope.is_recovery()));
+    encoding.extend_from_slice(&book.commit_index().to_le_bytes());
+    encoding.extend_from_slice(&book.reset_epoch().to_le_bytes());
+    encoding.extend_from_slice(&book.book_commands_committed().to_le_bytes());
+    encoding.push(u8::from(book.exact_endpoint_state_changed()));
+    encoding.extend_from_slice(book.transition_chain_sha256().as_bytes());
+    encode_book_snapshot(encoding, book.snapshot());
+    Sha256DigestV1::from_bytes(Sha256::digest(encoding.as_slice()).into())
+}
+
+fn encode_book_snapshot(encoding: &mut Vec<u8>, snapshot: &XnasBookSnapshotV1) {
+    for levels in [snapshot.bids(), snapshot.asks()] {
+        encoding.extend_from_slice(
+            &u64::try_from(levels.len())
+                .expect("usize always fits u64 on supported targets")
+                .to_le_bytes(),
+        );
+        for level in levels {
+            encoding.extend_from_slice(&level.price_raw().to_le_bytes());
+            encoding.extend_from_slice(&level.aggregate_size().to_le_bytes());
+            encoding.extend_from_slice(&level.order_count().to_le_bytes());
+        }
+    }
+    encoding.extend_from_slice(&snapshot.live_orders().to_le_bytes());
+}
+
+#[cfg(test)]
+fn committed_observation_digest_streaming_reference(
+    source_digest: Sha256DigestV1,
+    validity_epoch_index: u64,
+    symbol: &str,
+    envelope_sha256: Sha256DigestV1,
+    envelope: &ReadyEnvelopeTxnV1,
+    book: &XnasBookCommitV1,
+) -> Sha256DigestV1 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hft.xnas_committed_observation.v2\0");
+    hasher.update(source_digest.as_bytes());
+    hasher.update(envelope.identity().publisher_id().to_le_bytes());
+    hasher.update(envelope.identity().instrument_id().to_le_bytes());
+    hasher.update(validity_epoch_index.to_le_bytes());
+    hasher.update(
+        u64::try_from(symbol.len())
+            .expect("usize always fits u64 on supported targets")
+            .to_le_bytes(),
+    );
+    hasher.update(symbol.as_bytes());
+    hasher.update(envelope_sha256.as_bytes());
+    hasher.update(envelope.terminal_sequence().to_le_bytes());
+    hasher.update(envelope.terminal_source_ordinal().to_le_bytes());
+    envelope::hash_event_semantics(&mut hasher, envelope.witness());
+    envelope::hash_raw_event(&mut hasher, envelope.witness().event().raw());
+    hasher.update(envelope.endpoint_ns().to_le_bytes());
+    hasher.update(envelope.witness_ts_recv().to_le_bytes());
+    hasher.update(envelope.effective_available_ns().to_le_bytes());
+    hasher.update(envelope.closure_confirmation_delay_ns().to_le_bytes());
+    hasher.update(envelope.execution_sequence_blocks().to_le_bytes());
+    hasher.update(envelope.execution_carrier_count().to_le_bytes());
+    hasher.update([u8::from(envelope.is_recovery())]);
+    hasher.update(book.commit_index().to_le_bytes());
+    hasher.update(book.reset_epoch().to_le_bytes());
+    hasher.update(book.book_commands_committed().to_le_bytes());
+    hasher.update([u8::from(book.exact_endpoint_state_changed())]);
+    hasher.update(book.transition_chain_sha256().as_bytes());
+    for levels in [book.snapshot().bids(), book.snapshot().asks()] {
+        hasher.update(
+            u64::try_from(levels.len())
+                .expect("usize always fits u64 on supported targets")
+                .to_le_bytes(),
+        );
+        for level in levels {
+            hasher.update(level.price_raw().to_le_bytes());
+            hasher.update(level.aggregate_size().to_le_bytes());
+            hasher.update(level.order_count().to_le_bytes());
+        }
+    }
+    hasher.update(book.snapshot().live_orders().to_le_bytes());
     Sha256DigestV1::from_bytes(hasher.finalize().into())
 }
 
@@ -2612,6 +2926,17 @@ pub enum XnasReplayErrorV1 {
     CannotFinishFailedReplay,
     #[error("replay must reach EOF before it can produce a success receipt")]
     CannotFinishBeforeEof,
+    #[error(
+        "the revalidation pass must be drained to EOF before it can produce an equivalence receipt"
+    )]
+    CannotFinishRevalidationBeforeEof,
+    #[error("a failed revalidation pass cannot be resumed")]
+    CannotContinueFailedRevalidation,
+    #[error("terminal revalidation receipt differs from the qualification receipt")]
+    RevalidationReceiptMismatch {
+        qualification: Arc<XnasReplayReceiptV1>,
+        revalidation: Arc<XnasReplayReceiptV1>,
+    },
     #[error("{0}")]
     TerminalDisqualified(Box<XnasTerminalDisqualificationV1>),
 }
@@ -2629,5 +2954,227 @@ impl XnasReplayErrorV1 {
             Self::PrefixFailed(diagnostic) => Some(diagnostic),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod committed_observation_digest_tests {
+    use super::*;
+    use hft_mbo_event_contract::{
+        classify_full_order_book, validate_raw_event, BoundPublisherPolicyV1, LogicalSourceV1,
+        OpenedReplicaV1, OpenedRepresentationV1, PublisherPolicyIdV1, SourceDescriptorV1,
+        ACTION_ADD, ACTION_FILL, ACTION_TRADE, EXPECTED_MBO_RECORD_SIZE_BYTES, EXPECTED_MBO_RTYPE,
+        FLAG_LAST, SIDE_ASK, SIDE_BID,
+    };
+
+    const SOURCE: Sha256DigestV1 = Sha256DigestV1::from_bytes([19; 32]);
+
+    fn policy() -> BoundPublisherPolicyV1 {
+        BoundPublisherPolicyV1::bind(
+            PublisherPolicyIdV1::XnasItchHistorical,
+            &SourceDescriptorV1 {
+                logical: LogicalSourceV1 {
+                    catalog_release_id: "test".into(),
+                    catalog_object_id: "test".into(),
+                    canonical_path: "/test.dbn".into(),
+                    canonical_sha256: SOURCE,
+                    canonical_bytes: 1,
+                    dbn_version: 1,
+                    dbn_ts_out: false,
+                    dataset: "XNAS.ITCH".into(),
+                    schema: "mbo".into(),
+                },
+                opened: OpenedReplicaV1 {
+                    configured_path: "/test.dbn".into(),
+                    opened_path: "/test.dbn".into(),
+                    representation: OpenedRepresentationV1::CanonicalObject,
+                    opened_sha256: SOURCE,
+                    opened_bytes: 1,
+                },
+            },
+        )
+        .unwrap()
+    }
+
+    fn disposition(raw: RawMboEventV1) -> EventDispositionV1 {
+        classify_full_order_book(validate_raw_event(raw).unwrap(), &policy()).unwrap()
+    }
+
+    fn member() -> RawMboEventV1 {
+        RawMboEventV1 {
+            source_object_sha256: SOURCE,
+            raw_ordinal: 1,
+            subordinal: 0,
+            rtype: EXPECTED_MBO_RTYPE,
+            record_size_bytes: EXPECTED_MBO_RECORD_SIZE_BYTES,
+            publisher_id: 2,
+            instrument_id: 101,
+            ts_event: 1_000,
+            ts_recv: 2_000,
+            ts_in_delta: 0,
+            channel_id: 0,
+            sequence: 10,
+            order_id: 1,
+            price_raw: 100_000_000_000,
+            size_raw: 100,
+            flags_raw: FLAG_LAST,
+            action_raw: ACTION_ADD,
+            side_raw: SIDE_BID,
+        }
+    }
+
+    fn witness() -> RawMboEventV1 {
+        RawMboEventV1 {
+            source_object_sha256: SOURCE,
+            raw_ordinal: 2,
+            subordinal: 0,
+            rtype: EXPECTED_MBO_RTYPE,
+            record_size_bytes: EXPECTED_MBO_RECORD_SIZE_BYTES,
+            publisher_id: 2,
+            instrument_id: 101,
+            ts_event: 1_100,
+            ts_recv: 2_100,
+            ts_in_delta: 0,
+            channel_id: 0,
+            sequence: 11,
+            order_id: 0,
+            price_raw: 101_000_000_000,
+            size_raw: 10,
+            flags_raw: FLAG_LAST,
+            action_raw: ACTION_TRADE,
+            side_raw: SIDE_ASK,
+        }
+    }
+
+    fn digests_for(
+        symbol: &str,
+        snapshot_depth: usize,
+        witness_raw: RawMboEventV1,
+    ) -> (Sha256DigestV1, Sha256DigestV1) {
+        let envelope = ReadyEnvelopeTxnV1::synthetic_for_book_test(
+            vec![disposition(member())],
+            disposition(witness_raw),
+            false,
+        );
+        let mut book =
+            ExactBookProjectorV1::new(SOURCE, envelope.identity(), snapshot_depth).unwrap();
+        let commit = book.apply_envelope(&envelope).unwrap();
+        let envelope_sha256 = envelope.commitment(SOURCE).sha256();
+        (
+            committed_observation_digest(
+                &mut Vec::new(),
+                SOURCE,
+                1,
+                symbol,
+                envelope_sha256,
+                &envelope,
+                &commit,
+            ),
+            committed_observation_digest_streaming_reference(
+                SOURCE,
+                1,
+                symbol,
+                envelope_sha256,
+                &envelope,
+                &commit,
+            ),
+        )
+    }
+
+    fn digest_for(witness_raw: RawMboEventV1) -> Sha256DigestV1 {
+        let (buffered, streaming) = digests_for("TEST", 10, witness_raw);
+        assert_eq!(buffered, streaming);
+        buffered
+    }
+
+    #[test]
+    fn buffered_observation_encoding_matches_streaming_reference() {
+        let variants = [
+            ("N", 1, witness()),
+            (
+                "NVDA",
+                2,
+                RawMboEventV1 {
+                    size_raw: 11,
+                    ..witness()
+                },
+            ),
+            (
+                "LONGER-SYNTHETIC-SYMBOL",
+                10,
+                RawMboEventV1 {
+                    action_raw: ACTION_FILL,
+                    side_raw: SIDE_BID,
+                    ..witness()
+                },
+            ),
+        ];
+        for (symbol, depth, witness_raw) in variants {
+            let (buffered, streaming) = digests_for(symbol, depth, witness_raw);
+            assert_eq!(buffered, streaming);
+        }
+    }
+
+    #[test]
+    fn every_exposed_witness_payload_family_changes_the_observation_digest() {
+        let base = witness();
+        let variants = vec![
+            RawMboEventV1 {
+                raw_ordinal: base.raw_ordinal + 1,
+                ..base
+            },
+            RawMboEventV1 {
+                ts_event: base.ts_event + 1,
+                ..base
+            },
+            RawMboEventV1 {
+                ts_recv: base.ts_recv + 1,
+                ..base
+            },
+            RawMboEventV1 {
+                ts_in_delta: 1,
+                ..base
+            },
+            RawMboEventV1 {
+                channel_id: 1,
+                ..base
+            },
+            RawMboEventV1 {
+                sequence: base.sequence + 1,
+                ..base
+            },
+            RawMboEventV1 {
+                order_id: 99,
+                ..base
+            },
+            RawMboEventV1 {
+                price_raw: base.price_raw + 1,
+                ..base
+            },
+            RawMboEventV1 {
+                size_raw: base.size_raw + 1,
+                ..base
+            },
+            RawMboEventV1 {
+                flags_raw: 0,
+                ..base
+            },
+            RawMboEventV1 {
+                action_raw: ACTION_FILL,
+                ..base
+            },
+            RawMboEventV1 {
+                side_raw: SIDE_BID,
+                ..base
+            },
+        ];
+
+        let baseline = digest_for(base);
+        let changed = variants
+            .into_iter()
+            .map(digest_for)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(changed.len(), 12);
+        assert!(changed.iter().all(|digest| *digest != baseline));
     }
 }

@@ -23,7 +23,7 @@ use crate::types::{Action, BookConsistency, LobState, MboMessage, Order, Side};
 /// field. Bumped to `2.0.0` to signal the conceptual break from the legacy
 /// flat shape (no envelope existed before — pre-M.A.5 was implicit-1.0).
 ///
-/// **Independent of** [`crate::export::SCHEMA_VERSION`] (`"1.0"`), which
+/// **Independent of** `crate::export::SCHEMA_VERSION` (`"1.0"`), which
 /// versions the Parquet export schema — a different artifact. When either
 /// constant bumps, the other should NOT auto-bump.
 ///

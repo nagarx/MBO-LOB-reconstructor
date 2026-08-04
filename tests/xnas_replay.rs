@@ -18,7 +18,7 @@ use mbo_lob_reconstructor::{
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::process::Command;
@@ -204,6 +204,42 @@ fn replay_config() -> XnasReplayConfigV1 {
         NonZeroUsize::new(64).unwrap(),
         NonZeroUsize::new(64).unwrap(),
     )
+}
+
+fn independent_observation_chain_seed(
+    source: Sha256DigestV1,
+    config: XnasReplayConfigV1,
+) -> Sha256DigestV1 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hft.xnas_committed_observation_chain.seed.v2\0");
+    hasher.update(source.as_bytes());
+    hasher.update(
+        u64::try_from(config.snapshot_depth().get())
+            .unwrap()
+            .to_le_bytes(),
+    );
+    hasher.update(
+        u64::try_from(config.max_envelope_members().get())
+            .unwrap()
+            .to_le_bytes(),
+    );
+    hasher.update(
+        u64::try_from(config.max_sequence_blocks().get())
+            .unwrap()
+            .to_le_bytes(),
+    );
+    Sha256DigestV1::from_bytes(hasher.finalize().into())
+}
+
+fn independent_observation_chain_next(
+    prior: Sha256DigestV1,
+    observation: Sha256DigestV1,
+) -> Sha256DigestV1 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hft.xnas_committed_observation_chain.v2\0");
+    hasher.update(prior.as_bytes());
+    hasher.update(observation.as_bytes());
+    Sha256DigestV1::from_bytes(hasher.finalize().into())
 }
 
 fn run_with_all_traces(replay: StrictXnasReplayV1, records: u64) -> XnasReplayRunV1 {
@@ -441,6 +477,52 @@ fn conformance_records(initial_event_ns: u64, initial_recv_ns: u64) -> Vec<MboMs
     ]
 }
 
+fn long_trade_stream_records(
+    trade_count: usize,
+    changed_trade: Option<(usize, u32)>,
+) -> Vec<MboMsg> {
+    let mut records = Vec::with_capacity(trade_count + 1);
+    records.push(initial_clear(START_NS + 1, START_NS + 2));
+    for index in 0..trade_count {
+        let size = changed_trade
+            .filter(|(changed_index, _)| *changed_index == index)
+            .map_or(1, |(_, changed_size)| changed_size);
+        records.push(message(
+            b'T',
+            b'N',
+            0,
+            ASK,
+            size,
+            u32::try_from(index + 1).unwrap(),
+            flags::LAST,
+            START_NS + 10 + index as u64,
+            START_NS + 100 + index as u64,
+        ));
+    }
+    records
+}
+
+fn exact_byte_differences(source: &[u8], alternate: &[u8]) -> Vec<(u64, u8, u8)> {
+    assert_eq!(source.len(), alternate.len());
+    source
+        .iter()
+        .zip(alternate)
+        .enumerate()
+        .filter_map(|(offset, (source, alternate))| {
+            (source != alternate).then_some((offset as u64, *source, *alternate))
+        })
+        .collect()
+}
+
+fn apply_byte_differences(file: &mut File, differences: &[(u64, u8, u8)], use_alternate: bool) {
+    for (offset, original, alternate) in differences {
+        file.seek(SeekFrom::Start(*offset)).unwrap();
+        file.write_all(&[if use_alternate { *alternate } else { *original }])
+            .unwrap();
+    }
+    file.sync_data().unwrap();
+}
+
 #[test]
 fn strict_loader_replay_proves_repeated_last_multiblock_and_population_semantics() {
     for compression in [Compression::None, Compression::Zstd] {
@@ -456,6 +538,13 @@ fn strict_loader_replay_proves_repeated_last_multiblock_and_population_semantics
         assert_eq!(updates.len(), 4);
 
         assert_eq!(updates[0].events().len(), 1);
+        assert_eq!(
+            updates[0].source_object_sha256(),
+            expectation(&path, 10).logical().canonical_sha256
+        );
+        assert_eq!(updates[0].validity_epoch_index(), 1);
+        assert_eq!(updates[0].first_source_ordinal(), 2);
+        assert_eq!(updates[0].last_source_ordinal(), 2);
         assert_eq!(updates[0].terminal_source_ordinal(), 2);
         assert_eq!(updates[0].witness_source_ordinal(), 3);
         assert_eq!(updates[0].book().snapshot().live_orders(), 1);
@@ -538,8 +627,8 @@ fn strict_loader_replay_proves_repeated_last_multiblock_and_population_semantics
             1
         );
         assert_eq!(
-            receipt.staged_update_chain_sha256(),
-            updates.last().unwrap().staged_update_chain_sha256()
+            receipt.committed_observation_chain_sha256(),
+            updates.last().unwrap().committed_observation_chain_sha256()
         );
         assert_eq!(run.selected_ordinal_dispositions().len(), 10);
         assert!(run
@@ -568,6 +657,300 @@ fn strict_loader_replay_proves_repeated_last_multiblock_and_population_semantics
             role,
             XnasSelectedOrdinalRoleV1::EofTailQuarantinedMember { .. }
         )));
+    }
+}
+
+#[test]
+fn qualified_two_pass_replay_exposes_pending_envelopes_then_exact_equivalence() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("two-pass.dbn");
+    let records = conformance_records(START_NS + 1, START_NS + 2);
+    write_dbn(&path, Compression::None, &records);
+    let expected_source = expectation(&path, records.len() as u64)
+        .logical()
+        .canonical_sha256;
+
+    let plan = open_replay(&path, records.len() as u64).qualify().unwrap();
+    assert_eq!(
+        plan.qualification_receipt().source().decoded_records(),
+        records.len() as u64
+    );
+    let build = plan.qualification_receipt().build();
+    let package_lock = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"))
+        .expect("package lock is present in the repository");
+    assert_eq!(build.package_version(), "1.0.0");
+    assert_eq!(
+        plan.qualification_receipt().schema(),
+        "xnas_replay_receipt_v1"
+    );
+    assert_eq!(build.replay_algorithm_id(), "hft.xnas.strict_replay.v2");
+    assert!(build
+        .enabled_features()
+        .split(',')
+        .any(|feature| feature == "CARGO_FEATURE_DATABENTO"));
+    assert_eq!(
+        build.package_repository_cargo_lock_sha256(),
+        Sha256DigestV1::from_bytes(Sha256::digest(package_lock).into())
+    );
+    if build.git_commit() == "unverified-no-package-repository-commit" {
+        assert!(build.git_dirty());
+    } else {
+        assert_eq!(build.git_commit().len(), 40);
+        assert!(build
+            .git_commit()
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+    }
+    if build.rustc_command() != "unverified-non-utf8-rustc-command" {
+        let rustc_output = Command::new(build.rustc_command())
+            .arg("-vV")
+            .output()
+            .unwrap();
+        assert!(rustc_output.status.success());
+        let rustc_verbose = String::from_utf8(rustc_output.stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        assert_eq!(
+            build.rustc_verbose_sha256(),
+            Sha256DigestV1::from_bytes(Sha256::digest(rustc_verbose.as_bytes()).into())
+        );
+        assert_eq!(build.rustc_version(), rustc_verbose.lines().next().unwrap());
+    }
+    let mut pass = plan.open_revalidation_pass().unwrap();
+    let mut observations = Vec::new();
+    let mut observation_digests = Vec::new();
+    let mut observation_chains = Vec::new();
+    while let Some(observation) = pass.next_observation().unwrap() {
+        observation_digests.push(observation.committed_observation_sha256());
+        observation_chains.push(observation.committed_observation_chain_sha256());
+        observations.push((
+            observation.source_object_sha256(),
+            observation.validity_epoch_index(),
+            observation.first_source_ordinal(),
+            observation.last_source_ordinal(),
+            observation.witness_source_ordinal(),
+            observation.effective_available_ns(),
+            observation.book().exact_endpoint_state_changed(),
+        ));
+    }
+    assert_eq!(observations.len(), 4);
+    assert!(observations
+        .iter()
+        .all(|observation| observation.0 == expected_source && observation.1 == 1));
+    // The witness that closes one envelope belongs to the following envelope,
+    // never to both member populations.
+    assert_eq!(
+        (observations[0].2, observations[0].3, observations[0].4),
+        (2, 2, 3)
+    );
+    assert_eq!(observations[1].2, 3);
+    for pair in observations.windows(2) {
+        assert_eq!(pair[0].4, pair[1].2);
+        assert_ne!(pair[0].4, pair[0].3);
+    }
+
+    let mut independent_chain =
+        independent_observation_chain_seed(expected_source, plan.qualification_receipt().config());
+    for (observation_digest, exposed_chain) in observation_digests.iter().zip(&observation_chains) {
+        independent_chain =
+            independent_observation_chain_next(independent_chain, *observation_digest);
+        assert_eq!(*exposed_chain, independent_chain);
+    }
+    assert_eq!(
+        observation_digests[0].to_hex(),
+        "772b8a79f0bccb14d81ddbdcf746a04a92ea3ab4971cf0b894a0d3f39ff0aa83"
+    );
+    assert_eq!(
+        independent_chain.to_hex(),
+        "73a8db01092d6a20e6b3310005b6086fc6b369a2768c6ecc62a99608e4550236"
+    );
+
+    let equivalence = pass.finish().unwrap();
+    assert_eq!(equivalence.schema(), "xnas_replay_equivalence_receipt_v1");
+    assert_eq!(equivalence.exact_receipt(), plan.qualification_receipt());
+    assert_eq!(equivalence.verified_complete_replays(), 2);
+    assert_eq!(
+        equivalence
+            .exact_receipt()
+            .committed_observation_chain_sha256(),
+        independent_chain
+    );
+    assert_eq!(
+        equivalence.authority(),
+        "development_only_exact_two_pass_replay_equivalence_not_publication_authority"
+    );
+}
+
+#[test]
+fn qualified_two_pass_replay_preserves_quarantine_recovery_and_epoch_semantics() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("two-pass-recovery.dbn");
+    let records = recoverable_failure_records(RecoverableFailureFixtureV1::MissingModify);
+    write_dbn(&path, Compression::None, &records);
+
+    let plan = open_replay(&path, records.len() as u64).qualify().unwrap();
+    assert_eq!(
+        plan.qualification_receipt()
+            .counts()
+            .semantic_quarantine_incidents,
+        1
+    );
+    let mut pass = plan.open_revalidation_pass().unwrap();
+    let mut observations = Vec::new();
+    while let Some(observation) = pass.next_observation().unwrap() {
+        observations.push((
+            observation.is_recovery(),
+            observation.validity_epoch_index(),
+            observation.book().reset_epoch(),
+            observation.terminal_source_ordinal(),
+        ));
+    }
+    assert_eq!(observations.len(), 3);
+    assert_eq!(observations[0], (false, 1, 1, 2));
+    assert_eq!(observations[1], (false, 1, 1, 3));
+    assert_eq!(observations[2], (true, 2, 2, 7));
+
+    let equivalence = pass.finish().unwrap();
+    assert_eq!(equivalence.exact_receipt(), plan.qualification_receipt());
+    assert_eq!(equivalence.verified_complete_replays(), 2);
+}
+
+#[test]
+fn revalidation_cannot_finish_before_eof_or_after_source_mutation() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("two-pass-terminal-gate.dbn");
+    let records = conformance_records(START_NS + 1, START_NS + 2);
+    write_dbn(&path, Compression::None, &records);
+    let plan = open_replay(&path, records.len() as u64).qualify().unwrap();
+
+    let pass = plan.open_revalidation_pass().unwrap();
+    assert!(matches!(
+        pass.finish(),
+        Err(XnasReplayErrorV1::CannotFinishRevalidationBeforeEof)
+    ));
+
+    let mut pass = plan.open_revalidation_pass().unwrap();
+    while let Some(observation) = pass.next_observation().unwrap() {
+        let _ = observation;
+    }
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"terminal-mutation")
+        .unwrap();
+    assert!(matches!(
+        pass.finish(),
+        Err(XnasReplayErrorV1::Boundary(
+            mbo_lob_reconstructor::StrictBoundaryErrorV1::SourceChangedDuringDecode { .. }
+        ))
+    ));
+}
+
+#[test]
+fn revalidation_stream_error_is_returned_once_then_fused_and_cannot_finish() {
+    const TRADE_COUNT: usize = 30_000;
+    const CHANGED_TRADE: usize = 29_000;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("two-pass-fused-error-a.dbn");
+    let alternate_path = dir.path().join("two-pass-fused-error-b.dbn");
+    let records = long_trade_stream_records(TRADE_COUNT, None);
+    let mut alternate_records = records.clone();
+    alternate_records[CHANGED_TRADE + 1] = message_for_instrument(
+        202,
+        b'T',
+        b'N',
+        0,
+        ASK,
+        1,
+        u32::try_from(CHANGED_TRADE + 1).unwrap(),
+        flags::LAST,
+        START_NS + 10 + CHANGED_TRADE as u64,
+        START_NS + 100 + CHANGED_TRADE as u64,
+    );
+    write_dbn(&path, Compression::None, &records);
+    write_dbn(&alternate_path, Compression::None, &alternate_records);
+    let source_bytes = std::fs::read(&path).unwrap();
+    let alternate_bytes = std::fs::read(&alternate_path).unwrap();
+    let differences = exact_byte_differences(&source_bytes, &alternate_bytes);
+    assert!(!differences.is_empty());
+    assert!(differences.iter().all(|(offset, _, _)| *offset > 1_000_000));
+
+    let plan = open_replay(&path, records.len() as u64).qualify().unwrap();
+    let mut pass = plan.open_revalidation_pass().unwrap();
+    let mut source = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    apply_byte_differences(&mut source, &differences, true);
+    let first_error = loop {
+        match pass.next_observation() {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("late unmapped identity was mistaken for verified EOF"),
+            Err(error) => break error,
+        }
+    };
+    assert!(matches!(first_error, XnasReplayErrorV1::PrefixFailed(_)));
+    assert!(matches!(
+        pass.next_observation(),
+        Err(XnasReplayErrorV1::CannotContinueFailedRevalidation)
+    ));
+    assert!(matches!(
+        pass.finish(),
+        Err(XnasReplayErrorV1::CannotFinishFailedReplay)
+    ));
+}
+
+#[test]
+fn revalidation_receipt_mismatch_detects_late_same_length_mutation_restored_before_posthash() {
+    const TRADE_COUNT: usize = 30_000;
+    const CHANGED_TRADE: usize = 29_000;
+
+    let dir = tempdir().unwrap();
+    let source_path = dir.path().join("two-pass-transient-a.dbn");
+    let alternate_path = dir.path().join("two-pass-transient-b.dbn");
+    let source_records = long_trade_stream_records(TRADE_COUNT, None);
+    let alternate_records = long_trade_stream_records(TRADE_COUNT, Some((CHANGED_TRADE, 7)));
+    write_dbn(&source_path, Compression::None, &source_records);
+    write_dbn(&alternate_path, Compression::None, &alternate_records);
+    let source_bytes = std::fs::read(&source_path).unwrap();
+    let alternate_bytes = std::fs::read(&alternate_path).unwrap();
+    let differences = exact_byte_differences(&source_bytes, &alternate_bytes);
+    assert!(!differences.is_empty());
+    assert!(differences.iter().all(|(offset, _, _)| *offset > 1_000_000));
+
+    let plan = open_replay(&source_path, source_records.len() as u64)
+        .qualify()
+        .unwrap();
+    let mut pass = plan.open_revalidation_pass().unwrap();
+    let mut source = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&source_path)
+        .unwrap();
+    apply_byte_differences(&mut source, &differences, true);
+
+    while pass.next_observation().unwrap().is_some() {}
+
+    apply_byte_differences(&mut source, &differences, false);
+    drop(source);
+    assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+
+    match pass.finish() {
+        Err(XnasReplayErrorV1::RevalidationReceiptMismatch {
+            qualification,
+            revalidation,
+        }) => {
+            assert_eq!(qualification.source(), revalidation.source());
+            assert_ne!(
+                qualification.committed_observation_chain_sha256(),
+                revalidation.committed_observation_chain_sha256()
+            );
+        }
+        other => panic!("expected an exact receipt mismatch, found {other:?}"),
     }
 }
 
@@ -1505,6 +1888,8 @@ fn invalid_first_condition_can_only_qualify_through_witnessed_reset_recovery() {
     );
     assert_eq!(run.traces().len(), 1);
     assert!(run.traces()[0].is_recovery());
+    assert_eq!(run.traces()[0].validity_epoch_index(), 1);
+    assert_eq!(run.traces()[0].book().reset_epoch(), 2);
     assert_eq!(run.traces()[0].events().len(), 2);
     assert_eq!(run.traces()[0].terminal_source_ordinal(), 3);
     assert_eq!(run.traces()[0].witness_source_ordinal(), 4);
@@ -2294,7 +2679,7 @@ fn output_configuration_is_receipt_bound() {
             .unwrap();
         outcomes.push((
             receipt.config(),
-            receipt.staged_update_chain_sha256(),
+            receipt.committed_observation_chain_sha256(),
             receipt.identities()[0].last_committed_book_state_sha256(),
         ));
     }
@@ -2408,8 +2793,12 @@ fn probe_serializes_only_eof_terminal_outcomes_and_uses_distinct_exit_codes() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stderr.is_empty());
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(terminal["schema"], "xnas_strict_replay_probe_v2");
+    assert_eq!(terminal["schema"], "xnas_strict_replay_probe_v3");
     assert_eq!(terminal["outcome"]["qualification"], "disqualified");
+    assert_eq!(
+        terminal["outcome"]["diagnostic"]["schema"],
+        "xnas_terminal_disqualification_v1"
+    );
     assert_eq!(
         terminal["outcome"]["diagnostic"]["authority"],
         "nonconsumable_terminal_diagnostic"
@@ -2446,11 +2835,32 @@ fn probe_serializes_only_eof_terminal_outcomes_and_uses_distinct_exit_codes() {
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(terminal["schema"], "xnas_strict_replay_probe_v2");
+    assert_eq!(terminal["schema"], "xnas_strict_replay_probe_v3");
     assert_eq!(terminal["outcome"]["qualification"], "qualified");
     assert_eq!(
         terminal["outcome"]["run"]["receipt"]["source"]["decoded_records"],
         qualified_records.len() as u64
+    );
+    let probe_receipt = &terminal["outcome"]["run"]["receipt"];
+    assert!(probe_receipt
+        .get("committed_observation_chain_sha256")
+        .is_some());
+    assert!(probe_receipt.get("staged_update_chain_sha256").is_none());
+    assert_eq!(
+        probe_receipt["build"]["replay_algorithm_id"],
+        "hft.xnas.strict_replay.v2"
+    );
+    assert_eq!(probe_receipt["build"]["package_version"], "1.0.0");
+    assert!(probe_receipt["build"]["enabled_features"]
+        .as_str()
+        .unwrap()
+        .split(',')
+        .any(|feature| feature == "CARGO_FEATURE_DATABENTO"));
+    let package_lock = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"))
+        .expect("package lock is present in the repository");
+    assert_eq!(
+        probe_receipt["build"]["package_repository_cargo_lock_sha256"],
+        Sha256DigestV1::from_bytes(Sha256::digest(package_lock).into()).to_hex()
     );
 
     let midstream_source_path = dir.path().join("probe-midstream-fatal.dbn");

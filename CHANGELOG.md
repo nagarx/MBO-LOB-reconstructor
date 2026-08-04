@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — strict XNAS backbone candidate
+
+- Added an expectation-bound DBN loader and canonical raw MBO event contract
+  with typed accepted/rejected custody and XNAS historical publisher policy.
+- Added identity-local, transactional XNAS envelope reconstruction with exact
+  A/M/C/R book commands; T/F remain distinct analytical execution carriers and
+  cannot mutate resting book state.
+- Added validity/quarantine/recovery ledgers, causal closure timestamps, exact
+  endpoint-state semantics, terminal reconciliation, versioned observation and
+  chain identities, and self-described success/disqualification receipts.
+- Added a closed two-pass API for private downstream staging. Pending
+  observations are non-serializable and an equivalence attestation is minted
+  only after both EOF receipts agree field-for-field.
+- Added package-local build provenance and the stdout-at-EOF
+  `xnas_replay_probe` v3 development boundary.
+- Added adversarial gates for digest sensitivity, independent rolling-chain
+  calculation, source mutation, pass-two fused failure, recovery epochs, and a
+  same-length mutation/restore detected by receipt mismatch.
+
+### Changed — explicit breaking boundary
+
+- Package version is now 1.0.0 because the strict receipt and event semantics
+  are a new public contract. The probe-v3 and digest-v2 surfaces do not
+  reinterpret earlier development probe-v2 evidence. No checked-in external
+  consumer used the developing strict V1 Rust API at this boundary.
+- See `docs/STRICT_XNAS_REPLAY_CONTRACT.md` for exact schemas, digest domains,
+  authority limits, and mandatory extractor ownership.
+
 ## [0.3.0] — 2026-08-01
 
 **MINOR under `VERSIONING.md` R7 — outputs proven byte-identical, not asserted.**
