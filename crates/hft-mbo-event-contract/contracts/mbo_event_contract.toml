@@ -1,0 +1,367 @@
+# Canonical Databento MBO event contract.
+#
+# This authority is intentionally independent of pipeline_contract.toml. The
+# latter versions feature and artifact layouts; this file versions the
+# lossless provider-event boundary consumed before reconstruction or feature
+# policy. MBO-LOB-reconstructor owns the runtime implementation. Generated
+# snapshots are non-authoritative, byte-bound build inputs.
+
+[contract]
+id = "hft.canonical_mbo_event"
+schema_version = "1.0.0"
+status = "development_candidate"
+semantic_owner = "MBO-LOB-reconstructor"
+authority_owner = "HFT-pipeline-v2/contracts"
+provider = "Databento"
+source_encoding = "DBN"
+source_schema = "mbo"
+expected_rtype = 160
+compatibility_rule = "exact_major_and_contract_sha256"
+
+[identity]
+primary_row_key = ["source_object_sha256", "raw_ordinal", "subordinal"]
+secondary_exchange_coordinate = ["publisher_id", "instrument_id", "channel_id", "sequence"]
+replay_order = "raw_ordinal_then_subordinal"
+exchange_coordinate_is_unique = false
+raw_ordinal_counts = "every_successfully_decoded_source_record_before_validation_or_policy"
+subordinal_definition = "zero_for_one_to_one_dbn_mbo_projection"
+
+[record_layout]
+expected_record_size_bytes = 56
+expected_header_length_words = 14
+record_size_origin = "dbn_Record_record_size"
+projection_cardinality = "one_raw_mbo_record_to_one_raw_mbo_event_v1"
+field_order = [
+  "source_object_sha256",
+  "raw_ordinal",
+  "subordinal",
+  "rtype",
+  "record_size_bytes",
+  "publisher_id",
+  "instrument_id",
+  "ts_event",
+  "ts_recv",
+  "ts_in_delta",
+  "channel_id",
+  "sequence",
+  "order_id",
+  "price_raw",
+  "size_raw",
+  "flags_raw",
+  "action_raw",
+  "side_raw",
+]
+
+[source_descriptor]
+required = [
+  "logical_catalog_release_id",
+  "logical_catalog_object_id",
+  "logical_canonical_path",
+  "logical_canonical_sha256",
+  "logical_canonical_bytes",
+  "configured_path",
+  "opened_representation",
+  "opened_path",
+  "opened_sha256",
+  "opened_bytes",
+  "dbn_version",
+  "dbn_ts_out",
+  "dataset",
+  "schema",
+]
+configured_opened_path_policy = "exact_match_in_strict_v1"
+logical_opened_digest_policy = "exact_match_for_canonical_object_before_reusable_output"
+hot_store_substitution_policy = "unsupported_in_strict_v1"
+representation_model_variants = ["canonical_object", "derived_replica"]
+strict_v1_accepted_representation = "canonical_object_only"
+derived_replica_status = "reserved_for_a_future_contract_version"
+future_derived_replica_prerequisite = "verified_derivation_or_decode_equivalence_receipt"
+dbn_ts_out_policy = "must_be_false_for_v1"
+
+[raw_event_fields.source_object_sha256]
+rust_type = "Sha256DigestV1"
+unit = "sha256_digest_bytes"
+origin = "logical_canonical_source_object_verified_against_opened_object"
+wire_encoding = "lowercase_hex_64"
+
+[raw_event_fields.raw_ordinal]
+rust_type = "u64"
+unit = "one_based_decoded_record_index"
+origin = "decoder"
+
+[raw_event_fields.subordinal]
+rust_type = "u16"
+unit = "zero_based_projection_index"
+origin = "projection"
+
+[raw_event_fields.rtype]
+rust_type = "u8"
+unit = "dbn_record_type_code"
+origin = "MboMsg.hd.rtype"
+
+[raw_event_fields.record_size_bytes]
+rust_type = "u16"
+unit = "bytes"
+origin = "dbn.Record.record_size"
+
+[raw_event_fields.publisher_id]
+rust_type = "u16"
+unit = "databento_publisher_id"
+origin = "MboMsg.hd.publisher_id"
+
+[raw_event_fields.instrument_id]
+rust_type = "u32"
+unit = "databento_instrument_id"
+origin = "MboMsg.hd.instrument_id"
+
+[raw_event_fields.ts_event]
+rust_type = "u64"
+unit = "unix_epoch_nanoseconds"
+origin = "MboMsg.hd.ts_event"
+clock = "matching_engine_received"
+
+[raw_event_fields.ts_recv]
+rust_type = "u64"
+unit = "unix_epoch_nanoseconds"
+origin = "MboMsg.ts_recv"
+clock = "capture_server_received"
+
+[raw_event_fields.ts_in_delta]
+rust_type = "i32"
+unit = "nanoseconds_before_ts_recv"
+origin = "MboMsg.ts_in_delta"
+clock = "matching_engine_sending_delta"
+
+[raw_event_fields.channel_id]
+rust_type = "u8"
+unit = "databento_channel_id"
+origin = "MboMsg.channel_id"
+
+[raw_event_fields.sequence]
+rust_type = "u32"
+unit = "venue_message_sequence"
+origin = "MboMsg.sequence"
+
+[raw_event_fields.order_id]
+rust_type = "u64"
+unit = "venue_order_identifier"
+origin = "MboMsg.order_id"
+
+[raw_event_fields.price_raw]
+rust_type = "i64"
+unit = "fixed_price_1e_minus_9"
+origin = "MboMsg.price"
+
+[raw_event_fields.size_raw]
+rust_type = "u32"
+unit = "instrument_context_quantity"
+origin = "MboMsg.size"
+
+[raw_event_fields.flags_raw]
+rust_type = "u8"
+unit = "databento_flag_bitset"
+origin = "MboMsg.flags.raw"
+
+[raw_event_fields.action_raw]
+rust_type = "u8"
+unit = "ascii_action_code"
+origin = "MboMsg.action"
+
+[raw_event_fields.side_raw]
+rust_type = "u8"
+unit = "ascii_side_code"
+origin = "MboMsg.side"
+
+[sentinels]
+price_undefined = 9223372036854775807
+size_undefined = 4294967295
+timestamp_undefined = "18446744073709551615"
+sentinel_policy = "preserve_raw_and_classify_explicitly_never_coerce"
+
+[clocks]
+replay_order = "source_raw_ordinal"
+ts_event = "matching_engine_received_unix_ns"
+ts_recv = "capture_server_received_unix_ns"
+ts_in_delta = "matching_engine_sending_ns_before_ts_recv"
+derived_ts_send = "checked_ts_recv_minus_ts_in_delta_only"
+monotonicity = "not_assumed_for_ts_event_or_ts_recv"
+bad_ts_recv_flag_policy = "preserve_ts_recv_but_forbid_using_it_as_a_trusted_ordering_clock"
+
+[sides.ask]
+code = "A"
+raw_byte = 65
+
+[sides.bid]
+code = "B"
+raw_byte = 66
+
+[sides.none]
+code = "N"
+raw_byte = 78
+
+[actions.add]
+code = "A"
+raw_byte = 65
+disposition = "book_command"
+lane = "add"
+side_semantics = "resting_order"
+book_effect = "add"
+allowed_sides = ["A", "B"]
+required_fields = ["order_id_nonzero", "price_present", "size_present_positive"]
+
+[actions.modify]
+code = "M"
+raw_byte = 77
+disposition = "book_command"
+lane = "modify"
+side_semantics = "resting_order"
+book_effect = "modify"
+allowed_sides = ["A", "B"]
+required_fields = ["order_id_nonzero", "price_present", "size_present_positive"]
+
+[actions.cancel]
+code = "C"
+raw_byte = 67
+disposition = "book_command"
+lane = "cancel"
+side_semantics = "resting_order"
+book_effect = "cancel"
+allowed_sides = ["A", "B"]
+required_fields = ["order_id_nonzero", "price_present", "size_present_positive"]
+
+[actions.clear]
+code = "R"
+raw_byte = 82
+disposition = "book_command"
+lane = "clear"
+side_semantics = "none"
+book_effect = "clear"
+allowed_sides = ["N"]
+required_fields = []
+
+[actions.trade]
+code = "T"
+raw_byte = 84
+disposition = "execution_carrier"
+lane = "trade_aggressor"
+side_semantics = "aggressor"
+book_effect = "none"
+allowed_sides = ["A", "B", "N"]
+required_fields = ["price_present", "size_present_positive"]
+
+[actions.fill]
+code = "F"
+raw_byte = 70
+disposition = "execution_carrier"
+lane = "resting_fill"
+side_semantics = "resting_filled_order"
+book_effect = "none"
+allowed_sides = ["A", "B", "N"]
+required_fields = ["price_present", "size_present_positive"]
+
+[actions.none]
+code = "N"
+raw_byte = 78
+disposition = "control"
+lane = "none"
+side_semantics = "none"
+book_effect = "none"
+allowed_sides = ["A", "B", "N"]
+required_fields = []
+
+[flags.last]
+mask = 128
+meaning = "last_record_in_one_publisher_event_for_instrument"
+
+[flags.tob]
+mask = 64
+meaning = "top_of_book_record_not_individual_order"
+
+[flags.snapshot]
+mask = 32
+meaning = "record_sourced_from_snapshot_replay"
+
+[flags.mbp]
+mask = 16
+meaning = "aggregated_price_level_not_individual_order"
+
+[flags.bad_ts_recv]
+mask = 8
+meaning = "ts_recv_inaccurate_due_to_clock_or_reordering"
+
+[flags.maybe_bad_book]
+mask = 4
+meaning = "unrecoverable_channel_gap_detected"
+
+[flags.publisher_specific]
+mask = 2
+meaning = "semantics_require_registered_publisher_policy"
+
+[flags.reserved]
+mask = 1
+meaning = "unassigned_preserve_without_interpretation"
+
+[strict_validation]
+unknown_action = "fatal"
+unknown_side = "fatal"
+side_s = "fatal_not_a_databento_mbo_side"
+invalid_rtype = "fatal"
+source_identity_mismatch = "fatal"
+source_path_substitution = "fatal"
+sentinel_in_required_book_field = "fatal"
+maybe_bad_book = "fatal_before_reusable_output"
+publisher_specific_without_policy = "fatal"
+snapshot_without_registered_policy = "fatal"
+unassigned_flag_without_registered_policy = "fatal"
+tob_or_mbp_without_registered_projection = "fatal"
+repair_requested = "fatal"
+quarantine_is_success = false
+
+[disposition]
+book_command_variants = ["add", "modify", "cancel", "clear"]
+execution_variants = ["trade_aggressor_known", "trade_unsigned", "resting_fill"]
+control_variants = ["none"]
+book_mutator_input = "validated_book_command_only"
+raw_event_retention = "every_disposition_retains_lossless_raw_event"
+
+[versioning]
+development_candidate_churn = "unreleased_bytes_may_change_without_version_bump_until_first_admission"
+any_authority_byte_change_after_first_admission = "at_least_patch_version_bump"
+major = "any_change_to_raw_fields_types_units_identity_action_side_flag_sentinel_clock_or_validation_semantics"
+minor = "additive_optional_metadata_or_losslessly_preservable_control_classification"
+patch = "documentation_or_generator_fix_with_identical_runtime_semantics"
+artifact_binding = "schema_version_and_exact_contract_sha256_both_required"
+
+[publisher_policies.reject_all_v1]
+policy_id = "reject_all_publisher_specific_v1"
+dataset = "*"
+dbn_versions = [1, 2, 3]
+publisher_id_match = "any"
+publisher_ids = []
+publisher_specific_flag = "reject"
+snapshot_flag = "reject"
+unassigned_flag = "reject"
+
+[publisher_policies.xnas_itch_historical_v1]
+policy_id = "xnas_itch_historical_v1"
+dataset = "XNAS.ITCH"
+dbn_versions = [1]
+publisher_id_match = "allowlist"
+publisher_ids = [2]
+publisher_specific_flag = "preserve_opaque_not_used_for_semantics"
+snapshot_flag = "reject"
+unassigned_flag = "reject"
+
+[authority_sources.databento_common_fields]
+url = "https://databento.com/docs/standards-and-conventions/common-fields-enums-types"
+supports = "action_side_flag_clock_and_sentinel_semantics"
+
+[authority_sources.databento_order_tracking]
+url = "https://databento.com/docs/examples/order-book/order-tracking"
+supports = "trade_fill_none_book_noop_and_example_specific_f_last_inspection"
+
+[authority_sources.dbn_rust]
+repository = "https://github.com/databento/dbn"
+tag = "v0.64.0"
+commit = "64e5416"
+supports = "MboMsg_field_names_types_and_dbn_constants"

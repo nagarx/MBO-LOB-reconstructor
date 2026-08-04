@@ -49,7 +49,12 @@
 //! This loader focuses on I/O and decode errors only. Use `skip_invalid(true)`
 //! to skip messages that fail to decode from the DBN format.
 
+pub mod canonical;
 pub mod error;
+pub use canonical::{
+    CanonicalReadReceiptV1, CanonicalSourceExpectationV1, StrictBoundaryErrorV1, StrictDbnLoaderV1,
+    StrictMboEventIteratorV1, VerifiedStreamEventV1,
+};
 pub use error::BoundaryError;
 
 use std::fs::File;

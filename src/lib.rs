@@ -168,6 +168,10 @@ pub mod dbn_bridge;
 
 #[cfg(feature = "databento")]
 #[cfg_attr(docsrs, doc(cfg(feature = "databento")))]
+mod canonical_dbn;
+
+#[cfg(feature = "databento")]
+#[cfg_attr(docsrs, doc(cfg(feature = "databento")))]
 pub mod hotstore;
 
 #[cfg(feature = "databento")]
@@ -235,12 +239,17 @@ pub use source::DbnSource;
 pub use dbn_bridge::DbnBridge;
 
 #[cfg(feature = "databento")]
+pub use canonical_dbn::CanonicalProjectionErrorV1;
+
+#[cfg(feature = "databento")]
 pub use hotstore::{HotStoreConfig, HotStoreManager};
 
 #[cfg(feature = "databento")]
 #[allow(deprecated)]
 pub use loader::{
-    is_valid_order, BoundaryError, DbnLoader, LoaderStats, TypedMessageIterator, IO_BUFFER_SIZE,
+    is_valid_order, BoundaryError, CanonicalReadReceiptV1, CanonicalSourceExpectationV1, DbnLoader,
+    LoaderStats, StrictBoundaryErrorV1, StrictDbnLoaderV1, StrictMboEventIteratorV1,
+    TypedMessageIterator, VerifiedStreamEventV1, IO_BUFFER_SIZE,
 };
 
 // Re-exports - Parquet export (feature-gated)

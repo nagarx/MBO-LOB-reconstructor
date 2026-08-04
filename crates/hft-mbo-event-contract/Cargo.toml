@@ -1,0 +1,20 @@
+[package]
+name = "hft-mbo-event-contract"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "LicenseRef-Proprietary"
+description = "Lossless canonical MBO event types and typed disposition boundary"
+build = "build.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+
+[build-dependencies]
+sha2 = "0.10"
+toml = "0.8"
+
+[dev-dependencies]
+serde_json = "1.0"
+sha2 = "0.10"
