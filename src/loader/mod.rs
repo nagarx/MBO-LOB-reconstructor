@@ -52,8 +52,9 @@
 pub mod canonical;
 pub mod error;
 pub use canonical::{
-    CanonicalReadReceiptV1, CanonicalSourceExpectationV1, StrictBoundaryErrorV1, StrictDbnLoaderV1,
-    StrictMboEventIteratorV1, VerifiedStreamEventV1,
+    BoundXnasHistoricalSourceV1, CanonicalReadReceiptV1, CanonicalSourceExpectationV1,
+    StrictBoundaryErrorV1, StrictDbnLoaderV1, StrictMboEventIteratorV1,
+    VerifiedInstrumentIdentityV1, VerifiedStreamEventV1,
 };
 pub use error::BoundaryError;
 

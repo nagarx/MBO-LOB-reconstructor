@@ -247,9 +247,10 @@ pub use hotstore::{HotStoreConfig, HotStoreManager};
 #[cfg(feature = "databento")]
 #[allow(deprecated)]
 pub use loader::{
-    is_valid_order, BoundaryError, CanonicalReadReceiptV1, CanonicalSourceExpectationV1, DbnLoader,
-    LoaderStats, StrictBoundaryErrorV1, StrictDbnLoaderV1, StrictMboEventIteratorV1,
-    TypedMessageIterator, VerifiedStreamEventV1, IO_BUFFER_SIZE,
+    is_valid_order, BoundXnasHistoricalSourceV1, BoundaryError, CanonicalReadReceiptV1,
+    CanonicalSourceExpectationV1, DbnLoader, LoaderStats, StrictBoundaryErrorV1, StrictDbnLoaderV1,
+    StrictMboEventIteratorV1, TypedMessageIterator, VerifiedInstrumentIdentityV1,
+    VerifiedStreamEventV1, IO_BUFFER_SIZE,
 };
 
 // Re-exports - Parquet export (feature-gated)

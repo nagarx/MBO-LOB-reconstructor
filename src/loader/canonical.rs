@@ -9,16 +9,18 @@
 use super::{CountingReader, IO_BUFFER_SIZE};
 use crate::canonical_dbn::{CanonicalDbnBridgeV1, CanonicalProjectionErrorV1};
 use dbn::decode::{DbnMetadata, DecodeRecordRef, DynDecoder};
-use dbn::{MboMsg, Record, Schema, VersionUpgradePolicy};
+use dbn::{MboMsg, Record, SType, Schema, VersionUpgradePolicy};
 use hft_mbo_event_contract::{
     classify_full_order_book, validate_raw_event, BoundPublisherPolicyV1, EventDispositionV1,
     LogicalSourceV1, OpenedReplicaV1, OpenedRepresentationV1, PublisherPolicyBindingErrorV1,
     PublisherPolicyIdV1, Sha256DigestV1, SourceDescriptorV1, SourceIdentityErrorV1,
     ValidationFailureV1, CANONICAL_MBO_EVENT_CONTRACT_ID, CANONICAL_MBO_EVENT_CONTRACT_SHA256,
     CANONICAL_MBO_EVENT_SCHEMA_VERSION, EXPECTED_MBO_RECORD_SIZE_BYTES, EXPECTED_MBO_RTYPE,
+    XNAS_ITCH_HISTORICAL_PUBLISHER_IDS_V1,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::num::NonZeroU64;
@@ -28,6 +30,59 @@ use std::sync::Arc;
 use thiserror::Error;
 
 type StrictDecoderV1 = DynDecoder<'static, CountingReader<BufReader<File>>>;
+
+const NS_PER_UTC_DAY: u64 = 86_400_000_000_000;
+
+/// One point-in-time instrument mapping verified from the opened DBN metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VerifiedInstrumentIdentityV1 {
+    pub publisher_id: u16,
+    pub instrument_id: u32,
+    pub symbol: String,
+}
+
+/// Source/metadata binding for one historical XNAS MBO daily object.
+///
+/// This value is minted only while the strict loader owns the already
+/// hash-verified file handle. Callers cannot supply a replacement instrument
+/// universe independently of the bytes being decoded. Completeness additionally
+/// requires an unforgeable [`CanonicalReadReceiptV1`] after EOF reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BoundXnasHistoricalSourceV1 {
+    source_object_sha256: Sha256DigestV1,
+    session_start_ns: u64,
+    session_end_ns: u64,
+    session_date: String,
+    instruments: Vec<VerifiedInstrumentIdentityV1>,
+}
+
+impl BoundXnasHistoricalSourceV1 {
+    pub const fn source_object_sha256(&self) -> Sha256DigestV1 {
+        self.source_object_sha256
+    }
+
+    pub const fn session_start_ns(&self) -> u64 {
+        self.session_start_ns
+    }
+
+    pub const fn session_end_ns(&self) -> u64 {
+        self.session_end_ns
+    }
+
+    pub fn session_date(&self) -> &str {
+        &self.session_date
+    }
+
+    pub fn instruments(&self) -> &[VerifiedInstrumentIdentityV1] {
+        &self.instruments
+    }
+
+    pub fn contains_identity(&self, publisher_id: u16, instrument_id: u32) -> bool {
+        self.instruments.iter().any(|identity| {
+            identity.publisher_id == publisher_id && identity.instrument_id == instrument_id
+        })
+    }
+}
 
 /// Externally established catalog identity and expected decoded population.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,12 +189,19 @@ impl StrictDbnLoaderV1 {
             .map_err(StrictBoundaryErrorV1::MetadataDecode)?;
         validate_metadata(decoder.metadata(), &source.logical)?;
         let publisher_policy = BoundPublisherPolicyV1::bind(publisher_policy_id, &source)?;
+        let xnas_historical_source = match publisher_policy_id {
+            PublisherPolicyIdV1::RejectAll => None,
+            PublisherPolicyIdV1::XnasItchHistorical => {
+                Some(verify_xnas_historical_source(decoder.metadata(), &source)?)
+            }
+        };
 
         Ok(StrictMboEventIteratorV1 {
             decoder,
             post_read_file,
             source,
             publisher_policy,
+            xnas_historical_source,
             expected_records: expectation.expected_records,
             decoded_records: 0,
             next_raw_ordinal: Some(NonZeroU64::MIN),
@@ -173,6 +235,7 @@ pub struct StrictMboEventIteratorV1 {
     post_read_file: File,
     source: SourceDescriptorV1,
     publisher_policy: BoundPublisherPolicyV1,
+    xnas_historical_source: Option<BoundXnasHistoricalSourceV1>,
     expected_records: u64,
     decoded_records: u64,
     next_raw_ordinal: Option<NonZeroU64>,
@@ -189,6 +252,10 @@ impl StrictMboEventIteratorV1 {
 
     pub const fn decoded_records(&self) -> u64 {
         self.decoded_records
+    }
+
+    pub const fn xnas_historical_source(&self) -> Option<&BoundXnasHistoricalSourceV1> {
+        self.xnas_historical_source.as_ref()
     }
 
     pub fn bytes_consumed(&self) -> u64 {
@@ -246,6 +313,7 @@ impl StrictMboEventIteratorV1 {
                 .expect("build-time validated canonical contract digest"),
             source: self.source,
             publisher_policy_id: self.publisher_policy.id().as_str(),
+            xnas_historical_source: self.xnas_historical_source,
             version_upgrade_policy: "as_is",
             expected_records: self.expected_records,
             decoded_records: self.decoded_records,
@@ -358,15 +426,58 @@ impl std::iter::FusedIterator for StrictMboEventIteratorV1 {}
 /// Receipt available only after strict stream completion and reconciliation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CanonicalReadReceiptV1 {
-    pub contract_id: &'static str,
-    pub contract_schema_version: &'static str,
-    pub contract_sha256: Sha256DigestV1,
-    pub source: SourceDescriptorV1,
-    pub publisher_policy_id: &'static str,
-    pub version_upgrade_policy: &'static str,
-    pub expected_records: u64,
-    pub decoded_records: u64,
-    pub bytes_consumed: u64,
+    contract_id: &'static str,
+    contract_schema_version: &'static str,
+    contract_sha256: Sha256DigestV1,
+    source: SourceDescriptorV1,
+    publisher_policy_id: &'static str,
+    xnas_historical_source: Option<BoundXnasHistoricalSourceV1>,
+    version_upgrade_policy: &'static str,
+    expected_records: u64,
+    decoded_records: u64,
+    bytes_consumed: u64,
+}
+
+impl CanonicalReadReceiptV1 {
+    pub const fn contract_id(&self) -> &'static str {
+        self.contract_id
+    }
+
+    pub const fn contract_schema_version(&self) -> &'static str {
+        self.contract_schema_version
+    }
+
+    pub const fn contract_sha256(&self) -> Sha256DigestV1 {
+        self.contract_sha256
+    }
+
+    pub const fn source(&self) -> &SourceDescriptorV1 {
+        &self.source
+    }
+
+    pub const fn publisher_policy_id(&self) -> &'static str {
+        self.publisher_policy_id
+    }
+
+    pub const fn xnas_historical_source(&self) -> Option<&BoundXnasHistoricalSourceV1> {
+        self.xnas_historical_source.as_ref()
+    }
+
+    pub const fn version_upgrade_policy(&self) -> &'static str {
+        self.version_upgrade_policy
+    }
+
+    pub const fn expected_records(&self) -> u64 {
+        self.expected_records
+    }
+
+    pub const fn decoded_records(&self) -> u64 {
+        self.decoded_records
+    }
+
+    pub const fn bytes_consumed(&self) -> u64 {
+        self.bytes_consumed
+    }
 }
 
 #[derive(Debug, Error)]
@@ -407,6 +518,22 @@ pub enum StrictBoundaryErrorV1 {
     MetadataSchema { actual: String },
     #[error("DBN metadata ts_out must be false for canonical event v1")]
     MetadataTsOut,
+    #[error("XNAS historical source metadata is not a complete UTC day: start={start_ns}, end={end_ns:?}")]
+    XnasMetadataDayBoundary { start_ns: u64, end_ns: Option<u64> },
+    #[error("XNAS historical source metadata must have no record limit")]
+    XnasMetadataLimit,
+    #[error("XNAS historical source metadata symbology must be raw_symbol -> instrument_id")]
+    XnasMetadataSymbology,
+    #[error("XNAS historical source metadata must have a nonempty unique requested-symbol set")]
+    XnasMetadataSymbols,
+    #[error("XNAS historical source metadata reports partial or not-found symbols")]
+    XnasMetadataIncompleteSymbols,
+    #[error(
+        "XNAS historical source metadata has no unique active mapping for requested symbol {0}"
+    )]
+    XnasMetadataMapping(String),
+    #[error("XNAS historical source metadata maps multiple symbols to instrument {0}")]
+    XnasMetadataDuplicateInstrument(u32),
     #[error(transparent)]
     PublisherPolicy(#[from] PublisherPolicyBindingErrorV1),
     #[error("DBN decoder failed before source ordinal {next_raw_ordinal}: {source}")]
@@ -488,6 +615,90 @@ fn validate_metadata(
         return Err(StrictBoundaryErrorV1::MetadataTsOut);
     }
     Ok(())
+}
+
+fn verify_xnas_historical_source(
+    metadata: &dbn::Metadata,
+    source: &SourceDescriptorV1,
+) -> Result<BoundXnasHistoricalSourceV1, StrictBoundaryErrorV1> {
+    let end_ns = metadata.end.map(NonZeroU64::get);
+    let expected_end = metadata.start.checked_add(NS_PER_UTC_DAY);
+    if metadata.start % NS_PER_UTC_DAY != 0 || end_ns != expected_end {
+        return Err(StrictBoundaryErrorV1::XnasMetadataDayBoundary {
+            start_ns: metadata.start,
+            end_ns,
+        });
+    }
+    if metadata.limit.is_some() {
+        return Err(StrictBoundaryErrorV1::XnasMetadataLimit);
+    }
+    if metadata.stype_in != Some(SType::RawSymbol) || metadata.stype_out != SType::InstrumentId {
+        return Err(StrictBoundaryErrorV1::XnasMetadataSymbology);
+    }
+    let requested = metadata.symbols.iter().cloned().collect::<BTreeSet<_>>();
+    if requested.is_empty() || requested.len() != metadata.symbols.len() {
+        return Err(StrictBoundaryErrorV1::XnasMetadataSymbols);
+    }
+    if !metadata.partial.is_empty() || !metadata.not_found.is_empty() {
+        return Err(StrictBoundaryErrorV1::XnasMetadataIncompleteSymbols);
+    }
+
+    let session_date = metadata.start().date();
+    let mut active = BTreeMap::<String, u32>::new();
+    for mapping in &metadata.mappings {
+        if !requested.contains(&mapping.raw_symbol) || active.contains_key(&mapping.raw_symbol) {
+            return Err(StrictBoundaryErrorV1::XnasMetadataMapping(
+                mapping.raw_symbol.clone(),
+            ));
+        }
+        let intervals = mapping
+            .intervals
+            .iter()
+            .filter(|interval| {
+                session_date >= interval.start_date && session_date < interval.end_date
+            })
+            .collect::<Vec<_>>();
+        if intervals.len() != 1 {
+            return Err(StrictBoundaryErrorV1::XnasMetadataMapping(
+                mapping.raw_symbol.clone(),
+            ));
+        }
+        let instrument_id = intervals[0]
+            .symbol
+            .parse::<u32>()
+            .map_err(|_| StrictBoundaryErrorV1::XnasMetadataMapping(mapping.raw_symbol.clone()))?;
+        active.insert(mapping.raw_symbol.clone(), instrument_id);
+    }
+    if active.len() != requested.len() || active.keys().ne(requested.iter()) {
+        return Err(StrictBoundaryErrorV1::XnasMetadataSymbols);
+    }
+    let mut instrument_ids = BTreeSet::new();
+    let publisher_id = *XNAS_ITCH_HISTORICAL_PUBLISHER_IDS_V1
+        .first()
+        .expect("build-time validated XNAS publisher allowlist");
+    let instruments = active
+        .into_iter()
+        .map(|(symbol, instrument_id)| {
+            if !instrument_ids.insert(instrument_id) {
+                return Err(StrictBoundaryErrorV1::XnasMetadataDuplicateInstrument(
+                    instrument_id,
+                ));
+            }
+            Ok(VerifiedInstrumentIdentityV1 {
+                publisher_id,
+                instrument_id,
+                symbol,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(BoundXnasHistoricalSourceV1 {
+        source_object_sha256: source.logical.canonical_sha256,
+        session_start_ns: metadata.start,
+        session_end_ns: end_ns.expect("validated complete-day end"),
+        session_date: session_date.to_string(),
+        instruments,
+    })
 }
 
 fn hash_file_from_start(file: &mut File) -> io::Result<(Sha256DigestV1, u64)> {

@@ -408,6 +408,27 @@ fn generate(root: &toml::Value, contract_sha256: &str) -> String {
         )
         .unwrap();
     }
+    let xnas_policy = policies["xnas_itch_historical_v1"]
+        .as_table()
+        .expect("invalid xnas_itch_historical_v1 publisher policy");
+    let xnas_publisher_ids = xnas_policy["publisher_ids"]
+        .as_array()
+        .expect("xnas publisher_ids must be an array")
+        .iter()
+        .map(|value| {
+            let value = value
+                .as_integer()
+                .expect("xnas publisher_ids must contain integers");
+            u16::try_from(value).expect("xnas publisher_id must fit u16")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(xnas_publisher_ids, [2]);
+    writeln!(
+        code,
+        "pub const XNAS_ITCH_HISTORICAL_PUBLISHER_IDS_V1: &[u16] = &{:?};",
+        xnas_publisher_ids
+    )
+    .unwrap();
     writeln!(code).unwrap();
 
     for name in ["add", "modify", "cancel", "clear", "trade", "fill", "none"] {

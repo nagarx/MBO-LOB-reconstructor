@@ -1,7 +1,10 @@
 #![cfg(feature = "databento")]
 
 use dbn::encode::{DbnEncoder, DynWriter, EncodeRecord};
-use dbn::{flags, Compression, MboMsg, Metadata, RecordHeader, SType, Schema, TradeMsg};
+use dbn::{
+    flags, Compression, MappingInterval, MboMsg, Metadata, RecordHeader, SType, Schema,
+    SymbolMapping, TradeMsg,
+};
 use hft_mbo_event_contract::{
     EventDispositionV1, LogicalSourceV1, PublisherPolicyIdV1, Sha256DigestV1,
     CANONICAL_MBO_EVENT_CONTRACT_SHA256,
@@ -16,15 +19,29 @@ use std::path::Path;
 use tempfile::tempdir;
 
 fn metadata(dataset: &str, schema: Option<Schema>, version: u8, ts_out: bool) -> Metadata {
-    Metadata::builder()
+    const START_NS: u64 = 1_751_328_000_000_000_000;
+    const END_NS: u64 = START_NS + 86_400_000_000_000;
+    let mut metadata = Metadata::builder()
         .version(version)
         .dataset(dataset)
         .schema(schema)
-        .start(0)
-        .stype_in(Some(SType::InstrumentId))
+        .start(START_NS)
+        .end(std::num::NonZeroU64::new(END_NS))
+        .stype_in(Some(SType::RawSymbol))
         .stype_out(SType::InstrumentId)
         .ts_out(ts_out)
-        .build()
+        .build();
+    let start_date = metadata.start().date();
+    metadata.symbols = vec!["TEST".into()];
+    metadata.mappings = vec![SymbolMapping {
+        raw_symbol: "TEST".into(),
+        intervals: vec![MappingInterval {
+            start_date,
+            end_date: start_date.next_day().unwrap(),
+            symbol: "101".into(),
+        }],
+    }];
+    metadata
 }
 
 fn message(action: u8, side: u8, order_id: u64, size: u32, sequence: u32) -> MboMsg {
@@ -66,6 +83,20 @@ fn digest_and_len(path: &Path) -> (Sha256DigestV1, u64) {
     file.read_to_end(&mut bytes).unwrap();
     let digest: [u8; 32] = Sha256::digest(&bytes).into();
     (Sha256DigestV1::from_bytes(digest), bytes.len() as u64)
+}
+
+fn xnas_open_error(name: &str, actual_metadata: &Metadata) -> StrictBoundaryErrorV1 {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join(format!("{name}.dbn"));
+    write_mbo(&path, Compression::None, actual_metadata, &[]);
+    match StrictDbnLoaderV1::open(
+        expectation(&path, "XNAS.ITCH", "mbo", 1, false, 0),
+        &path,
+        PublisherPolicyIdV1::XnasItchHistorical,
+    ) {
+        Ok(_) => panic!("{name} metadata unexpectedly qualified"),
+        Err(error) => error,
+    }
 }
 
 fn expectation(
@@ -119,6 +150,11 @@ fn valid_compressed_and_uncompressed_streams_reconcile_exactly() {
             PublisherPolicyIdV1::XnasItchHistorical,
         )
         .unwrap();
+        let source_binding = stream.xnas_historical_source().unwrap();
+        assert_eq!(source_binding.session_date(), "2025-07-01");
+        assert_eq!(source_binding.instruments().len(), 1);
+        assert!(source_binding.contains_identity(2, 101));
+        assert_eq!(source_binding.instruments()[0].symbol, "TEST");
 
         let mut ordinals = Vec::new();
         let mut book = 0;
@@ -137,14 +173,21 @@ fn valid_compressed_and_uncompressed_streams_reconcile_exactly() {
         assert_eq!(book, 2);
         assert_eq!(execution, 2);
         let receipt = stream.finish().unwrap();
-        assert_eq!(receipt.expected_records, 4);
-        assert_eq!(receipt.decoded_records, 4);
-        assert_eq!(receipt.bytes_consumed, fs::metadata(&path).unwrap().len());
+        assert_eq!(receipt.expected_records(), 4);
+        assert_eq!(receipt.decoded_records(), 4);
+        assert_eq!(receipt.bytes_consumed(), fs::metadata(&path).unwrap().len());
         assert_eq!(
-            receipt.contract_sha256.to_hex(),
+            receipt.contract_sha256().to_hex(),
             CANONICAL_MBO_EVENT_CONTRACT_SHA256
         );
-        assert_eq!(receipt.publisher_policy_id, "xnas_itch_historical_v1");
+        assert_eq!(receipt.publisher_policy_id(), "xnas_itch_historical_v1");
+        assert_eq!(
+            receipt
+                .xnas_historical_source()
+                .unwrap()
+                .source_object_sha256(),
+            receipt.source().logical.canonical_sha256
+        );
     }
 }
 
@@ -256,6 +299,61 @@ fn metadata_identity_is_checked_before_first_record() {
             _ => unreachable!(),
         }
     }
+}
+
+#[test]
+fn xnas_daily_universe_binding_rejects_incomplete_or_ambiguous_metadata() {
+    let mut wrong_day = metadata("XNAS.ITCH", Some(Schema::Mbo), 1, false);
+    wrong_day.start += 1;
+    assert!(matches!(
+        xnas_open_error("wrong-day", &wrong_day),
+        StrictBoundaryErrorV1::XnasMetadataDayBoundary { .. }
+    ));
+
+    let mut limited = metadata("XNAS.ITCH", Some(Schema::Mbo), 1, false);
+    limited.limit = std::num::NonZeroU64::new(1);
+    assert!(matches!(
+        xnas_open_error("limited", &limited),
+        StrictBoundaryErrorV1::XnasMetadataLimit
+    ));
+
+    let mut wrong_symbology = metadata("XNAS.ITCH", Some(Schema::Mbo), 1, false);
+    wrong_symbology.stype_in = Some(SType::InstrumentId);
+    assert!(matches!(
+        xnas_open_error("wrong-symbology", &wrong_symbology),
+        StrictBoundaryErrorV1::XnasMetadataSymbology
+    ));
+
+    let mut partial = metadata("XNAS.ITCH", Some(Schema::Mbo), 1, false);
+    partial.partial.push("TEST".into());
+    assert!(matches!(
+        xnas_open_error("partial", &partial),
+        StrictBoundaryErrorV1::XnasMetadataIncompleteSymbols
+    ));
+
+    let mut duplicate_symbol = metadata("XNAS.ITCH", Some(Schema::Mbo), 1, false);
+    duplicate_symbol.symbols.push("TEST".into());
+    assert!(matches!(
+        xnas_open_error("duplicate-symbol", &duplicate_symbol),
+        StrictBoundaryErrorV1::XnasMetadataSymbols
+    ));
+
+    let mut missing_mapping = metadata("XNAS.ITCH", Some(Schema::Mbo), 1, false);
+    missing_mapping.mappings.clear();
+    assert!(matches!(
+        xnas_open_error("missing-mapping", &missing_mapping),
+        StrictBoundaryErrorV1::XnasMetadataSymbols
+    ));
+
+    let mut duplicate_instrument = metadata("XNAS.ITCH", Some(Schema::Mbo), 1, false);
+    let mut second = duplicate_instrument.mappings[0].clone();
+    second.raw_symbol = "OTHER".into();
+    duplicate_instrument.symbols.push("OTHER".into());
+    duplicate_instrument.mappings.push(second);
+    assert!(matches!(
+        xnas_open_error("duplicate-instrument", &duplicate_instrument),
+        StrictBoundaryErrorV1::XnasMetadataDuplicateInstrument(101)
+    ));
 }
 
 #[test]
@@ -405,7 +503,7 @@ fn pathname_replacement_after_open_does_not_substitute_decoded_bytes() {
     }
     assert_eq!(seen, 4);
     let receipt = stream.finish().unwrap();
-    assert_eq!(receipt.source.opened.opened_sha256, expected_digest);
+    assert_eq!(receipt.source().opened.opened_sha256, expected_digest);
     assert_ne!(digest_and_len(&path).0, expected_digest);
 }
 

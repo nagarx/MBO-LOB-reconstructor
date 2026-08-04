@@ -736,7 +736,7 @@ pub fn classify_full_order_book(
             }
         }
         PublisherPolicyIdV1::XnasItchHistorical => {
-            if raw.publisher_id != 2 {
+            if !XNAS_ITCH_HISTORICAL_PUBLISHER_IDS_V1.contains(&raw.publisher_id) {
                 return Err(fail(ValidationReasonV1::PublisherPolicyMismatch {
                     policy_id: publisher_policy.id.as_str(),
                     publisher_id: raw.publisher_id,
@@ -1048,6 +1048,7 @@ mod tests {
             serde_json::to_string(&PublisherPolicyIdV1::XnasItchHistorical).unwrap(),
             format!("\"{PUBLISHER_POLICY_XNAS_ITCH_HISTORICAL_V1_ID}\"")
         );
+        assert_eq!(XNAS_ITCH_HISTORICAL_PUBLISHER_IDS_V1, &[2]);
     }
 
     #[test]
