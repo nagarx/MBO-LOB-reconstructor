@@ -1855,7 +1855,10 @@ impl StrictXnasReplayV1 {
                         .apply_envelope_precommitted(&ready, envelope_commitment)
                     {
                         Ok(book) => book,
-                        Err(source) if is_quarantinable_book_error(&source) => {
+                        Err(source)
+                            if classify_book_failure(&source)
+                                == ReplayFailureScopeV1::IdentityQuarantine =>
+                        {
                             return self.quarantine_failed_ready_envelope(state, ready, source)
                         }
                         Err(source) => return Err(XnasReplayErrorV1::Book(source)),
@@ -2084,7 +2087,7 @@ impl StrictXnasReplayV1 {
         source: EnvelopeAssemblyErrorV1,
         open: Option<OpenEnvelopeV1>,
     ) -> Result<Option<XnasStagedBookUpdateV1>, XnasReplayErrorV1> {
-        if !is_quarantinable_envelope_error(source) {
+        if classify_envelope_failure(source) == ReplayFailureScopeV1::ReplayFatal {
             return Err(XnasReplayErrorV1::Envelope {
                 raw_ordinal: trigger.raw_ordinal,
                 source,
@@ -2409,29 +2412,181 @@ fn is_source_fatal_validation(reason: &ValidationReasonV1) -> bool {
         )
 }
 
-fn is_quarantinable_envelope_error(source: EnvelopeAssemblyErrorV1) -> bool {
-    matches!(
-        source,
-        EnvelopeAssemblyErrorV1::BlockTimestampMismatch
-            | EnvelopeAssemblyErrorV1::ExactDuplicate
-            | EnvelopeAssemblyErrorV1::LastToNonLast
-            | EnvelopeAssemblyErrorV1::ChannelChange
-            | EnvelopeAssemblyErrorV1::SequenceRegressionOrReuse
-            | EnvelopeAssemblyErrorV1::ReceiveTimeChangedBeforeTerminal
-    )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayFailureScopeV1 {
+    IdentityQuarantine,
+    ReplayFatal,
 }
 
-fn is_quarantinable_book_error(source: &BookTransactionErrorV1) -> bool {
-    matches!(
-        source,
+/// Decide whether an envelope failure belongs to one market-data identity or
+/// invalidates the source/replay boundary itself.
+///
+/// This match is intentionally exhaustive. Adding an assembly error must fail
+/// compilation until its failure owner has been chosen explicitly.
+const fn classify_envelope_failure(source: EnvelopeAssemblyErrorV1) -> ReplayFailureScopeV1 {
+    match source {
+        EnvelopeAssemblyErrorV1::BlockTimestampMismatch
+        | EnvelopeAssemblyErrorV1::ExactDuplicate
+        | EnvelopeAssemblyErrorV1::LastToNonLast
+        | EnvelopeAssemblyErrorV1::ChannelChange
+        | EnvelopeAssemblyErrorV1::SequenceRegressionOrReuse
+        | EnvelopeAssemblyErrorV1::ReceiveTimeChangedBeforeTerminal => {
+            ReplayFailureScopeV1::IdentityQuarantine
+        }
+        EnvelopeAssemblyErrorV1::SourceChange
+        | EnvelopeAssemblyErrorV1::IdentityChange
+        | EnvelopeAssemblyErrorV1::NonIncreasingSourceOrdinal
+        | EnvelopeAssemblyErrorV1::WrongSameBlockSequence
+        | EnvelopeAssemblyErrorV1::MemberLimit { .. }
+        | EnvelopeAssemblyErrorV1::SequenceBlockLimit { .. }
+        | EnvelopeAssemblyErrorV1::NotTerminal
+        | EnvelopeAssemblyErrorV1::AvailabilityBeforeEndpoint
+        | EnvelopeAssemblyErrorV1::CountOverflow => ReplayFailureScopeV1::ReplayFatal,
+    }
+}
+
+/// Decide whether a book transaction failure is attributable to one identity
+/// candidate or proves a replay/invariant failure.
+///
+/// Resource limits and internal arithmetic/reconciliation failures remain
+/// fatal: quarantining them would silently select away high-activity data or a
+/// software defect. This match is exhaustive for compile-time drift control.
+const fn classify_book_failure(source: &BookTransactionErrorV1) -> ReplayFailureScopeV1 {
+    match source {
         BookTransactionErrorV1::DuplicateAdd { .. }
-            | BookTransactionErrorV1::MissingModify { .. }
-            | BookTransactionErrorV1::ModifySideMismatch { .. }
-            | BookTransactionErrorV1::MissingCancel { .. }
-            | BookTransactionErrorV1::CancelIdentityMismatch { .. }
-            | BookTransactionErrorV1::OverCancel { .. }
-            | BookTransactionErrorV1::LockedOrCrossedEndpoint { .. }
-    )
+        | BookTransactionErrorV1::MissingModify { .. }
+        | BookTransactionErrorV1::ModifySideMismatch { .. }
+        | BookTransactionErrorV1::MissingCancel { .. }
+        | BookTransactionErrorV1::CancelIdentityMismatch { .. }
+        | BookTransactionErrorV1::OverCancel { .. }
+        | BookTransactionErrorV1::LockedOrCrossedEndpoint { .. } => {
+            ReplayFailureScopeV1::IdentityQuarantine
+        }
+        BookTransactionErrorV1::ZeroSnapshotDepth
+        | BookTransactionErrorV1::SourceMismatch
+        | BookTransactionErrorV1::IdentityMismatch
+        | BookTransactionErrorV1::MemberOrdinalNotIncreasing
+        | BookTransactionErrorV1::UnexpectedClear
+        | BookTransactionErrorV1::InvalidRecoveryClear
+        | BookTransactionErrorV1::LevelArithmeticOverflow
+        | BookTransactionErrorV1::LevelAggregateUnderflow
+        | BookTransactionErrorV1::LevelPopulationMismatch
+        | BookTransactionErrorV1::ZeroRestingOrder
+        | BookTransactionErrorV1::InternalReconciliationOverflow
+        | BookTransactionErrorV1::InternalLevelStateMismatch
+        | BookTransactionErrorV1::InternalLockedOrCrossedState
+        | BookTransactionErrorV1::CommitIndexOverflow
+        | BookTransactionErrorV1::ResetEpochOverflow
+        | BookTransactionErrorV1::CountOverflow => ReplayFailureScopeV1::ReplayFatal,
+    }
+}
+
+#[cfg(test)]
+mod replay_failure_scope_tests {
+    use super::*;
+
+    #[test]
+    fn every_envelope_failure_has_the_intended_scope() {
+        let identity_quarantine = [
+            EnvelopeAssemblyErrorV1::BlockTimestampMismatch,
+            EnvelopeAssemblyErrorV1::ExactDuplicate,
+            EnvelopeAssemblyErrorV1::LastToNonLast,
+            EnvelopeAssemblyErrorV1::ChannelChange,
+            EnvelopeAssemblyErrorV1::SequenceRegressionOrReuse,
+            EnvelopeAssemblyErrorV1::ReceiveTimeChangedBeforeTerminal,
+        ];
+        let replay_fatal = [
+            EnvelopeAssemblyErrorV1::SourceChange,
+            EnvelopeAssemblyErrorV1::IdentityChange,
+            EnvelopeAssemblyErrorV1::NonIncreasingSourceOrdinal,
+            EnvelopeAssemblyErrorV1::WrongSameBlockSequence,
+            EnvelopeAssemblyErrorV1::MemberLimit { limit: 1 },
+            EnvelopeAssemblyErrorV1::SequenceBlockLimit { limit: 1 },
+            EnvelopeAssemblyErrorV1::NotTerminal,
+            EnvelopeAssemblyErrorV1::AvailabilityBeforeEndpoint,
+            EnvelopeAssemblyErrorV1::CountOverflow,
+        ];
+
+        for source in identity_quarantine {
+            assert_eq!(
+                classify_envelope_failure(source),
+                ReplayFailureScopeV1::IdentityQuarantine
+            );
+        }
+        for source in replay_fatal {
+            assert_eq!(
+                classify_envelope_failure(source),
+                ReplayFailureScopeV1::ReplayFatal
+            );
+        }
+    }
+
+    #[test]
+    fn every_book_failure_has_the_intended_scope() {
+        let identity_quarantine = [
+            BookTransactionErrorV1::DuplicateAdd {
+                order_id: 1,
+                raw_ordinal: 1,
+            },
+            BookTransactionErrorV1::MissingModify {
+                order_id: 1,
+                raw_ordinal: 1,
+            },
+            BookTransactionErrorV1::ModifySideMismatch {
+                order_id: 1,
+                raw_ordinal: 1,
+            },
+            BookTransactionErrorV1::MissingCancel {
+                order_id: 1,
+                raw_ordinal: 1,
+            },
+            BookTransactionErrorV1::CancelIdentityMismatch {
+                order_id: 1,
+                raw_ordinal: 1,
+            },
+            BookTransactionErrorV1::OverCancel {
+                order_id: 1,
+                raw_ordinal: 1,
+                resting: 1,
+                cancelled: 2,
+            },
+            BookTransactionErrorV1::LockedOrCrossedEndpoint {
+                best_bid: 2,
+                best_ask: 1,
+            },
+        ];
+        let replay_fatal = [
+            BookTransactionErrorV1::ZeroSnapshotDepth,
+            BookTransactionErrorV1::SourceMismatch,
+            BookTransactionErrorV1::IdentityMismatch,
+            BookTransactionErrorV1::MemberOrdinalNotIncreasing,
+            BookTransactionErrorV1::UnexpectedClear,
+            BookTransactionErrorV1::InvalidRecoveryClear,
+            BookTransactionErrorV1::LevelArithmeticOverflow,
+            BookTransactionErrorV1::LevelAggregateUnderflow,
+            BookTransactionErrorV1::LevelPopulationMismatch,
+            BookTransactionErrorV1::ZeroRestingOrder,
+            BookTransactionErrorV1::InternalReconciliationOverflow,
+            BookTransactionErrorV1::InternalLevelStateMismatch,
+            BookTransactionErrorV1::InternalLockedOrCrossedState,
+            BookTransactionErrorV1::CommitIndexOverflow,
+            BookTransactionErrorV1::ResetEpochOverflow,
+            BookTransactionErrorV1::CountOverflow,
+        ];
+
+        for source in &identity_quarantine {
+            assert_eq!(
+                classify_book_failure(source),
+                ReplayFailureScopeV1::IdentityQuarantine
+            );
+        }
+        for source in &replay_fatal {
+            assert_eq!(
+                classify_book_failure(source),
+                ReplayFailureScopeV1::ReplayFatal
+            );
+        }
+    }
 }
 
 fn semantic_quarantine_ledgers_reconcile(

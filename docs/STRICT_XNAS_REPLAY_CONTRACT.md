@@ -63,6 +63,23 @@ reconciliation. A prefix failure cannot produce a receipt. A replay that
 reaches EOF but fails a terminal invariant produces the explicitly
 non-consumable `XnasTerminalDisqualificationV1`.
 
+Failures have exactly three owners:
+
+- identity-attributable market-data anomalies quarantine that identity, emit no
+  contaminated observation, and permit requalification only through a clean,
+  witnessed `R` recovery envelope;
+- source, custody, resource-bound, arithmetic, and internal reconciliation
+  failures are replay-fatal and cannot be converted into selective record
+  loss;
+- EOF-sealed incomplete initialization, open-tail, and unrecovered-invalid
+  states are terminal disqualifications and cannot mint a success receipt.
+
+Envelope and book error classification is compiler-exhaustive: a new error
+variant cannot compile until its owner is chosen. Snapshot-driven recovery is
+not implemented in this version. Snapshot-like input is quarantined and cannot
+restore validity; only the documented clean `R` path can do so. This is an
+intentional fail-closed boundary, not an implicit promise of snapshot support.
+
 Downstream staging uses this closed lifecycle:
 
 1. `StrictXnasReplayV1::qualify()` completes pass one and returns
