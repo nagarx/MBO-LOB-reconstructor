@@ -6,11 +6,12 @@ use dbn::{
     SymbolMapping, TradeMsg,
 };
 use hft_mbo_event_contract::{
-    EventDispositionV1, LogicalSourceV1, PublisherPolicyIdV1, Sha256DigestV1,
+    EventDispositionV1, LogicalSourceV1, PublisherPolicyIdV1, Sha256DigestV1, ValidationReasonV1,
     CANONICAL_MBO_EVENT_CONTRACT_SHA256,
 };
 use mbo_lob_reconstructor::{
     CanonicalSourceExpectationV1, StrictBoundaryErrorV1, StrictDbnLoaderV1,
+    VerifiedRejectionStageV1,
 };
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -161,7 +162,7 @@ fn valid_compressed_and_uncompressed_streams_reconcile_exactly() {
         let mut execution = 0;
         while let Some(item) = stream.next() {
             let item = item.unwrap();
-            let disposition = item.disposition();
+            let disposition = item.accepted().expect("fixture is accepted").disposition();
             ordinals.push(disposition.event().raw().raw_ordinal);
             match disposition {
                 EventDispositionV1::Book(_) => book += 1,
@@ -357,7 +358,7 @@ fn xnas_daily_universe_binding_rejects_incomplete_or_ambiguous_metadata() {
 }
 
 #[test]
-fn wrong_rtype_and_semantic_failure_own_their_one_based_ordinals_and_fuse() {
+fn wrong_rtype_is_fatal_but_semantic_rejections_retain_exact_custody_to_eof() {
     let dir = tempdir().unwrap();
     let wrong_rtype = dir.path().join("wrong-rtype.dbn");
     write_trade_record_with_mbo_metadata(&wrong_rtype);
@@ -378,25 +379,95 @@ fn wrong_rtype_and_semantic_failure_own_their_one_based_ordinals_and_fuse() {
     ));
 
     let bad_action = dir.path().join("bad-action.dbn");
+    let unknown_action = message(b'X', b'B', 10, 100, 1);
+    let mut maybe_bad_book = message(b'A', b'B', 11, 100, 2);
+    maybe_bad_book.flags = (flags::LAST | flags::MAYBE_BAD_BOOK).into();
     write_mbo(
         &bad_action,
         Compression::None,
         &metadata("XNAS.ITCH", Some(Schema::Mbo), 1, false),
-        &[message(b'X', b'B', 10, 100, 1)],
+        &[unknown_action, maybe_bad_book],
     );
     let mut stream = StrictDbnLoaderV1::open(
-        expectation(&bad_action, "XNAS.ITCH", "mbo", 1, false, 1),
+        expectation(&bad_action, "XNAS.ITCH", "mbo", 1, false, 2),
         &bad_action,
         PublisherPolicyIdV1::XnasItchHistorical,
     )
     .unwrap();
-    match stream.next().unwrap() {
-        Err(StrictBoundaryErrorV1::Validation(failure)) => {
-            assert_eq!(failure.raw_ordinal, 1)
-        }
-        other => panic!("unexpected result: {other:?}"),
-    }
+    let rejected = stream
+        .next()
+        .unwrap()
+        .unwrap()
+        .rejected()
+        .expect("unknown action is a lossless semantic rejection")
+        .clone();
+    assert_eq!(rejected.failure().raw_ordinal, 1);
+    assert_eq!(rejected.raw().raw_ordinal, 1);
+    assert_eq!(rejected.raw().action_raw, b'X');
+    assert_eq!(rejected.raw().order_id, 10);
+    assert_eq!(
+        rejected.failure().reason,
+        ValidationReasonV1::UnknownAction(b'X')
+    );
+    assert_eq!(
+        rejected.stage(),
+        VerifiedRejectionStageV1::UniversalValidation
+    );
+
+    let rejected = stream
+        .next()
+        .unwrap()
+        .unwrap()
+        .rejected()
+        .expect("MAYBE_BAD_BOOK is a lossless policy rejection")
+        .clone();
+    assert_eq!(rejected.raw().raw_ordinal, 2);
+    assert_eq!(rejected.raw().order_id, 11);
+    assert_eq!(rejected.failure().reason, ValidationReasonV1::MaybeBadBook);
+    assert_eq!(
+        rejected.stage(),
+        VerifiedRejectionStageV1::FullOrderBookPolicy
+    );
     assert!(stream.next().is_none());
+    let receipt = stream.finish().unwrap();
+    assert_eq!(receipt.decoded_records(), 2);
+    assert_eq!(receipt.accepted_records(), 0);
+    assert_eq!(receipt.rejected_records(), 2);
+}
+
+#[test]
+fn record_identity_absent_from_opened_metadata_is_source_fatal_and_fuses() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("unmapped-identity.dbn");
+    let mut unmapped = message(b'A', b'B', 10, 100, 1);
+    unmapped.hd.instrument_id = 202;
+    let recovery = message(b'R', b'N', 0, 0, 2);
+    write_mbo(
+        &path,
+        Compression::None,
+        &metadata("XNAS.ITCH", Some(Schema::Mbo), 1, false),
+        &[unmapped, recovery],
+    );
+    let mut stream = StrictDbnLoaderV1::open(
+        expectation(&path, "XNAS.ITCH", "mbo", 1, false, 2),
+        &path,
+        PublisherPolicyIdV1::XnasItchHistorical,
+    )
+    .unwrap();
+    assert!(matches!(
+        stream.next().unwrap(),
+        Err(StrictBoundaryErrorV1::RecordIdentityNotInMetadata {
+            raw_ordinal: 1,
+            publisher_id: 2,
+            instrument_id: 202,
+        })
+    ));
+    assert_eq!(stream.decoded_records(), 1);
+    assert!(stream.next().is_none());
+    assert!(matches!(
+        stream.finish(),
+        Err(StrictBoundaryErrorV1::CannotFinishFailedStream)
+    ));
 }
 
 #[test]
@@ -496,7 +567,12 @@ fn pathname_replacement_after_open_does_not_substitute_decoded_bytes() {
     while let Some(item) = stream.next() {
         let item = item.unwrap();
         assert_eq!(
-            item.disposition().event().raw().source_object_sha256,
+            item.accepted()
+                .expect("fixture is accepted")
+                .disposition()
+                .event()
+                .raw()
+                .source_object_sha256,
             expected_digest
         );
         seen += 1;

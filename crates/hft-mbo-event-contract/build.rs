@@ -10,7 +10,7 @@ const DIGEST_RELATIVE: &str = "contracts/mbo_event_contract.sha256";
 // not sufficient to change the compiled contract. Updating this value requires
 // a reviewed Rust source change as well as a root-authority change.
 const EXPECTED_CONTRACT_SHA256: &str =
-    "5e42cfd8e2d2f2a60e2e6152b1400e1b478a3c9354969ef2e85ac2618d36a302";
+    "2d88212e5209ac4fc4b375bb84cddf812b074ae1c28799b03a9720e9abdde72d";
 
 fn required_table<'a>(root: &'a toml::Value, name: &str) -> &'a toml::value::Table {
     root.get(name)
@@ -300,11 +300,11 @@ fn validate_closed_contract(root: &toml::Value) {
     let strict = required_table(root, "strict_validation");
     assert_eq!(
         required_str(strict, "snapshot_without_registered_policy"),
-        "fatal"
+        "decoded_record_rejected_policy_owner_must_escalate_or_quarantine"
     );
     assert_eq!(
         required_str(strict, "unassigned_flag_without_registered_policy"),
-        "fatal"
+        "decoded_record_rejected_policy_owner_must_escalate_or_quarantine"
     );
 
     let policies = required_table(root, "publisher_policies");

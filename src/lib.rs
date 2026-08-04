@@ -164,6 +164,10 @@ pub mod warnings;
 
 #[cfg(feature = "databento")]
 #[cfg_attr(docsrs, doc(cfg(feature = "databento")))]
+mod xnas;
+
+#[cfg(feature = "databento")]
+#[cfg_attr(docsrs, doc(cfg(feature = "databento")))]
 pub mod dbn_bridge;
 
 #[cfg(feature = "databento")]
@@ -245,12 +249,27 @@ pub use canonical_dbn::CanonicalProjectionErrorV1;
 pub use hotstore::{HotStoreConfig, HotStoreManager};
 
 #[cfg(feature = "databento")]
+pub use xnas::{
+    BookTransactionErrorV1, StrictXnasReplayV1, XnasBookCommitV1, XnasBookLevelV1,
+    XnasBookSnapshotV1, XnasEnvelopeErrorV1, XnasEofTailQuarantineV1, XnasEofTailReasonV1,
+    XnasIdentityReplayReceiptV1, XnasIdentityV1, XnasInvalidStateQuarantinedRecordV1,
+    XnasQuarantineReasonV1, XnasRecoveryQualificationV1, XnasRejectedRecordPhaseV1,
+    XnasRejectedRecordQuarantineV1, XnasReplayConfigV1, XnasReplayCountsV1, XnasReplayErrorV1,
+    XnasReplayPrefixFailureV1, XnasReplayReceiptV1, XnasReplayRunV1, XnasReplayTraceV1,
+    XnasResetBoundaryQuarantineV1, XnasSelectedOrdinalDispositionV1, XnasSelectedOrdinalRoleV1,
+    XnasSemanticQuarantineIncidentV1, XnasTerminalDisqualificationReasonV1,
+    XnasTerminalDisqualificationV1, XnasTerminalIdentityStatusV1, XnasValidityEpochQualificationV1,
+    XnasValidityEpochV1, XnasValidityInvalidationReasonV1, XnasValidityInvalidationV1,
+};
+
+#[cfg(feature = "databento")]
 #[allow(deprecated)]
 pub use loader::{
-    is_valid_order, BoundXnasHistoricalSourceV1, BoundaryError, CanonicalReadReceiptV1,
-    CanonicalSourceExpectationV1, DbnLoader, LoaderStats, StrictBoundaryErrorV1, StrictDbnLoaderV1,
-    StrictMboEventIteratorV1, TypedMessageIterator, VerifiedInstrumentIdentityV1,
-    VerifiedStreamEventV1, IO_BUFFER_SIZE,
+    is_valid_order, BoundaryError, CanonicalReadReceiptV1, CanonicalSourceExpectationV1, DbnLoader,
+    LoaderStats, StrictBoundaryErrorV1, StrictDbnLoaderV1, StrictMboEventIteratorV1,
+    TypedMessageIterator, VerifiedInstrumentIdentityV1, VerifiedRejectedStreamEventV1,
+    VerifiedRejectionStageV1, VerifiedStreamEventV1, VerifiedStreamRecordV1,
+    XnasDailyMetadataBindingV1, IO_BUFFER_SIZE,
 };
 
 // Re-exports - Parquet export (feature-gated)

@@ -14,9 +14,9 @@ use hft_mbo_event_contract::{
     classify_full_order_book, validate_raw_event, BoundPublisherPolicyV1, EventDispositionV1,
     LogicalSourceV1, OpenedReplicaV1, OpenedRepresentationV1, PublisherPolicyBindingErrorV1,
     PublisherPolicyIdV1, Sha256DigestV1, SourceDescriptorV1, SourceIdentityErrorV1,
-    ValidationFailureV1, CANONICAL_MBO_EVENT_CONTRACT_ID, CANONICAL_MBO_EVENT_CONTRACT_SHA256,
-    CANONICAL_MBO_EVENT_SCHEMA_VERSION, EXPECTED_MBO_RECORD_SIZE_BYTES, EXPECTED_MBO_RTYPE,
-    XNAS_ITCH_HISTORICAL_PUBLISHER_IDS_V1,
+    ValidationBoundaryClassV1, ValidationFailureV1, CANONICAL_MBO_EVENT_CONTRACT_ID,
+    CANONICAL_MBO_EVENT_CONTRACT_SHA256, CANONICAL_MBO_EVENT_SCHEMA_VERSION,
+    EXPECTED_MBO_RECORD_SIZE_BYTES, EXPECTED_MBO_RTYPE, XNAS_ITCH_HISTORICAL_PUBLISHER_IDS_V1,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -48,7 +48,7 @@ pub struct VerifiedInstrumentIdentityV1 {
 /// universe independently of the bytes being decoded. Completeness additionally
 /// requires an unforgeable [`CanonicalReadReceiptV1`] after EOF reconciliation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct BoundXnasHistoricalSourceV1 {
+pub struct XnasDailyMetadataBindingV1 {
     source_object_sha256: Sha256DigestV1,
     session_start_ns: u64,
     session_end_ns: u64,
@@ -56,7 +56,7 @@ pub struct BoundXnasHistoricalSourceV1 {
     instruments: Vec<VerifiedInstrumentIdentityV1>,
 }
 
-impl BoundXnasHistoricalSourceV1 {
+impl XnasDailyMetadataBindingV1 {
     pub const fn source_object_sha256(&self) -> Sha256DigestV1 {
         self.source_object_sha256
     }
@@ -81,6 +81,15 @@ impl BoundXnasHistoricalSourceV1 {
         self.instruments.iter().any(|identity| {
             identity.publisher_id == publisher_id && identity.instrument_id == instrument_id
         })
+    }
+
+    pub fn symbol_for_identity(&self, publisher_id: u16, instrument_id: u32) -> Option<&str> {
+        self.instruments
+            .iter()
+            .find(|identity| {
+                identity.publisher_id == publisher_id && identity.instrument_id == instrument_id
+            })
+            .map(|identity| identity.symbol.as_str())
     }
 }
 
@@ -204,6 +213,8 @@ impl StrictDbnLoaderV1 {
             xnas_historical_source,
             expected_records: expectation.expected_records,
             decoded_records: 0,
+            accepted_records: 0,
+            rejected_records: 0,
             next_raw_ordinal: Some(NonZeroU64::MIN),
             bytes_read,
             terminal: false,
@@ -223,6 +234,71 @@ pub struct VerifiedStreamEventV1 {
     disposition: EventDispositionV1,
 }
 
+/// One losslessly decoded record that cannot enter an accepted semantic lane.
+///
+/// This is not an iterator failure: the raw record remains source-bound and is
+/// available only so an owning policy coordinator can quarantine it, invalidate
+/// the affected identity, and continue toward an EOF receipt. It can never be
+/// reinterpreted as an accepted event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedRejectedStreamEventV1 {
+    raw: hft_mbo_event_contract::RawMboEventV1,
+    failure: ValidationFailureV1,
+    stage: VerifiedRejectionStageV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifiedRejectionStageV1 {
+    UniversalValidation,
+    FullOrderBookPolicy,
+}
+
+impl VerifiedRejectedStreamEventV1 {
+    pub const fn raw(&self) -> &hft_mbo_event_contract::RawMboEventV1 {
+        &self.raw
+    }
+
+    pub const fn failure(&self) -> &ValidationFailureV1 {
+        &self.failure
+    }
+
+    pub const fn stage(&self) -> VerifiedRejectionStageV1 {
+        self.stage
+    }
+}
+
+/// Exact outcome for one decoded source record. Structural decode and source
+/// failures remain iterator errors; record-local semantic rejection is data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifiedStreamRecordV1 {
+    Accepted(VerifiedStreamEventV1),
+    Rejected(VerifiedRejectedStreamEventV1),
+}
+
+impl VerifiedStreamRecordV1 {
+    pub const fn raw(&self) -> &hft_mbo_event_contract::RawMboEventV1 {
+        match self {
+            Self::Accepted(event) => event.disposition().event().raw(),
+            Self::Rejected(event) => event.raw(),
+        }
+    }
+
+    pub const fn accepted(&self) -> Option<&VerifiedStreamEventV1> {
+        match self {
+            Self::Accepted(event) => Some(event),
+            Self::Rejected(_) => None,
+        }
+    }
+
+    pub const fn rejected(&self) -> Option<&VerifiedRejectedStreamEventV1> {
+        match self {
+            Self::Accepted(_) => None,
+            Self::Rejected(event) => Some(event),
+        }
+    }
+}
+
 impl VerifiedStreamEventV1 {
     pub const fn disposition(&self) -> &EventDispositionV1 {
         &self.disposition
@@ -235,9 +311,11 @@ pub struct StrictMboEventIteratorV1 {
     post_read_file: File,
     source: SourceDescriptorV1,
     publisher_policy: BoundPublisherPolicyV1,
-    xnas_historical_source: Option<BoundXnasHistoricalSourceV1>,
+    xnas_historical_source: Option<XnasDailyMetadataBindingV1>,
     expected_records: u64,
     decoded_records: u64,
+    accepted_records: u64,
+    rejected_records: u64,
     next_raw_ordinal: Option<NonZeroU64>,
     bytes_read: Arc<AtomicU64>,
     terminal: bool,
@@ -254,7 +332,15 @@ impl StrictMboEventIteratorV1 {
         self.decoded_records
     }
 
-    pub const fn xnas_historical_source(&self) -> Option<&BoundXnasHistoricalSourceV1> {
+    pub const fn accepted_records(&self) -> u64 {
+        self.accepted_records
+    }
+
+    pub const fn rejected_records(&self) -> u64 {
+        self.rejected_records
+    }
+
+    pub const fn xnas_historical_source(&self) -> Option<&XnasDailyMetadataBindingV1> {
         self.xnas_historical_source.as_ref()
     }
 
@@ -306,6 +392,14 @@ impl StrictMboEventIteratorV1 {
             });
         }
 
+        if self.accepted_records.checked_add(self.rejected_records) != Some(self.decoded_records) {
+            return Err(StrictBoundaryErrorV1::SemanticPopulationMismatch {
+                decoded: self.decoded_records,
+                accepted: self.accepted_records,
+                rejected: self.rejected_records,
+            });
+        }
+
         Ok(CanonicalReadReceiptV1 {
             contract_id: CANONICAL_MBO_EVENT_CONTRACT_ID,
             contract_schema_version: CANONICAL_MBO_EVENT_SCHEMA_VERSION,
@@ -317,6 +411,8 @@ impl StrictMboEventIteratorV1 {
             version_upgrade_policy: "as_is",
             expected_records: self.expected_records,
             decoded_records: self.decoded_records,
+            accepted_records: self.accepted_records,
+            rejected_records: self.rejected_records,
             bytes_consumed,
         })
     }
@@ -329,7 +425,7 @@ impl StrictMboEventIteratorV1 {
 }
 
 impl Iterator for StrictMboEventIteratorV1 {
-    type Item = Result<VerifiedStreamEventV1, StrictBoundaryErrorV1>;
+    type Item = Result<VerifiedStreamRecordV1, StrictBoundaryErrorV1>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.terminal {
@@ -403,21 +499,74 @@ impl Iterator for StrictMboEventIteratorV1 {
                 return Some(Err(error));
             }
         };
+        if self
+            .xnas_historical_source
+            .as_ref()
+            .is_some_and(|binding| !binding.contains_identity(raw.publisher_id, raw.instrument_id))
+        {
+            let error = self.fail(StrictBoundaryErrorV1::RecordIdentityNotInMetadata {
+                raw_ordinal: raw.raw_ordinal,
+                publisher_id: raw.publisher_id,
+                instrument_id: raw.instrument_id,
+            });
+            return Some(Err(error));
+        }
         let validated = match validate_raw_event(raw) {
             Ok(value) => value,
             Err(source) => {
-                let error = self.fail(StrictBoundaryErrorV1::Validation(source));
-                return Some(Err(error));
+                if source.reason.boundary_class() == ValidationBoundaryClassV1::SourceStreamFatal {
+                    let error = self.fail(StrictBoundaryErrorV1::Validation(source));
+                    return Some(Err(error));
+                }
+                self.rejected_records = match self.rejected_records.checked_add(1) {
+                    Some(value) => value,
+                    None => {
+                        let error = self.fail(StrictBoundaryErrorV1::RawOrdinalOverflow);
+                        return Some(Err(error));
+                    }
+                };
+                return Some(Ok(VerifiedStreamRecordV1::Rejected(
+                    VerifiedRejectedStreamEventV1 {
+                        raw,
+                        failure: source,
+                        stage: VerifiedRejectionStageV1::UniversalValidation,
+                    },
+                )));
             }
         };
         let disposition = match classify_full_order_book(validated, &self.publisher_policy) {
             Ok(value) => value,
             Err(source) => {
-                let error = self.fail(StrictBoundaryErrorV1::Validation(source));
+                if source.reason.boundary_class() == ValidationBoundaryClassV1::SourceStreamFatal {
+                    let error = self.fail(StrictBoundaryErrorV1::Validation(source));
+                    return Some(Err(error));
+                }
+                self.rejected_records = match self.rejected_records.checked_add(1) {
+                    Some(value) => value,
+                    None => {
+                        let error = self.fail(StrictBoundaryErrorV1::RawOrdinalOverflow);
+                        return Some(Err(error));
+                    }
+                };
+                return Some(Ok(VerifiedStreamRecordV1::Rejected(
+                    VerifiedRejectedStreamEventV1 {
+                        raw,
+                        failure: source,
+                        stage: VerifiedRejectionStageV1::FullOrderBookPolicy,
+                    },
+                )));
+            }
+        };
+        self.accepted_records = match self.accepted_records.checked_add(1) {
+            Some(value) => value,
+            None => {
+                let error = self.fail(StrictBoundaryErrorV1::RawOrdinalOverflow);
                 return Some(Err(error));
             }
         };
-        Some(Ok(VerifiedStreamEventV1 { disposition }))
+        Some(Ok(VerifiedStreamRecordV1::Accepted(
+            VerifiedStreamEventV1 { disposition },
+        )))
     }
 }
 
@@ -431,10 +580,12 @@ pub struct CanonicalReadReceiptV1 {
     contract_sha256: Sha256DigestV1,
     source: SourceDescriptorV1,
     publisher_policy_id: &'static str,
-    xnas_historical_source: Option<BoundXnasHistoricalSourceV1>,
+    xnas_historical_source: Option<XnasDailyMetadataBindingV1>,
     version_upgrade_policy: &'static str,
     expected_records: u64,
     decoded_records: u64,
+    accepted_records: u64,
+    rejected_records: u64,
     bytes_consumed: u64,
 }
 
@@ -459,7 +610,7 @@ impl CanonicalReadReceiptV1 {
         self.publisher_policy_id
     }
 
-    pub const fn xnas_historical_source(&self) -> Option<&BoundXnasHistoricalSourceV1> {
+    pub const fn xnas_historical_source(&self) -> Option<&XnasDailyMetadataBindingV1> {
         self.xnas_historical_source.as_ref()
     }
 
@@ -473,6 +624,14 @@ impl CanonicalReadReceiptV1 {
 
     pub const fn decoded_records(&self) -> u64 {
         self.decoded_records
+    }
+
+    pub const fn accepted_records(&self) -> u64 {
+        self.accepted_records
+    }
+
+    pub const fn rejected_records(&self) -> u64 {
+        self.rejected_records
     }
 
     pub const fn bytes_consumed(&self) -> u64 {
@@ -562,6 +721,14 @@ pub enum StrictBoundaryErrorV1 {
         #[source]
         source: CanonicalProjectionErrorV1,
     },
+    #[error(
+        "decoded source record {raw_ordinal} identity ({publisher_id},{instrument_id}) is absent from same-file metadata"
+    )]
+    RecordIdentityNotInMetadata {
+        raw_ordinal: u64,
+        publisher_id: u16,
+        instrument_id: u32,
+    },
     #[error(transparent)]
     Validation(#[from] ValidationFailureV1),
     #[error("raw source ordinal overflow")]
@@ -586,6 +753,14 @@ pub enum StrictBoundaryErrorV1 {
     },
     #[error("decoded record count mismatch: expected={expected}, actual={actual}")]
     RecordCountMismatch { expected: u64, actual: u64 },
+    #[error(
+        "decoded semantic population mismatch: decoded={decoded}, accepted={accepted}, rejected={rejected}"
+    )]
+    SemanticPopulationMismatch {
+        decoded: u64,
+        accepted: u64,
+        rejected: u64,
+    },
     #[error("compressed byte consumption mismatch: expected={expected}, actual={actual}")]
     ByteConsumptionMismatch { expected: u64, actual: u64 },
 }
@@ -620,7 +795,7 @@ fn validate_metadata(
 fn verify_xnas_historical_source(
     metadata: &dbn::Metadata,
     source: &SourceDescriptorV1,
-) -> Result<BoundXnasHistoricalSourceV1, StrictBoundaryErrorV1> {
+) -> Result<XnasDailyMetadataBindingV1, StrictBoundaryErrorV1> {
     let end_ns = metadata.end.map(NonZeroU64::get);
     let expected_end = metadata.start.checked_add(NS_PER_UTC_DAY);
     if metadata.start % NS_PER_UTC_DAY != 0 || end_ns != expected_end {
@@ -692,7 +867,7 @@ fn verify_xnas_historical_source(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(BoundXnasHistoricalSourceV1 {
+    Ok(XnasDailyMetadataBindingV1 {
         source_object_sha256: source.logical.canonical_sha256,
         session_start_ns: metadata.start,
         session_end_ns: end_ns.expect("validated complete-day end"),

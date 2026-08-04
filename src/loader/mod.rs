@@ -52,9 +52,10 @@
 pub mod canonical;
 pub mod error;
 pub use canonical::{
-    BoundXnasHistoricalSourceV1, CanonicalReadReceiptV1, CanonicalSourceExpectationV1,
-    StrictBoundaryErrorV1, StrictDbnLoaderV1, StrictMboEventIteratorV1,
-    VerifiedInstrumentIdentityV1, VerifiedStreamEventV1,
+    CanonicalReadReceiptV1, CanonicalSourceExpectationV1, StrictBoundaryErrorV1, StrictDbnLoaderV1,
+    StrictMboEventIteratorV1, VerifiedInstrumentIdentityV1, VerifiedRejectedStreamEventV1,
+    VerifiedRejectionStageV1, VerifiedStreamEventV1, VerifiedStreamRecordV1,
+    XnasDailyMetadataBindingV1,
 };
 pub use error::BoundaryError;
 
@@ -569,7 +570,7 @@ impl DbnLoader {
     #[deprecated(
         since = "0.2.0",
         note = "Use iter_messages_typed instead (Item = Result<MboMessage, BoundaryError>). \
-                This legacy API will be removed in 0.3.0 (calendar 2026-10-29) per \
+                This legacy API is scheduled for removal on or after 2026-10-29 per \
                 Phase M REV 3 Decision 2."
     )]
     pub fn iter_messages(self) -> Result<MessageIterator<DbnFileDecoder>> {
@@ -644,7 +645,7 @@ impl DbnLoader {
         since = "0.2.0",
         note = "Use a manual loop over iter_messages_typed() for typed-error handling. \
                 This convenience helper depends on legacy-iterator-api which is \
-                scheduled for removal in 0.3.0 (calendar 2026-10-29)."
+                scheduled for removal on or after 2026-10-29."
     )]
     pub fn read_all(self) -> Result<Vec<MboMessage>> {
         let mut messages = Vec::new();
@@ -666,7 +667,7 @@ impl DbnLoader {
         since = "0.2.0",
         note = "Use a manual loop over iter_messages_typed() for typed-error handling. \
                 This convenience helper depends on legacy-iterator-api which is \
-                scheduled for removal in 0.3.0 (calendar 2026-10-29)."
+                scheduled for removal on or after 2026-10-29."
     )]
     pub fn count_messages(self) -> Result<u64> {
         let mut count = 0u64;
@@ -686,8 +687,8 @@ impl DbnLoader {
 /// iterator API with `Item = Result<MboMessage, BoundaryError>`.
 ///
 /// Gated under the `legacy-iterator-api` feature flag (default-on for
-/// transition; will be removed in 0.3.0 / calendar 2026-10-29 per Phase M
-/// REV 3 Decision 2).
+/// transition; scheduled for removal on or after 2026-10-29 per Phase M REV 3
+/// Decision 2).
 #[cfg(feature = "legacy-iterator-api")]
 pub struct MessageIterator<D: DecodeRecord> {
     decoder: D,

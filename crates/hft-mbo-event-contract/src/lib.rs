@@ -615,6 +615,48 @@ pub enum ValidationReasonV1 {
     },
 }
 
+/// Custody boundary owned by the canonical event contract. A source-fatal
+/// reason means exact stream attribution or policy binding is not trustworthy;
+/// a rejected record remains exactly attributable and can be handed to a
+/// publisher-specific quarantine owner without calling it accepted semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationBoundaryClassV1 {
+    SourceStreamFatal,
+    DecodedRecordRejected,
+}
+
+impl ValidationReasonV1 {
+    pub const fn boundary_class(&self) -> ValidationBoundaryClassV1 {
+        match self {
+            Self::PlaceholderSourceDigest
+            | Self::ZeroRawOrdinal
+            | Self::WrongRtype(_)
+            | Self::WrongRecordSize(_)
+            | Self::NonzeroSubordinal(_)
+            | Self::SourcePolicyBindingMismatch
+            | Self::PublisherPolicyMismatch { .. } => ValidationBoundaryClassV1::SourceStreamFatal,
+            Self::UnknownAction(_)
+            | Self::UnknownSide(_)
+            | Self::InvalidSideForAction { .. }
+            | Self::UndefinedTsEvent
+            | Self::UndefinedTsRecv
+            | Self::ZeroOrderId
+            | Self::UndefinedPrice
+            | Self::UndefinedSize
+            | Self::ZeroSize
+            | Self::MaybeBadBook
+            | Self::UnsupportedTopOfBook
+            | Self::UnsupportedMarketByPrice
+            | Self::PublisherSpecificPolicyRequired(_)
+            | Self::SnapshotPolicyRequired
+            | Self::UnassignedFlagPolicyRequired => {
+                ValidationBoundaryClassV1::DecodedRecordRejected
+            }
+        }
+    }
+}
+
 /// Closed identifiers for publisher policy rows registered by the authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PublisherPolicyIdV1 {
@@ -1163,6 +1205,49 @@ mod tests {
         assert_eq!(error.reason, ValidationReasonV1::UnknownSide(b'S'));
         let error = validate_raw_event(raw(b'X', SIDE_BID)).unwrap_err();
         assert_eq!(error.reason, ValidationReasonV1::UnknownAction(b'X'));
+    }
+
+    #[test]
+    fn validation_boundary_class_is_exhaustive_and_custody_preserving() {
+        let source_fatal = [
+            ValidationReasonV1::PlaceholderSourceDigest,
+            ValidationReasonV1::ZeroRawOrdinal,
+            ValidationReasonV1::WrongRtype(1),
+            ValidationReasonV1::WrongRecordSize(1),
+            ValidationReasonV1::NonzeroSubordinal(1),
+            ValidationReasonV1::SourcePolicyBindingMismatch,
+            ValidationReasonV1::PublisherPolicyMismatch {
+                policy_id: "test",
+                publisher_id: 9,
+            },
+        ];
+        assert!(source_fatal.iter().all(|reason| {
+            reason.boundary_class() == ValidationBoundaryClassV1::SourceStreamFatal
+        }));
+
+        let rejected = [
+            ValidationReasonV1::UnknownAction(b'X'),
+            ValidationReasonV1::UnknownSide(b'X'),
+            ValidationReasonV1::InvalidSideForAction {
+                action: KnownActionV1::Add,
+                side: KnownSideV1::None,
+            },
+            ValidationReasonV1::UndefinedTsEvent,
+            ValidationReasonV1::UndefinedTsRecv,
+            ValidationReasonV1::ZeroOrderId,
+            ValidationReasonV1::UndefinedPrice,
+            ValidationReasonV1::UndefinedSize,
+            ValidationReasonV1::ZeroSize,
+            ValidationReasonV1::MaybeBadBook,
+            ValidationReasonV1::UnsupportedTopOfBook,
+            ValidationReasonV1::UnsupportedMarketByPrice,
+            ValidationReasonV1::PublisherSpecificPolicyRequired(2),
+            ValidationReasonV1::SnapshotPolicyRequired,
+            ValidationReasonV1::UnassignedFlagPolicyRequired,
+        ];
+        assert!(rejected.iter().all(|reason| {
+            reason.boundary_class() == ValidationBoundaryClassV1::DecodedRecordRejected
+        }));
     }
 
     #[test]
