@@ -18,14 +18,10 @@ use crate::types::{Action, BookConsistency, LobState, MboMessage, Order, Side};
 
 /// Schema version for the `LobStats` JSON serialization envelope.
 ///
-/// Phase M M.A.5 (REV 3 boundary discipline cycle): introduced
-/// [`LobStatsExportEnvelope`] wrapping the raw stats with a `schema_version`
-/// field. Bumped to `2.0.0` to signal the conceptual break from the legacy
-/// flat shape (no envelope existed before — pre-M.A.5 was implicit-1.0).
-///
-/// **Independent of** `crate::export::SCHEMA_VERSION` (`"1.0"`), which
-/// versions the Parquet export schema — a different artifact. When either
-/// constant bumps, the other should NOT auto-bump.
+/// Version `3.0.0` is the exact v1 semantic-major envelope. It wraps the
+/// payload, requires every current counter, rejects unknown keys, and excludes
+/// obsolete pre-v1 trade-anomaly counters that the T/F-correct implementation
+/// cannot populate.
 ///
 /// # Versioning policy (per hft-rules §1)
 ///
@@ -33,7 +29,7 @@ use crate::types::{Action, BookConsistency, LobState, MboMessage, Order, Side};
 ///   field, rename a field, change an envelope key).
 /// - MINOR: additive non-breaking changes (e.g., new `LobStats` field).
 /// - PATCH: docs-only changes.
-pub const LOB_STATS_SCHEMA_VERSION: &str = "2.0.0";
+pub const LOB_STATS_SCHEMA_VERSION: &str = "3.0.0";
 
 /// How to handle crossed quotes (bid >= ask) when they occur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -50,7 +46,7 @@ pub enum CrossedQuotePolicy {
 
     /// Return last valid book state when crossing would occur.
     ///
-    /// Book mutations are still applied internally (the order IS added/cancelled/traded).
+    /// Book commands are still applied internally (A/M/C/R only).
     /// Only the returned LobState uses the last valid snapshot. Functionally identical
     /// to `UseLastValid` — both share the same code path.
     SkipUpdate,
@@ -58,6 +54,7 @@ pub enum CrossedQuotePolicy {
 
 /// Configuration for LOB reconstructor behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LobConfig {
     /// Number of price levels to track
     pub levels: usize,
@@ -71,17 +68,10 @@ pub struct LobConfig {
     /// Whether to log warnings for consistency issues
     pub log_warnings: bool,
 
-    /// Skip system messages (order_id=0, size=0, price<=0) instead of erroring.
-    ///
-    /// DBN/MBO data often contains system messages (heartbeats, status updates)
-    /// that have order_id=0. These are NOT valid orders and cannot be processed
-    /// by the LOB reconstructor.
-    ///
-    /// When true (default): silently skip these messages and track count in stats.
-    /// When false: attempt to process (will fail validation if validate_messages=true).
-    ///
-    /// This is the recommended setting for LOB reconstruction from real market data.
-    pub skip_system_messages: bool,
+    /// Skip explicit `Action::None` controls before ordinary processing.
+    /// Invalid field shapes are never classified as controls and still fail
+    /// action-specific validation.
+    pub skip_noop_controls: bool,
 }
 
 impl Default for LobConfig {
@@ -91,7 +81,7 @@ impl Default for LobConfig {
             crossed_quote_policy: CrossedQuotePolicy::Allow,
             validate_messages: true,
             log_warnings: true,
-            skip_system_messages: true, // Safe default for real market data
+            skip_noop_controls: true, // Safe default for real market data
         }
     }
 }
@@ -123,17 +113,11 @@ impl LobConfig {
         self
     }
 
-    /// Enable/disable skipping of system messages.
-    ///
-    /// System messages are identified by:
-    /// - order_id = 0 (heartbeats, status updates, metadata)
-    /// - size = 0 (invalid order size)
-    /// - price <= 0 (invalid price)
-    ///
-    /// When true (default): these messages are silently skipped.
-    /// When false: these messages will be processed (and likely fail validation).
-    pub fn with_skip_system_messages(mut self, skip: bool) -> Self {
-        self.skip_system_messages = skip;
+    /// Enable or disable skipping explicit `Action::None` controls.
+    /// Field shapes are never inferred as controls; malformed commands and
+    /// valid order-id-zero aggregate trades remain observable.
+    pub fn with_skip_noop_controls(mut self, skip: bool) -> Self {
+        self.skip_noop_controls = skip;
         self
     }
 
@@ -213,13 +197,14 @@ pub struct LobReconstructor {
 ///   and add-of-existing paths (see `LobReconstructor::modify_order` and
 ///   `LobReconstructor::add_order`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct LobStats {
-    /// Total messages processed (excludes system messages if skip_system_messages=true)
+    /// Total messages processed (excludes explicit controls if skip_noop_controls=true)
     pub messages_processed: u64,
 
-    /// System messages skipped (order_id=0, size=0, price<=0)
-    pub system_messages_skipped: u64,
+    /// Explicit `Action::None` controls skipped.
+    pub noop_controls_skipped: u64,
 
     /// Number of active orders
     pub active_orders: usize,
@@ -251,14 +236,13 @@ pub struct LobStats {
     /// Number of cancels where order was not at expected price level
     pub cancel_order_at_level_missing: u64,
 
-    /// Number of trades for orders not found
-    pub trade_order_not_found: u64,
+    /// Aggregate economic execution carriers observed. These do not mutate
+    /// resting-book state.
+    pub aggregate_trades_observed: u64,
 
-    /// Number of trades where price level was missing
-    pub trade_price_level_missing: u64,
-
-    /// Number of trades where order was not at expected price level
-    pub trade_order_at_level_missing: u64,
+    /// Resting-order fill-evidence carriers observed. The paired cancel or
+    /// modify remains the authoritative quantity mutation.
+    pub resting_fills_observed: u64,
 
     /// Number of `modify_order` operations where the `order_id` was NOT found
     /// in the active orders map.
@@ -270,7 +254,6 @@ pub struct LobStats {
     /// for messages whose corresponding `Add` arrived before the iteration
     /// window started; persistent non-zero values during steady-state
     /// indicate upstream feed gaps.
-    #[serde(default)]
     pub modify_order_not_found: u64,
 
     /// Number of `add_order` operations where the `order_id` already existed
@@ -281,7 +264,6 @@ pub struct LobStats {
     /// fall-through to `modify_order(msg)` (some exchanges reuse `order_id`s).
     /// Persistent non-zero values may indicate either (a) legitimate id reuse
     /// by the venue, or (b) data-feed quirks worth investigating.
-    #[serde(default)]
     pub add_order_id_collision: u64,
 
     /// Number of book clears/resets
@@ -297,9 +279,6 @@ impl LobStats {
         self.cancel_order_not_found > 0
             || self.cancel_price_level_missing > 0
             || self.cancel_order_at_level_missing > 0
-            || self.trade_order_not_found > 0
-            || self.trade_price_level_missing > 0
-            || self.trade_order_at_level_missing > 0
             || self.modify_order_not_found > 0
             || self.add_order_id_collision > 0
     }
@@ -309,9 +288,6 @@ impl LobStats {
         self.cancel_order_not_found
             + self.cancel_price_level_missing
             + self.cancel_order_at_level_missing
-            + self.trade_order_not_found
-            + self.trade_price_level_missing
-            + self.trade_order_at_level_missing
             + self.modify_order_not_found
             + self.add_order_id_collision
     }
@@ -325,19 +301,11 @@ impl LobStats {
     /// rename to `path`. Eliminates the SIGKILL-mid-write partial-file risk
     /// of the pre-M.A.5 `BufWriter + serde_json::to_writer_pretty` path.
     ///
-    /// **Envelope wrapper**: output JSON is `{ "schema_version": "2.0.0",
+    /// **Envelope wrapper**: output JSON is `{ "schema_version": "3.0.0",
     /// "stats": {...} }`. The `schema_version` field is the
     /// [`LOB_STATS_SCHEMA_VERSION`] constant. **Breaking change** for the
-    /// on-disk format; pre-M.A.5 flat-shape files cannot round-trip through
-    /// `export_to_file → load_from_file` cleanly anymore (but
-    /// [`Self::load_from_file`] remains backward-compatible via dual-format
-    /// reading — see its docs).
-    ///
-    /// **Fallback**: if `NamedTempFile::new_in(parent)` fails (e.g., NFS
-    /// quirks, EROFS) or `persist()` fails (e.g., cross-device link EXDEV),
-    /// the function falls back to direct `File::create` + `write_all` +
-    /// `sync_all` and emits a `log::warn!`. The fallback emits the same
-    /// envelope shape so readers cannot distinguish atomic vs fallback paths.
+    /// on-disk format. Legacy flat files and older schema envelopes are
+    /// rejected rather than silently reinterpreted.
     ///
     /// # SSoT-deferred consolidation
     ///
@@ -363,117 +331,35 @@ impl LobStats {
             .unwrap_or_else(|| std::path::Path::new("."));
 
         // Atomic-write path: tempfile in same FS as target → write → fsync → rename.
-        match tempfile::NamedTempFile::new_in(parent) {
-            Ok(mut tmp) => {
-                serde_json::to_writer_pretty(&mut tmp, &envelope).map_err(std::io::Error::other)?;
-                tmp.as_file().sync_all()?;
-                if let Err(persist_err) = tmp.persist(path) {
-                    log::warn!(
-                        "atomic persist failed for {} ({}); falling back to direct write",
-                        path.display(),
-                        persist_err.error
-                    );
-                    return Self::write_envelope_direct(path, &envelope);
-                }
-                Ok(())
-            }
-            Err(tmp_err) => {
-                log::warn!(
-                    "tempfile creation failed in {} ({}); falling back to direct write",
-                    parent.display(),
-                    tmp_err
-                );
-                Self::write_envelope_direct(path, &envelope)
-            }
-        }
+        // Failure at any step is fatal; there is no indistinguishable direct-write fallback.
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer_pretty(&mut tmp, &envelope).map_err(std::io::Error::other)?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(path).map_err(|error| error.error)?;
+
+        // Persist the directory entry, not only the file bytes.
+        std::fs::File::open(parent)?.sync_all()
     }
 
-    /// Direct (non-atomic) write fallback path. Same envelope shape as the
-    /// atomic path — readers cannot distinguish.
-    fn write_envelope_direct(
-        path: &std::path::Path,
-        envelope: &LobStatsExportEnvelopeRef<'_>,
-    ) -> std::io::Result<()> {
-        let mut file = std::fs::File::create(path)?;
-        serde_json::to_writer_pretty(&mut file, envelope).map_err(std::io::Error::other)?;
-        file.sync_all()
-    }
-
-    /// Load stats from a JSON file (dual-format aware).
+    /// Load stats from an exact-version JSON envelope.
     ///
-    /// Phase M M.A.5 (REV 3 boundary discipline cycle): accepts BOTH:
-    /// - **Envelope shape** (post-M.A.5): `{ "schema_version": "2.0.0",
-    ///   "stats": {...} }` — preferred.
-    /// - **Legacy flat shape** (pre-M.A.5): `{messages_processed: ..., ...}`
-    ///   without an envelope. Emits a `log::warn!` (per call) so operators
-    ///   are aware they're reading deprecated-format files. Scheduled for
-    ///   removal in next MAJOR (calendar 2026-10-29 — aligned with
-    ///   `legacy-iterator-api` removal).
-    ///
-    /// # Format dispatch (Phase M M.A.5 hardening — explicit over `untagged`)
-    ///
-    /// Earlier `#[serde(untagged)]` over `LobStatsLoadable` had a silent-
-    /// acceptance failure mode: a JSON with top-level `schema_version` BUT
-    /// the `stats` key MISSING (e.g., a botched migration script that wrote
-    /// `schema_version` but forgot the `stats` wrapper) would silently route
-    /// through the legacy variant — `LobStats` doesn't have a `schema_version`
-    /// field, so serde dropped it without error. The post-hardening dispatch
-    /// peeks at top-level keys via `serde_json::Value` BEFORE deserializing,
-    /// then routes:
-    /// - If `schema_version` AND `stats` are both present → strict envelope parse.
-    /// - If `schema_version` is present BUT `stats` is missing → fail-loud
-    ///   (`std::io::Error::other`) per hft-rules §5 — refusing to silently
-    ///   accept malformed envelope output.
-    /// - Otherwise → legacy flat parse + WARN.
+    /// Flat files, missing wrappers, unknown fields, and older or newer schema
+    /// versions are rejected. This prevents a historical counter population
+    /// from being silently assigned a new semantic meaning.
     pub fn load_from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
         let path_ref = path.as_ref();
         let json = std::fs::read_to_string(path_ref)?;
-
-        // Peek at top-level keys via Value to disambiguate envelope vs legacy
-        // PRECISELY — closes the silent-accept loophole that `#[serde(untagged)]`
-        // had with malformed-but-envelope-shaped payloads.
-        let value: serde_json::Value =
+        let envelope: LobStatsExportEnvelope =
             serde_json::from_str(&json).map_err(std::io::Error::other)?;
-
-        let has_schema_version = value
-            .as_object()
-            .map(|o| o.contains_key("schema_version"))
-            .unwrap_or(false);
-        let has_stats = value
-            .as_object()
-            .map(|o| o.contains_key("stats"))
-            .unwrap_or(false);
-
-        match (has_schema_version, has_stats) {
-            (true, true) => {
-                // Envelope shape — strict parse.
-                let envelope: LobStatsExportEnvelope =
-                    serde_json::from_value(value).map_err(std::io::Error::other)?;
-                Ok(envelope.stats)
-            }
-            (true, false) => {
-                // Malformed: claims envelope (has schema_version) but missing stats wrapper.
-                // Pre-hardening this would silently parse as Legacy(LobStats), dropping
-                // schema_version. Post-hardening: fail-loud per hft-rules §5.
-                Err(std::io::Error::other(format!(
-                    "malformed envelope at {}: top-level `schema_version` present but `stats` wrapper missing",
-                    path_ref.display(),
-                )))
-            }
-            (false, _) => {
-                // Legacy flat shape.
-                let stats: LobStats =
-                    serde_json::from_value(value).map_err(std::io::Error::other)?;
-                log::warn!(
-                    "loaded LobStats from {} in legacy flat-shape JSON (pre-M.A.5); \
-                     re-export to upgrade to envelope schema {}. \
-                     Legacy format scheduled for removal in next MAJOR (2026-10-29).",
-                    path_ref.display(),
-                    LOB_STATS_SCHEMA_VERSION,
-                );
-                Ok(stats)
-            }
+        if envelope.schema_version != LOB_STATS_SCHEMA_VERSION {
+            return Err(std::io::Error::other(format!(
+                "unsupported LobStats schema at {}: expected {}, observed {}",
+                path_ref.display(),
+                LOB_STATS_SCHEMA_VERSION,
+                envelope.schema_version,
+            )));
         }
+        Ok(envelope.stats)
     }
 }
 
@@ -493,15 +379,15 @@ impl LobStats {
 /// (`serde_json::to_writer_pretty(&LobStats)` directly) ALREADY occupied the
 /// flat top-level namespace. Adding a top-level `schema_version` field to
 /// `LobStats` itself would require either a hand-coded migration shim OR a
-/// second BREAKING bump down the line. The envelope is a one-time MAJOR bump
-/// (1.0 → 2.0) that creates a clean separation between the wrapper layer and
-/// the payload layer for all future evolution.
+/// second breaking bump down the line. The envelope creates a clean separation
+/// between wrapper and payload namespaces for future evolution.
 ///
 /// `#[non_exhaustive]` per Phase M Decision 18 — additive-only future evolution.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct LobStatsExportEnvelope {
-    /// Schema version string (e.g., `"2.0.0"`).
+    /// Exact schema version string (`"3.0.0"`).
     pub schema_version: String,
 
     /// The wrapped [`LobStats`] payload.
@@ -519,23 +405,13 @@ struct LobStatsExportEnvelopeRef<'a> {
     stats: &'a LobStats,
 }
 
-// Phase M M.A.5 hardening: the previous `LobStatsLoadable` `#[serde(untagged)]`
-// enum was REPLACED by an explicit `serde_json::Value`-peek dispatch in
-// `LobStats::load_from_file` (above). Rationale: untagged-fallback silently
-// accepted malformed envelope payloads (top-level `schema_version` but missing
-// `stats` wrapper) by routing to the Legacy variant and dropping the unknown
-// field. Explicit dispatch fails-loud on that malformed shape per hft-rules §5.
-
 /// The type of order reduction operation being performed.
 ///
-/// Both cancel and trade operations follow the same 3-stage lookup
-/// (order → price level → order at level) with identical partial/full
-/// removal logic. This enum selects the appropriate stat counters
-/// and log prefixes for each operation type.
+/// Authoritative compatibility-book quantity reduction. T/F are deliberately
+/// excluded; only C reaches this path.
 #[derive(Debug, Clone, Copy)]
 enum OrderReductionOp {
     Cancel,
-    Trade,
 }
 
 impl OrderReductionOp {
@@ -543,7 +419,6 @@ impl OrderReductionOp {
     const fn label(self) -> &'static str {
         match self {
             Self::Cancel => "Cancel",
-            Self::Trade => "Trade",
         }
     }
 }
@@ -791,21 +666,7 @@ impl LobReconstructor {
         self.reduce_or_remove_order(msg, OrderReductionOp::Cancel)
     }
 
-    /// Process a trade (execution).
-    ///
-    /// Trade reduces order size or removes it completely.
-    /// Uses soft error handling - anomalies are tracked in stats but don't fail.
-    #[inline]
-    fn process_trade(&mut self, msg: &MboMessage) -> Result<()> {
-        self.reduce_or_remove_order(msg, OrderReductionOp::Trade)
-    }
-
-    /// Unified order reduction: look up order, reduce or remove from book.
-    ///
-    /// Both cancel and trade follow the same 3-stage lookup with identical
-    /// partial/full removal logic. Only stat counters and log prefixes differ,
-    /// selected by `op`. This eliminates the ~90% code duplication that was
-    /// the root cause of bugs #2 and #3 (fix applied to one path but not the other).
+    /// Apply the authoritative cancel quantity delta.
     ///
     /// # Stages
     /// 1. Order lookup in `self.orders` → not found: increment stat, return Ok
@@ -820,10 +681,7 @@ impl LobReconstructor {
             None => {
                 // Order not found - common in real markets (already cancelled,
                 // late message, aggressor side trades, etc.)
-                match op {
-                    OrderReductionOp::Cancel => self.stats.cancel_order_not_found += 1,
-                    OrderReductionOp::Trade => self.stats.trade_order_not_found += 1,
-                }
+                self.stats.cancel_order_not_found += 1;
                 if self.config.log_warnings {
                     log::debug!(
                         "{}: order {} not found (msg #{}, ts={:?})",
@@ -849,10 +707,7 @@ impl LobReconstructor {
             None => {
                 // Price level doesn't exist - data anomaly, but recoverable
                 // Clean up the orphaned order tracking and continue
-                match op {
-                    OrderReductionOp::Cancel => self.stats.cancel_price_level_missing += 1,
-                    OrderReductionOp::Trade => self.stats.trade_price_level_missing += 1,
-                }
+                self.stats.cancel_price_level_missing += 1;
                 self.orders.remove(&msg.order_id);
                 if self.config.log_warnings {
                     log::warn!(
@@ -873,10 +728,7 @@ impl LobReconstructor {
             None => {
                 // Order not at price level - data anomaly, but recoverable
                 // Clean up the orphaned order tracking and continue
-                match op {
-                    OrderReductionOp::Cancel => self.stats.cancel_order_at_level_missing += 1,
-                    OrderReductionOp::Trade => self.stats.trade_order_at_level_missing += 1,
-                }
+                self.stats.cancel_order_at_level_missing += 1;
                 self.orders.remove(&msg.order_id);
                 if self.config.log_warnings {
                     log::warn!(
@@ -1156,31 +1008,10 @@ impl LobReconstructor {
     /// ```
     #[inline]
     pub fn process_message_into(&mut self, msg: &MboMessage, state: &mut LobState) -> Result<()> {
-        // System messages (heartbeats, status updates) are not valid orders.
-        //
-        // Phase O Cycle 1 / B.2a (NEW-AUDIT-A3 closure): exempt
-        // `Action::Clear` from this filter. Clear messages are SEMANTIC
-        // market events (mid-day book wipes from circuit-breaker /
-        // market-wide auction halts) that canonically carry the same
-        // zero-field shape as system heartbeats (`order_id=0, size=0,
-        // price=0`). Pre-B.2a this filter silently swallowed them,
-        // making the `Action::Clear => self.reset()` handler at the
-        // match dispatch below UNREACHABLE for default-config callers
-        // (`LobConfig::default()` sets `skip_system_messages: true`).
-        // The companion Phase O B.2b fix in the extractor's outer
-        // filter (`feature-extractor-MBO-LOB/crates/hft-extractor/src/
-        // pipeline.rs:346` as of 2026-07-07 — grep `msg.action !=
-        // Action::Clear` there if the line drifts) is
-        // the operator-visible counter side; B.2a is the load-bearing
-        // book-state fix. `Action::None` is intentionally NOT exempted
-        // — it has identical zero-field shape but per types.rs:48 is a
-        // "no-op action" with no required handler side effect; silent-
-        // drop preserves pre-B.2a behavior.
-        if self.config.skip_system_messages
-            && msg.is_system_message()
-            && msg.action != Action::Clear
-        {
-            self.stats.system_messages_skipped += 1;
+        // Only the explicit no-op lane is skippable. Aggregate trades with
+        // order_id=0 and malformed order commands remain observable.
+        if self.config.skip_noop_controls && msg.is_noop_control() {
+            self.stats.noop_controls_skipped += 1;
             // Still populate temporal info even for skipped messages
             self.fill_lob_state_with_temporal(
                 state,
@@ -1191,21 +1022,7 @@ impl LobReconstructor {
             return Ok(());
         }
 
-        // Validate message (if enabled).
-        //
-        // Phase O B.2a: also exempt `Action::Clear` from validation.
-        // `MboMessage::validate()` (types.rs:186-202) requires
-        // `order_id > 0 AND price > 0 AND size > 0` — the docstring at
-        // types.rs:183-185 explicitly says "checks whether a message
-        // that *should* represent a valid order actually has valid
-        // field values. System messages (heartbeats, status) should be
-        // filtered first." Clear is NOT supposed to represent a valid
-        // order, so it is correctly excluded from this validation
-        // contract. Without this exemption, the B.2a inner-filter
-        // exemption above would only move the silent-drop ONE LINE
-        // DOWN (Clear would pass the filter then be rejected by
-        // validation as `InvalidOrderId(0)`) — defeating the whole fix.
-        if self.config.validate_messages && msg.action != Action::Clear {
+        if self.config.validate_messages {
             msg.validate()?;
         }
 
@@ -1214,7 +1031,20 @@ impl LobReconstructor {
             Action::Add => self.add_order(msg)?,
             Action::Modify => self.modify_order(msg)?,
             Action::Cancel => self.cancel_order(msg)?,
-            Action::Trade | Action::Fill => self.process_trade(msg)?,
+            Action::TradeAggregate => {
+                self.stats.aggregate_trades_observed = self
+                    .stats
+                    .aggregate_trades_observed
+                    .checked_add(1)
+                    .ok_or_else(|| TlobError::generic("aggregate-trade counter overflow"))?;
+            }
+            Action::Fill => {
+                self.stats.resting_fills_observed = self
+                    .stats
+                    .resting_fills_observed
+                    .checked_add(1)
+                    .ok_or_else(|| TlobError::generic("resting-fill counter overflow"))?;
+            }
             Action::Clear => {
                 self.stats.book_clears += 1;
                 if self.config.log_warnings {
@@ -1340,7 +1170,7 @@ impl LobReconstructor {
     ///
     /// # Statistics Behavior
     ///
-    /// Statistics (`messages_processed`, `system_messages_skipped`, etc.)
+    /// Statistics (`messages_processed`, `noop_controls_skipped`, etc.)
     /// are intentionally preserved so you can track cumulative metrics
     /// across resets within a session.
     pub fn reset(&mut self) {
@@ -1598,35 +1428,44 @@ mod tests {
     }
 
     #[test]
-    fn test_trade_partial_fill() {
+    fn aggregate_trade_and_fill_are_book_noops_then_cancel_mutates_once() {
         let mut lob = LobReconstructor::new(10);
 
-        // Add order
         let add = create_test_message(1, Action::Add, Side::Bid, 100.0, 100);
         lob.process_message(&add).unwrap();
 
-        // Partial fill (50 shares)
-        let trade = create_test_message(1, Action::Trade, Side::Bid, 100.0, 50);
+        let trade = create_test_message(0, Action::TradeAggregate, Side::Ask, 100.0, 40);
         let state = lob.process_message(&trade).unwrap();
+        assert_eq!(lob.order_count(), 1);
+        assert_eq!(state.bid_sizes[0], 100);
+        assert_eq!(lob.stats().aggregate_trades_observed, 1);
 
-        assert_eq!(lob.order_count(), 1); // Order still exists
-        assert_eq!(state.bid_sizes[0], 50); // Reduced size
+        let fill = create_test_message(1, Action::Fill, Side::Bid, 100.0, 40);
+        let state = lob.process_message(&fill).unwrap();
+        assert_eq!(lob.order_count(), 1);
+        assert_eq!(state.bid_sizes[0], 100);
+        assert_eq!(lob.stats().resting_fills_observed, 1);
+
+        let cancel = create_test_message(1, Action::Cancel, Side::Bid, 100.0, 40);
+        let state = lob.process_message(&cancel).unwrap();
+        assert_eq!(lob.order_count(), 1);
+        assert_eq!(state.bid_sizes[0], 60);
     }
 
     #[test]
-    fn test_trade_full_fill() {
+    fn aggregate_trade_never_removes_a_resting_order() {
         let mut lob = LobReconstructor::new(10);
 
         // Add order
         let add = create_test_message(1, Action::Add, Side::Bid, 100.0, 100);
         lob.process_message(&add).unwrap();
 
-        // Full fill
-        let trade = create_test_message(1, Action::Trade, Side::Bid, 100.0, 100);
+        let trade = create_test_message(0, Action::TradeAggregate, Side::None, 100.0, 100);
         lob.process_message(&trade).unwrap();
 
-        assert_eq!(lob.order_count(), 0); // Order removed
-        assert_eq!(lob.bid_levels(), 0); // Price level removed
+        assert_eq!(lob.order_count(), 1);
+        assert_eq!(lob.bid_levels(), 1);
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 100);
     }
 
     #[test]
@@ -2062,8 +1901,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_trade_size_reduction() {
-        // Test that partial trade (fill) correctly reduces order size
+    fn test_repeated_aggregate_trades_do_not_reduce_order_size() {
         let mut lob = LobReconstructor::new(10);
 
         // Add order with 100 shares
@@ -2071,64 +1909,66 @@ mod tests {
             .unwrap();
 
         // Partial fill of 25 shares
-        lob.process_message(&create_test_message(1, Action::Trade, Side::Ask, 100.0, 25))
-            .unwrap();
+        lob.process_message(&create_test_message(
+            1,
+            Action::TradeAggregate,
+            Side::Ask,
+            100.0,
+            25,
+        ))
+        .unwrap();
 
-        // Order should have 75 shares remaining
+        // Aggregate executions do not identify or mutate the resting order.
         assert_eq!(lob.order_count(), 1);
-        assert_eq!(lob.get_lob_state().ask_sizes[0], 75);
+        assert_eq!(lob.get_lob_state().ask_sizes[0], 100);
 
         // Partial fill of 50 more shares
-        lob.process_message(&create_test_message(1, Action::Trade, Side::Ask, 100.0, 50))
-            .unwrap();
+        lob.process_message(&create_test_message(
+            1,
+            Action::TradeAggregate,
+            Side::Ask,
+            100.0,
+            50,
+        ))
+        .unwrap();
 
-        // Order should have 25 shares remaining
         assert_eq!(lob.order_count(), 1);
-        assert_eq!(lob.get_lob_state().ask_sizes[0], 25);
+        assert_eq!(lob.get_lob_state().ask_sizes[0], 100);
+        assert_eq!(lob.stats().aggregate_trades_observed, 2);
     }
 
     #[test]
-    fn test_over_trade_removes_order() {
-        // Test that trading more than order size removes the order cleanly
-        // (analogous to test_over_cancel_removes_order)
+    fn test_large_aggregate_trade_does_not_remove_order() {
         let mut lob = LobReconstructor::new(10);
 
         // Add order with 50 shares
         lob.process_message(&create_test_message(1, Action::Add, Side::Ask, 100.0, 50))
             .unwrap();
 
-        // Trade more than exists (100 > 50) - should remove entirely
+        // Aggregate volume can exceed one visible order and is not an order
+        // mutation command.
         lob.process_message(&create_test_message(
             1,
-            Action::Trade,
+            Action::TradeAggregate,
             Side::Ask,
             100.0,
             100,
         ))
         .unwrap();
 
-        assert_eq!(lob.order_count(), 0);
-        assert_eq!(lob.ask_levels(), 0);
+        assert_eq!(lob.order_count(), 1);
+        assert_eq!(lob.ask_levels(), 1);
+        assert_eq!(lob.get_lob_state().ask_sizes[0], 50);
     }
 
     // =========================================================================
     // Action::Clear Tests
     // =========================================================================
 
-    /// Phase O Cycle 1 / B.2a — Action::Clear MUST work under DEFAULT
-    /// config. Pre-B.2a, the inner is_system_message filter at
-    /// `process_message_into` line 1160 + the validate() check at line
-    /// 1173 silently swallowed Clear (Clear matches is_system_message
-    /// because order_id=0 AND fails validation because order_id=0).
-    /// The pre-existing `test_clear_resets_book` test below works around
-    /// this with `.with_skip_system_messages(false).with_validation(false)`
-    /// — proving the test author KNEW about the bug but routed around it.
-    /// This new test uses the DEFAULT config (both flags true) to lock
-    /// the post-B.2a behavior: Clear bypasses BOTH filters and reaches
-    /// the `Action::Clear => self.reset()` handler.
+    /// Clear is a typed book command and must work under default validation.
     #[test]
     fn b2a_action_clear_works_under_default_config() {
-        // DEFAULT config: skip_system_messages=true AND validate_messages=true.
+        // DEFAULT config: skip_noop_controls=true AND validate_messages=true.
         let mut lob = LobReconstructor::new(10);
 
         // Build up some state with valid orders.
@@ -2175,10 +2015,10 @@ mod tests {
             "B.2a: book_clears stat MUST increment by 1. \
              Pre-fix: 0 (Clear handler skipped). Post-fix: 1."
         );
-        // system_messages_skipped MUST NOT increment for Clear (Clear is
+        // noop_controls_skipped MUST NOT increment for Clear (Clear is
         // exempt from the system-message classification post-B.2a).
         assert_eq!(
-            lob.stats().system_messages_skipped,
+            lob.stats().noop_controls_skipped,
             0,
             "B.2a: Clear must NOT be counted as a system-message skip. \
              Pre-fix: Clear was wrongly counted (1). Post-fix: 0."
@@ -2247,7 +2087,7 @@ mod tests {
         );
         // Defense-in-depth: verify ALL key counters zeroed by full_reset.
         assert_eq!(lob.stats().messages_processed, 0);
-        assert_eq!(lob.stats().system_messages_skipped, 0);
+        assert_eq!(lob.stats().noop_controls_skipped, 0);
         assert_eq!(lob.stats().crossed_quotes, 0);
         // Book also reset (reset() called by full_reset() per :1382).
         assert_eq!(lob.order_count(), 0);
@@ -2264,18 +2104,14 @@ mod tests {
     }
 
     /// B.2a sanity: pre-existing `test_clear_resets_book` workaround
-    /// (with_skip_system_messages(false) + with_validation(false)) STILL
+    /// (with_skip_noop_controls(false) + with_validation(false)) STILL
     /// works post-B.2a. Locks that B.2a doesn't break the
     /// caller-explicit-config code path that some integration tests use.
     /// The actual assertions are in `test_clear_resets_book` (below);
     /// this comment is the audit pointer.
     #[test]
     fn test_clear_resets_book() {
-        // Disable validation and system message skipping since Clear uses dummy values
-        let config = LobConfig::new(10)
-            .with_logging(false)
-            .with_validation(false)
-            .with_skip_system_messages(false); // Allow order_id=0, price=0 for Clear
+        let config = LobConfig::new(10).with_logging(false);
         let mut lob = LobReconstructor::with_config(config);
 
         // Build up some state
@@ -2315,7 +2151,7 @@ mod tests {
         let config = LobConfig::new(10)
             .with_logging(false)
             .with_validation(false)
-            .with_skip_system_messages(false); // Allow price=0 for None
+            .with_skip_noop_controls(false); // Allow price=0 for None
         let mut lob = LobReconstructor::with_config(config);
 
         // Add an order
@@ -2342,8 +2178,8 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_system_messages_skipped_by_default() {
-        // Default config has skip_system_messages=true
+    fn test_noop_controls_skipped_by_default() {
+        // Default config has skip_noop_controls=true
         let mut lob = LobReconstructor::new(10);
 
         // Add a valid order first
@@ -2351,39 +2187,36 @@ mod tests {
             .unwrap();
         assert_eq!(lob.order_count(), 1);
         assert_eq!(lob.stats().messages_processed, 1);
-        assert_eq!(lob.stats().system_messages_skipped, 0);
+        assert_eq!(lob.stats().noop_controls_skipped, 0);
 
-        // System message: order_id = 0
-        let msg = MboMessage::new(0, Action::Add, Side::Bid, 100_000_000_000, 100);
+        // Only an explicit no-op is a system/control message. Invalid order
+        // shapes must fail rather than disappear into the system counter.
+        let msg = MboMessage::new(0, Action::None, Side::None, 0, 0);
         let state_before = lob.get_lob_state();
-        lob.process_message(&msg).unwrap(); // Should NOT error
-        assert_eq!(lob.get_lob_state().best_bid, state_before.best_bid); // State unchanged
-        assert_eq!(lob.stats().system_messages_skipped, 1);
-        assert_eq!(lob.stats().messages_processed, 1); // Not incremented
+        lob.process_message(&msg).unwrap();
+        assert_eq!(lob.get_lob_state().best_bid, state_before.best_bid);
+        assert_eq!(lob.stats().noop_controls_skipped, 1);
+        assert_eq!(lob.stats().messages_processed, 1);
 
-        // System message: size = 0
-        let msg = MboMessage::new(123, Action::Add, Side::Bid, 100_000_000_000, 0);
-        lob.process_message(&msg).unwrap(); // Should NOT error
-        assert_eq!(lob.stats().system_messages_skipped, 2);
-
-        // System message: price <= 0
-        let msg = MboMessage::new(123, Action::Add, Side::Bid, 0, 100);
-        lob.process_message(&msg).unwrap(); // Should NOT error
-        assert_eq!(lob.stats().system_messages_skipped, 3);
-
-        let msg = MboMessage::new(123, Action::Add, Side::Bid, -100, 100);
-        lob.process_message(&msg).unwrap(); // Should NOT error
-        assert_eq!(lob.stats().system_messages_skipped, 4);
+        for malformed in [
+            MboMessage::new(0, Action::Add, Side::Bid, 100_000_000_000, 100),
+            MboMessage::new(123, Action::Add, Side::Bid, 100_000_000_000, 0),
+            MboMessage::new(123, Action::Add, Side::Bid, 0, 100),
+            MboMessage::new(123, Action::Add, Side::Bid, -100, 100),
+        ] {
+            assert!(lob.process_message(&malformed).is_err());
+        }
+        assert_eq!(lob.stats().noop_controls_skipped, 1);
 
         // Order count should still be 1
         assert_eq!(lob.order_count(), 1);
     }
 
     #[test]
-    fn test_system_messages_not_skipped_when_disabled() {
-        // Disable system message skipping
+    fn test_explicit_noop_controls_are_processed_when_skipping_is_disabled() {
+        // Disable explicit no-op control skipping.
         let config = LobConfig::new(10)
-            .with_skip_system_messages(false)
+            .with_skip_noop_controls(false)
             .with_validation(true); // Keep validation enabled
 
         let mut lob = LobReconstructor::with_config(config);
@@ -2417,21 +2250,21 @@ mod tests {
     }
 
     #[test]
-    fn test_trade_unknown_order_is_ok() {
+    fn test_aggregate_trade_does_not_lookup_order() {
         let config = LobConfig::new(10).with_logging(false);
         let mut lob = LobReconstructor::with_config(config);
 
-        // Trade for an order that doesn't exist - should not fail
+        // Aggregate trades do not carry a resting-order identity.
         let result = lob.process_message(&create_test_message(
             999,
-            Action::Trade,
+            Action::TradeAggregate,
             Side::Bid,
             100.0,
             50,
         ));
 
         assert!(result.is_ok());
-        assert_eq!(lob.stats().trade_order_not_found, 1);
+        assert_eq!(lob.stats().aggregate_trades_observed, 1);
     }
 
     #[test]
@@ -2456,11 +2289,17 @@ mod tests {
             50,
         ))
         .unwrap();
-        lob.process_message(&create_test_message(3, Action::Trade, Side::Bid, 100.0, 50))
-            .unwrap();
+        lob.process_message(&create_test_message(
+            3,
+            Action::TradeAggregate,
+            Side::Bid,
+            100.0,
+            50,
+        ))
+        .unwrap();
 
         assert_eq!(lob.stats().cancel_order_not_found, 2);
-        assert_eq!(lob.stats().trade_order_not_found, 1);
+        assert_eq!(lob.stats().aggregate_trades_observed, 1);
     }
 
     // =========================================================================
@@ -2485,7 +2324,7 @@ mod tests {
             create_test_message(1, Action::Modify, Side::Bid, 100.0, 80),
             create_test_message(5, Action::Add, Side::Bid, 100.02, 300),
             create_test_message(2, Action::Cancel, Side::Ask, 100.05, 50),
-            create_test_message(6, Action::Trade, Side::Bid, 100.0, 30),
+            create_test_message(6, Action::TradeAggregate, Side::Bid, 100.0, 30),
         ];
 
         // Process with both APIs
@@ -2618,12 +2457,18 @@ mod tests {
         .unwrap();
         assert_eq!(lob.get_lob_state().bid_sizes[0], 470);
 
-        // Trade on order 2: remove 50 (total: 420)
-        lob.process_message(&create_test_message(2, Action::Trade, Side::Bid, 100.0, 50))
-            .unwrap();
-        assert_eq!(lob.get_lob_state().bid_sizes[0], 420);
+        // Aggregate execution does not mutate the order (total stays 470).
+        lob.process_message(&create_test_message(
+            2,
+            Action::TradeAggregate,
+            Side::Bid,
+            100.0,
+            50,
+        ))
+        .unwrap();
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 470);
 
-        // Full cancel order 3 (total: 320)
+        // Full cancel order 3 (total: 370)
         lob.process_message(&create_test_message(
             3,
             Action::Cancel,
@@ -2632,29 +2477,29 @@ mod tests {
             100,
         ))
         .unwrap();
-        assert_eq!(lob.get_lob_state().bid_sizes[0], 320);
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 370);
 
-        // Add new order at same price (total: 520)
+        // Add new order at same price (total: 570)
         lob.process_message(&create_test_message(6, Action::Add, Side::Bid, 100.0, 200))
             .unwrap();
-        assert_eq!(lob.get_lob_state().bid_sizes[0], 520);
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 570);
 
-        // Full trade on order 4 (total: 420)
+        // Another aggregate execution remains a no-op.
         lob.process_message(&create_test_message(
             4,
-            Action::Trade,
+            Action::TradeAggregate,
             Side::Bid,
             100.0,
             100,
         ))
         .unwrap();
-        assert_eq!(lob.get_lob_state().bid_sizes[0], 420);
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 570);
 
-        // Verify remaining orders: 1 (70), 2 (50), 5 (100), 6 (200) = 420
-        assert_eq!(lob.order_count(), 4);
+        // Remaining: 1 (70), 2 (100), 4 (100), 5 (100), 6 (200) = 570.
+        assert_eq!(lob.order_count(), 5);
         assert_eq!(lob.bid_levels(), 1);
 
-        // Verify order 1 has 70, order 2 has 50
+        // Verify order 1 has 70, order 2 has 100.
         // (This tests that partial operations didn't corrupt individual order sizes)
     }
 
@@ -2718,7 +2563,7 @@ mod tests {
                 // Trade
                 messages.push(create_test_message(
                     target_order,
-                    Action::Trade,
+                    Action::TradeAggregate,
                     Side::Bid,
                     base_bid,
                     25,
@@ -2776,7 +2621,7 @@ mod tests {
         // against future additive fields.
         let stats = LobStats {
             messages_processed: 1_000_000,
-            system_messages_skipped: 42,
+            noop_controls_skipped: 42,
             active_orders: 500,
             bid_levels: 10,
             ask_levels: 10,
@@ -2786,9 +2631,8 @@ mod tests {
             cancel_order_not_found: 15,
             cancel_price_level_missing: 4,
             cancel_order_at_level_missing: 1,
-            trade_order_not_found: 20,
-            trade_price_level_missing: 5,
-            trade_order_at_level_missing: 2,
+            aggregate_trades_observed: 30,
+            resting_fills_observed: 25,
             modify_order_not_found: 8,
             add_order_id_collision: 6,
             book_clears: 1,
@@ -2803,7 +2647,7 @@ mod tests {
         let loaded = LobStats::load_from_file(&path).unwrap();
 
         assert_eq!(loaded.messages_processed, 1_000_000);
-        assert_eq!(loaded.system_messages_skipped, 42);
+        assert_eq!(loaded.noop_controls_skipped, 42);
         assert_eq!(loaded.active_orders, 500);
         assert_eq!(loaded.bid_levels, 10);
         assert_eq!(loaded.ask_levels, 10);
@@ -2813,9 +2657,8 @@ mod tests {
         assert_eq!(loaded.cancel_order_not_found, 15);
         assert_eq!(loaded.cancel_price_level_missing, 4);
         assert_eq!(loaded.cancel_order_at_level_missing, 1);
-        assert_eq!(loaded.trade_order_not_found, 20);
-        assert_eq!(loaded.trade_price_level_missing, 5);
-        assert_eq!(loaded.trade_order_at_level_missing, 2);
+        assert_eq!(loaded.aggregate_trades_observed, 30);
+        assert_eq!(loaded.resting_fills_observed, 25);
         assert_eq!(loaded.modify_order_not_found, 8);
         assert_eq!(loaded.add_order_id_collision, 6);
         assert_eq!(loaded.book_clears, 1);
@@ -2840,9 +2683,8 @@ mod tests {
         // Phase M M.A.5: envelope wrapper added — every key now lives under
         // `parsed["stats"][...]`. Schema version is locked at the top level.
         // Phase M M.A.4: `errors` field REMOVED (F-007). The new
-        // `modify_order_not_found` + `add_order_id_collision` counters use
-        // `#[serde(default)]` so they default to 0 in the JSON when omitted
-        // — included here to lock the wire-format key names.
+        // Every v3 payload field is required on decode. These assertions lock
+        // the wire-format key names emitted even for an all-zero state.
         assert_eq!(parsed["schema_version"], LOB_STATS_SCHEMA_VERSION);
         assert_eq!(parsed["stats"]["messages_processed"], 0);
         assert_eq!(parsed["stats"]["modify_order_not_found"], 0);
@@ -2946,19 +2788,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lobstats_load_legacy_format() {
-        // Phase M M.A.5: dual-format read. `load_from_file` accepts both
-        // envelope (post-2.0.0) AND legacy (pre-2.0.0 flat) shapes. The
-        // legacy branch logs a WARN with calendar 2026-10-29 removal note
-        // (not asserted here — log-capture would couple to env_logger
-        // initialization). Asserts: a FLAT (non-envelope) JSON parses cleanly
-        // into a valid LobStats with non-default values preserved.
-        //
-        // Realism: the pre-M.A.5 serializer wrote `serde_json::to_writer_pretty(
-        // &LobStats)` directly — i.e., a flat object containing ALL serde
-        // fields. Therefore we construct the legacy fixture by serializing a
-        // populated LobStats DIRECTLY (bypassing the envelope wrapper), then
-        // assert `load_from_file` recovers it.
+    fn test_lobstats_load_legacy_format_is_rejected() {
         let dir = std::env::temp_dir().join("lobstats_legacy_load_test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("legacy.json");
@@ -2988,14 +2818,78 @@ mod tests {
         );
         assert!(parsed.get("messages_processed").is_some());
 
-        // Dual-format reader recovers the original.
-        let loaded = LobStats::load_from_file(&path).unwrap();
-        assert_eq!(loaded.messages_processed, 99);
-        assert_eq!(loaded.modify_order_not_found, 4);
-        assert_eq!(loaded.add_order_id_collision, 2);
-        assert_eq!(loaded.last_timestamp, Some(1_700_000_000_000_000_000));
+        assert!(
+            LobStats::load_from_file(&path).is_err(),
+            "schema-less historical stats must not be reinterpreted as v3"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_lobstats_load_rejects_wrong_schema_version() {
+        let dir = std::env::temp_dir().join("lobstats_wrong_schema_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wrong-schema.json");
+
+        let mut envelope = serde_json::json!({
+            "schema_version": LOB_STATS_SCHEMA_VERSION,
+            "stats": LobStats::default(),
+        });
+        envelope["schema_version"] = serde_json::Value::String("2.0.0".into());
+        std::fs::write(&path, serde_json::to_vec_pretty(&envelope).unwrap()).unwrap();
+
+        let error = LobStats::load_from_file(&path).unwrap_err();
+        assert!(error.to_string().contains("expected 3.0.0, observed 2.0.0"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_lobstats_load_rejects_old_counter_name() {
+        let dir = std::env::temp_dir().join("lobstats_old_counter_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old-counter.json");
+
+        let mut envelope = serde_json::json!({
+            "schema_version": LOB_STATS_SCHEMA_VERSION,
+            "stats": LobStats::default(),
+        });
+        let stats = envelope["stats"].as_object_mut().unwrap();
+        stats.remove("noop_controls_skipped");
+        stats.insert("system_messages_skipped".into(), 17_u64.into());
+        std::fs::write(&path, serde_json::to_vec_pretty(&envelope).unwrap()).unwrap();
+
+        assert!(
+            LobStats::load_from_file(&path).is_err(),
+            "historical system-message population must not become no-op controls"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_lobstats_v3_rejects_every_retired_trade_anomaly_key() {
+        for retired in [
+            "trade_order_not_found",
+            "trade_price_level_missing",
+            "trade_order_at_level_missing",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("{retired}.json"));
+            let mut envelope = serde_json::json!({
+                "schema_version": LOB_STATS_SCHEMA_VERSION,
+                "stats": LobStats::default(),
+            });
+            envelope["stats"]
+                .as_object_mut()
+                .unwrap()
+                .insert(retired.to_string(), 1_u64.into());
+            std::fs::write(&path, serde_json::to_vec_pretty(&envelope).unwrap()).unwrap();
+
+            assert!(
+                LobStats::load_from_file(&path).is_err(),
+                "valid-v3 envelope accepted retired key {retired}"
+            );
+        }
     }
 
     #[test]
@@ -3017,7 +2911,7 @@ mod tests {
         let malformed_json = r#"{
             "schema_version": "2.0.0",
             "messages_processed": 99,
-            "system_messages_skipped": 0,
+            "noop_controls_skipped": 0,
             "active_orders": 0,
             "bid_levels": 0,
             "ask_levels": 0,
@@ -3042,12 +2936,8 @@ mod tests {
         );
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("malformed envelope"),
-            "error message must cite 'malformed envelope'; got: {err_msg}"
-        );
-        assert!(
-            err_msg.contains("`stats` wrapper missing"),
-            "error message must cite missing `stats` wrapper; got: {err_msg}"
+            err_msg.contains("unknown field") || err_msg.contains("missing field"),
+            "strict envelope error must identify a structural mismatch; got: {err_msg}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3169,6 +3059,22 @@ mod tests {
         LobConfig::new(1).validate().unwrap();
         LobConfig::new(10).validate().unwrap();
         LobConfig::new(MAX_LOB_LEVELS).validate().unwrap();
+    }
+
+    #[test]
+    fn test_lob_config_rejects_legacy_control_name_and_unknown_fields() {
+        let mut legacy = serde_json::to_value(LobConfig::default()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("skip_noop_controls");
+        object.insert("skip_system_messages".into(), true.into());
+        assert!(serde_json::from_value::<LobConfig>(legacy).is_err());
+
+        let mut unknown = serde_json::to_value(LobConfig::default()).unwrap();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("silently_fix_data".into(), true.into());
+        assert!(serde_json::from_value::<LobConfig>(unknown).is_err());
     }
 
     #[test]

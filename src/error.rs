@@ -35,18 +35,16 @@ pub enum TlobError {
     #[error("Invalid size: {0}")]
     InvalidSize(u32),
 
-    /// Invalid timestamp (zero, negative, or u64→i64 overflow).
-    ///
-    /// Phase M M.A.6 (REV 3 F-023 closure): Databento DBN feeds occasionally
-    /// emit `hd.ts_event = 0` as a sentinel for "no timestamp" (e.g., on
-    /// session-control messages). Pre-M.A.6, [`crate::dbn_bridge::DbnBridge::convert`]
-    /// silently coerced this to `Some(0)`, propagating the sentinel as if it
-    /// were a real wall-clock timestamp. Post-M.A.6 the conversion fails-loud
-    /// with this variant, which the `TypedMessageIterator` then wraps as
-    /// [`crate::loader::BoundaryError::Convert`]. Per hft-rules §8 — never
-    /// silently coerce; surface the anomaly so consumers can decide policy.
+    /// Timestamp cannot be represented by the legacy signed-clock surface.
+    /// Zero is a present timestamp; an undefined DBN timestamp lies outside
+    /// this surface and therefore fails rather than becoming `None`.
     #[error("Invalid timestamp: {0}")]
     InvalidTimestamp(i64),
+
+    /// Unsigned source timestamp cannot be represented by the legacy signed
+    /// `MboMessage` clock without information loss.
+    #[error("Timestamp is outside the legacy i64 range: {0}")]
+    TimestampOutOfRange(u64),
 
     /// Invalid action type
     #[error("Invalid action: {0}")]

@@ -1,7 +1,7 @@
 //! Limit Order Book (LOB) reconstruction module.
 //!
 //! This module provides high-performance LOB reconstruction from MBO (Market-By-Order)
-//! events. It converts individual order events (Add, Modify, Cancel, Trade) into
+//! events. It converts authoritative order events (Add, Modify, Cancel, Clear) into
 //! aggregated price level snapshots.
 //!
 //! # Core Components
@@ -22,7 +22,7 @@
 //! ```ignore
 //! use mbo_lob_reconstructor::{LobReconstructor, LobConfig};
 //!
-//! // Create with default config (10 levels, skip system messages)
+//! // Create with default config (10 levels, skip explicit no-op controls)
 //! let mut lob = LobReconstructor::new(10);
 //!
 //! // Process messages
@@ -33,7 +33,7 @@
 //!
 //! // Check statistics
 //! println!("Processed: {}", lob.stats().messages_processed);
-//! println!("System messages skipped: {}", lob.stats().system_messages_skipped);
+//! println!("No-op controls skipped: {}", lob.stats().noop_controls_skipped);
 //! ```
 //!
 //! ## High-Performance Zero-Allocation Pattern
@@ -70,31 +70,20 @@
 //! }
 //! ```
 //!
-//! # System Messages
+//! # Compatibility controls
 //!
-//! DBN/MBO data contains system messages (order_id=0, heartbeats, status updates)
-//! that are not valid orders. By default, `LobConfig::skip_system_messages = true`
-//! causes these to be silently skipped. The count is tracked in
-//! `LobStats::system_messages_skipped`.
+//! Only explicit `Action::None` records are skipped as no-op controls. Field
+//! shapes are never used to hide malformed order commands or aggregate trades.
+//! The former message-at-a-time queue, lifecycle, and trade-aggregation modules
+//! are not part of the v1 crate surface: they cannot retain strict envelope
+//! custody, causal availability, or publisher-qualified queue policy.
 
 pub mod day_boundary;
 mod multi_symbol;
-pub mod order_lifecycle;
 pub mod price_level;
-pub mod queue_position;
 pub mod reconstructor;
-pub mod trade_aggregator;
 
 pub use day_boundary::{DayBoundary, DayBoundaryConfig, DayBoundaryDetector, DayBoundaryStats};
 pub use multi_symbol::MultiSymbolLob;
-pub use order_lifecycle::{
-    ActiveOrderFeatures, CompletionStats, LifecycleEvent, LifecycleStats, OrderLifecycle,
-    OrderLifecycleConfig, OrderLifecycleTracker, OrderModification, OrderOrigin, TerminalState,
-};
 pub use price_level::PriceLevel;
-pub use queue_position::{
-    PositionChange, PositionChangeReason, QueuePositionConfig, QueuePositionInfo,
-    QueuePositionTracker, QueueStats,
-};
 pub use reconstructor::{CrossedQuotePolicy, LobConfig, LobReconstructor, LobStats};
-pub use trade_aggregator::{Fill, Trade, TradeAggregator, TradeAggregatorConfig};

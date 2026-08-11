@@ -1,134 +1,12 @@
 //! # MBO-LOB-Reconstructor
 //!
-//! High-performance MBO → LOB reconstruction and analytics for deep learning preprocessing.
+//! Source-bound MBO decoding and exact XNAS order-book reconstruction.
 //!
-//! This library converts Market-By-Order (MBO) data streams into Limit Order Book (LOB)
-//! snapshots with enriched analytics, designed specifically as a preprocessing step for
-//! deep learning models (DeepLOB, TLOB, Transformers, CNN-LSTM, etc.).
-//!
-//! ## Features
-//!
-//! - **🚀 High Performance**: Process ~1M messages/second on modern hardware
-//! - **📊 MBO → LOB Reconstruction**: Convert order-level events to aggregated price levels
-//! - **🔬 Enriched Analytics**: Microprice, VWAP, depth imbalance, spread metrics
-//! - **✅ Book Consistency Validation**: Detect and handle crossed/locked quotes
-//! - **📈 Statistics Tracking**: Per-day statistics with Welford's algorithm
-//! - **🎯 ML-Ready**: NormalizationParams, DayStats, and feature extraction utilities
-//! - **📦 Databento Support**: Native support for compressed DBN files
-//!
-//! ### Performance Optimizations
-//!
-//! - **Zero-Allocation API**: Use `process_message_into()` to reuse `LobState` buffers
-//! - **Stack-Allocated `LobState`**: Fixed-size arrays instead of `Vec` (~30-50% faster)
-//! - **O(1) Price Level Size**: `PriceLevel` caches aggregate size (no more `values().sum()`)
-//! - **Zero-Copy DBN Parsing**: `MessageIterator` extracts fields without cloning
-//!
-//! ## Quick Start
-//!
-//! ### Basic LOB Reconstruction
-//!
-//! ```rust
-//! use mbo_lob_reconstructor::{LobReconstructor, MboMessage, Action, Side, constants::NANODOLLARS_PER_DOLLAR_F64};
-//!
-//! // Create LOB reconstructor with 10 price levels
-//! let mut lob = LobReconstructor::new(10);
-//!
-//! // Process MBO messages
-//! let msg = MboMessage::new(
-//!     1001,                    // order_id
-//!     Action::Add,             // action
-//!     Side::Bid,               // side
-//!     100_000_000_000,         // price ($100.00 in fixed-point)
-//!     100,                     // size
-//! );
-//!
-//! let state = lob.process_message(&msg).unwrap();
-//!
-//! // Access LOB state
-//! if let Some(bid) = state.best_bid {
-//!     println!("Best Bid: ${:.2}", bid as f64 / NANODOLLARS_PER_DOLLAR_F64);
-//! }
-//! ```
-//!
-//! ### Load from Databento DBN Files
-//!
-//! ```ignore
-//! use mbo_lob_reconstructor::{DbnLoader, LobReconstructor, DayStats, NormalizationParams};
-//!
-//! // Load compressed DBN file
-//! let loader = DbnLoader::new("data/NVDA.mbo.dbn.zst")?
-//!     .skip_invalid(true);
-//!
-//! let mut lob = LobReconstructor::new(10);
-//! let mut day_stats = DayStats::new("2025-02-03");
-//!
-//! // Process all messages
-//! for msg in loader.iter_messages()? {
-//!     let state = lob.process_message(&msg)?;
-//!     day_stats.update(&state);
-//! }
-//!
-//! // Get normalization parameters for ML
-//! let norm_params = NormalizationParams::from_day_stats(&day_stats, 10);
-//! norm_params.save_json("normalization.json")?;
-//! ```
-//!
-//! ### Advanced Analytics
-//!
-//! ```rust
-//! use mbo_lob_reconstructor::{LobState, DepthStats, MarketImpact, LiquidityMetrics, Side};
-//!
-//! // Create a sample state for demonstration
-//! let mut state = LobState::new(5);
-//! // LobState uses fixed-size arrays (not Vec) for zero-allocation performance
-//! state.bid_prices[0] = 100_000_000_000;  // $100.00
-//! state.bid_prices[1] = 99_990_000_000;   // $99.99
-//! state.bid_sizes[0] = 100;
-//! state.bid_sizes[1] = 200;
-//! state.ask_prices[0] = 100_010_000_000;  // $100.01
-//! state.ask_prices[1] = 100_020_000_000;  // $100.02
-//! state.ask_sizes[0] = 150;
-//! state.ask_sizes[1] = 100;
-//! state.best_bid = Some(100_000_000_000);
-//! state.best_ask = Some(100_010_000_000);
-//!
-//! // Per-side depth statistics
-//! let bid_stats = DepthStats::from_lob_state(&state, Side::Bid);
-//! println!("Bid VWAP: ${:.4}", bid_stats.weighted_avg_price);
-//!
-//! // Market impact simulation
-//! let impact = MarketImpact::simulate_buy(&state, 100);
-//! println!("Slippage: {:.2} bps", impact.slippage_bps);
-//!
-//! // Combined liquidity metrics
-//! let metrics = LiquidityMetrics::from_lob_state(&state);
-//! println!("Spread: {:.2} bps", metrics.spread_bps);
-//! ```
-//!
-//! ### High-Performance Zero-Allocation Processing
-//!
-//! For maximum throughput (real-time or batch processing), use the zero-allocation API:
-//!
-//! ```ignore
-//! use mbo_lob_reconstructor::{LobReconstructor, LobState, DbnLoader};
-//!
-//! // Create reconstructor and reusable state buffer
-//! let mut lob = LobReconstructor::new(10);
-//! let mut state = LobState::new(10);  // Stack-allocated, reused across all messages
-//!
-//! // Load and process
-//! let loader = DbnLoader::new("data/NVDA.mbo.dbn.zst")?;
-//!
-//! for msg in loader.iter_messages()? {
-//!     // Zero-allocation: fills existing state buffer in-place
-//!     lob.process_message_into(&msg, &mut state)?;
-//!
-//!     // Use state without any heap allocation overhead
-//!     if let Some(mid) = state.mid_price() {
-//!         // ... process mid-price
-//!     }
-//! }
-//! ```
+//! The strict API binds opened bytes to an expected source identity, validates
+//! XNAS event and envelope semantics, and emits transactionally committed book
+//! observations plus terminal custody receipts. The pathname-only compatibility
+//! loader was removed because physical EOF alone cannot prove a complete source
+//! object. Qualified file replay starts at [`StrictDbnLoaderV1`].
 //!
 //! ## Module Overview
 //!
@@ -136,20 +14,18 @@
 //! |--------|-------------|
 //! | [`types`] | Core types: `MboMessage`, `LobState`, `Action`, `Side`, `MAX_LOB_LEVELS` |
 //! | [`lob`] | LOB reconstruction: `LobReconstructor`, `MultiSymbolLob`, `PriceLevel` |
-//! | [`statistics`] | ML statistics: `DayStats`, `RunningStats`, `NormalizationParams` |
+//! | [`statistics`] | Descriptive LOB statistics: `DayStats`, `RunningStats` |
 //! | [`analytics`] | Advanced analytics: `DepthStats`, `MarketImpact`, `LiquidityMetrics` |
-//! | [`loader`] | DBN file loading (requires `databento` feature) |
+//! | [`loader`] | Source-bound DBN loading (requires `databento` feature) |
 //! | [`dbn_bridge`] | Databento format conversion (requires `databento` feature) |
 //! | [`warnings`] | Warning tracking: `WarningTracker`, `Warning`, `WarningCategory` |
 //! | [`constants`] | Domain constants: price/time conversion, financial units, numerical precision |
-//! | `export` | Parquet export for raw LOB/MBO data (requires `export` feature) |
 //!
 //! ## Feature Flags
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
 //! | `databento` | ✅ | Enable Databento DBN file support |
-//! | `export` | ❌ | Enable Apache Parquet export for LOB snapshots and MBO events |
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -176,15 +52,7 @@ mod canonical_dbn;
 
 #[cfg(feature = "databento")]
 #[cfg_attr(docsrs, doc(cfg(feature = "databento")))]
-pub mod hotstore;
-
-#[cfg(feature = "databento")]
-#[cfg_attr(docsrs, doc(cfg(feature = "databento")))]
 pub mod loader;
-
-#[cfg(feature = "export")]
-#[cfg_attr(docsrs, doc(cfg(feature = "export")))]
-pub mod export;
 
 // Re-exports - Constants
 pub use constants::{
@@ -199,6 +67,15 @@ pub use types::{Action, BookConsistency, LobState, MboMessage, Order, Side, MAX_
 // Re-exports - LOB reconstruction
 pub use lob::{CrossedQuotePolicy, LobConfig, LobReconstructor, LobStats, MultiSymbolLob};
 
+// Re-export the exact canonical event vocabulary through the reconstructor
+// facade so downstream adapters cannot accidentally resolve an independently
+// moving copy of the semantic contract.
+pub use hft_mbo_event_contract::{
+    AggressorSideV1, EventDispositionV1, ExecutionCarrierV1, LogicalSourceV1, Sha256DigestV1,
+    CANONICAL_MBO_EVENT_CONTRACT_ID, CANONICAL_MBO_EVENT_CONTRACT_SHA256,
+    CANONICAL_MBO_EVENT_SCHEMA_VERSION, XNAS_ITCH_HISTORICAL_PUBLISHER_IDS_V1,
+};
+
 // Re-exports - LobStats wire-format (Phase M M.A.5: envelope wrapper + schema version).
 // Exposed at crate root for external consumers reading `_reconstruction_stats.json`.
 pub use lob::reconstructor::{LobStatsExportEnvelope, LOB_STATS_SCHEMA_VERSION};
@@ -206,23 +83,8 @@ pub use lob::reconstructor::{LobStatsExportEnvelope, LOB_STATS_SCHEMA_VERSION};
 // Re-exports - Day Boundary Detection
 pub use lob::{DayBoundary, DayBoundaryConfig, DayBoundaryDetector, DayBoundaryStats};
 
-// Re-exports - Trade Aggregation
-pub use lob::{Fill, Trade, TradeAggregator, TradeAggregatorConfig};
-
-// Re-exports - Order Lifecycle Tracking
-pub use lob::{
-    ActiveOrderFeatures, CompletionStats, LifecycleEvent, LifecycleStats, OrderLifecycle,
-    OrderLifecycleConfig, OrderLifecycleTracker, OrderModification, OrderOrigin, TerminalState,
-};
-
-// Re-exports - Queue Position Tracking
-pub use lob::{
-    PositionChange, PositionChangeReason, QueuePositionConfig, QueuePositionInfo,
-    QueuePositionTracker, QueueStats,
-};
-
-// Re-exports - Statistics for ML
-pub use statistics::{DayStats, NormalizationParams, RunningStats};
+// Re-exports - descriptive statistics. Normalization belongs to the extractor.
+pub use statistics::{DayStats, RunningStats};
 
 // Re-exports - Analytics
 pub use analytics::{DepthStats, LiquidityMetrics, MarketImpact};
@@ -235,9 +97,6 @@ pub use warnings::{
 // Re-exports - Source abstraction
 pub use source::{MarketDataSource, SourceMetadata, VecSource};
 
-#[cfg(feature = "databento")]
-pub use source::DbnSource;
-
 // Re-exports - Databento support (feature-gated)
 #[cfg(feature = "databento")]
 pub use dbn_bridge::DbnBridge;
@@ -246,34 +105,29 @@ pub use dbn_bridge::DbnBridge;
 pub use canonical_dbn::CanonicalProjectionErrorV1;
 
 #[cfg(feature = "databento")]
-pub use hotstore::{HotStoreConfig, HotStoreManager};
-
-#[cfg(feature = "databento")]
 pub use xnas::{
     BookTransactionErrorV1, StrictXnasReplayV1, XnasBookCommitV1, XnasBookLevelV1,
-    XnasBookSnapshotV1, XnasEnvelopeErrorV1, XnasEofTailQuarantineV1, XnasEofTailReasonV1,
-    XnasIdentityReplayReceiptV1, XnasIdentityV1, XnasInvalidStateQuarantinedRecordV1,
+    XnasBookSnapshotV1, XnasCommittedObservationAccumulatorV1, XnasCommittedObservationClosureV1,
+    XnasEnvelopeErrorV1, XnasEofTailQuarantineV1, XnasEofTailReasonV1, XnasIdentityReplayReceiptV1,
+    XnasIdentityV1, XnasInvalidStateQuarantinedRecordV1, XnasObservationAccountingErrorV1,
     XnasPendingEnvelopeObservationV1, XnasQualifiedReplayPlanV1, XnasQuarantineReasonV1,
     XnasRecoveryQualificationV1, XnasRejectedRecordPhaseV1, XnasRejectedRecordQuarantineV1,
     XnasReplayBuildIdentityV1, XnasReplayConfigV1, XnasReplayCountsV1,
     XnasReplayEquivalenceReceiptV1, XnasReplayErrorV1, XnasReplayPrefixFailureV1,
-    XnasReplayReceiptV1, XnasReplayRevalidationPassV1, XnasReplayRunV1, XnasReplayTraceV1,
+    XnasReplayProbeRequestErrorV1, XnasReplayProbeRequestV1, XnasReplayReceiptV1,
+    XnasReplayRevalidationPassV1, XnasReplayRunV1, XnasReplayTraceV1,
     XnasResetBoundaryQuarantineV1, XnasSelectedOrdinalDispositionV1, XnasSelectedOrdinalRoleV1,
     XnasSemanticQuarantineIncidentV1, XnasTerminalDisqualificationReasonV1,
-    XnasTerminalDisqualificationV1, XnasTerminalIdentityStatusV1, XnasValidityEpochQualificationV1,
-    XnasValidityEpochV1, XnasValidityInvalidationReasonV1, XnasValidityInvalidationV1,
+    XnasTerminalDisqualificationV1, XnasTerminalIdentityStatusV1,
+    XnasUnboundDevelopmentReplayPlanV1, XnasValidityEpochQualificationV1, XnasValidityEpochV1,
+    XnasValidityInvalidationReasonV1, XnasValidityInvalidationV1,
 };
 
 #[cfg(feature = "databento")]
-#[allow(deprecated)]
 pub use loader::{
-    is_valid_order, BoundaryError, CanonicalReadReceiptV1, CanonicalSourceExpectationV1, DbnLoader,
-    LoaderStats, StrictBoundaryErrorV1, StrictDbnLoaderV1, StrictMboEventIteratorV1,
-    TypedMessageIterator, VerifiedInstrumentIdentityV1, VerifiedRejectedStreamEventV1,
-    VerifiedRejectionStageV1, VerifiedStreamEventV1, VerifiedStreamRecordV1,
-    XnasDailyMetadataBindingV1, IO_BUFFER_SIZE,
+    CanonicalReadReceiptV1, CanonicalSourceExpectationV1, StrictBoundaryErrorV1, StrictDbnLoaderV1,
+    StrictMboEventIteratorV1, VerifiedRejectedStreamEventV1, VerifiedRejectionStageV1,
+    VerifiedStreamEventV1, VerifiedStreamRecordV1, XnasDailyMetadataBindingV1,
+    XnasDailyMetadataExpectationV1, XnasExpectedInstrumentIdentityV1,
+    XnasPolicyBoundInstrumentIdentityV1, IO_BUFFER_SIZE,
 };
-
-// Re-exports - Parquet export (feature-gated)
-#[cfg(feature = "export")]
-pub use export::{ExportConfig, LobSnapshotWriter, MboEventWriter, ParquetExportStats};

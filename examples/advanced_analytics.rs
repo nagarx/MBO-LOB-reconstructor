@@ -3,7 +3,7 @@
 //! This example demonstrates all the new analytics features:
 //! - Book consistency validation
 //! - Enriched LOB analytics (microprice, VWAP, depth imbalance)
-//! - DayStats for normalization tracking
+//! - DayStats for descriptive reconstruction measurements
 //! - DepthStats for per-side analysis
 //! - MarketImpact simulation
 //! - LiquidityMetrics for comprehensive analysis
@@ -13,7 +13,7 @@
 use mbo_lob_reconstructor::constants::{BASIS_POINTS_PER_UNIT, NANODOLLARS_PER_DOLLAR_F64};
 use mbo_lob_reconstructor::{
     Action, CrossedQuotePolicy, DayStats, DepthStats, LiquidityMetrics, LobConfig,
-    LobReconstructor, LobState, MarketImpact, MboMessage, NormalizationParams, Side,
+    LobReconstructor, LobState, MarketImpact, MboMessage, Side,
 };
 
 fn main() {
@@ -39,7 +39,7 @@ fn main() {
     // 5. LiquidityMetrics
     demo_liquidity_metrics(&state);
 
-    // 6. DayStats and Normalization
+    // 6. DayStats
     demo_day_stats();
 
     println!("═══════════════════════════════════════════════════════════════");
@@ -358,10 +358,10 @@ fn demo_liquidity_metrics(state: &LobState) {
     println!();
 }
 
-/// Demonstrate DayStats and NormalizationParams
+/// Demonstrate descriptive DayStats.
 fn demo_day_stats() {
     println!("┌─────────────────────────────────────────────────────────────┐");
-    println!("│  6. DAY STATISTICS & NORMALIZATION                          │");
+    println!("│  6. DAY STATISTICS                                          │");
     println!("└─────────────────────────────────────────────────────────────┘\n");
 
     let mut day_stats = DayStats::new("2025-02-03");
@@ -373,7 +373,7 @@ fn demo_day_stats() {
         (1001, Action::Add, Side::Bid, 100.00, 500),
         (2001, Action::Add, Side::Ask, 100.01, 400),
         // Trade
-        (1001, Action::Trade, Side::Bid, 100.00, 100),
+        (1001, Action::TradeAggregate, Side::Bid, 100.00, 100),
         // Add more depth
         (1002, Action::Add, Side::Bid, 99.99, 300),
         (2002, Action::Add, Side::Ask, 100.02, 600),
@@ -419,24 +419,6 @@ fn demo_day_stats() {
     println!("\n  📊 Spread Statistics:");
     println!("     Spread Mean:      ${:.6}", day_stats.spread.mean);
     println!("     Spread (bps):     {:.2}", day_stats.spread_bps.mean);
-
-    // Create normalization parameters
-    let norm_params = NormalizationParams::from_day_stats(&day_stats, 10);
-
-    println!("\n  🔧 Normalization Parameters:");
-    println!("     Feature Count:    {}", norm_params.means.len());
-    println!("     Sample Count:     {}", norm_params.sample_count);
-    println!("     Source:           {}", norm_params.source);
-
-    // Show sample normalization
-    let test_price = 100.0;
-    let normalized = norm_params.normalize(test_price, 0);
-    let denormalized = norm_params.denormalize(normalized, 0);
-
-    println!("\n  📐 Normalization Example:");
-    println!("     Original:         ${test_price:.4}");
-    println!("     Normalized:       {normalized:.4} (z-score)");
-    println!("     Denormalized:     ${denormalized:.4}");
 
     println!();
 }

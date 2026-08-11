@@ -8,13 +8,152 @@
 //! equivalence, not vendor-semantic correctness or publication eligibility.
 
 use super::{
-    StrictXnasReplayV1, XnasBookCommitV1, XnasIdentityV1, XnasReplayErrorV1, XnasReplayReceiptV1,
+    initial_committed_observation_chain, next_committed_observation_chain, StrictXnasReplayV1,
+    XnasBookCommitV1, XnasIdentityV1, XnasReplayConfigV1, XnasReplayErrorV1, XnasReplayReceiptV1,
     XnasReplayTraceV1,
 };
-use crate::loader::{CanonicalSourceExpectationV1, StrictDbnLoaderV1};
+use crate::loader::{
+    CanonicalSourceExpectationV1, StrictBoundaryErrorV1, StrictDbnLoaderV1,
+    XnasDailyMetadataExpectationV1,
+};
 use hft_mbo_event_contract::{EventDispositionV1, PublisherPolicyIdV1, Sha256DigestV1};
 use serde::Serialize;
 use std::sync::Arc;
+use thiserror::Error;
+
+/// Consumer-side closure over the exact pass-two observation population.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XnasCommittedObservationClosureV1 {
+    observations_consumed: u64,
+    terminal_chain_sha256: Sha256DigestV1,
+}
+
+impl XnasCommittedObservationClosureV1 {
+    pub const fn observations_consumed(self) -> u64 {
+        self.observations_consumed
+    }
+
+    pub const fn terminal_chain_sha256(self) -> Sha256DigestV1 {
+        self.terminal_chain_sha256
+    }
+}
+
+/// Reconstructor-owned verifier for the observations a consumer actually saw.
+///
+/// Merely retaining the final upstream chain value would not detect a consumer
+/// that skipped an intermediate observation. This accumulator recomputes every
+/// link and closes against the terminal receipt.
+pub struct XnasCommittedObservationAccumulatorV1 {
+    qualification_receipt: XnasReplayReceiptV1,
+    source_digest: Sha256DigestV1,
+    chain: Sha256DigestV1,
+    observations_consumed: u64,
+    last_source_ordinal: Option<u64>,
+    last_effective_available_ns: Option<u64>,
+}
+
+impl XnasCommittedObservationAccumulatorV1 {
+    pub fn new(receipt: &XnasReplayReceiptV1) -> Self {
+        let source_digest = receipt.source().source().logical.compressed_sha256;
+        let config = receipt.config();
+        Self {
+            qualification_receipt: receipt.clone(),
+            source_digest,
+            chain: initial_committed_observation_chain(source_digest, config),
+            observations_consumed: 0,
+            last_source_ordinal: None,
+            last_effective_available_ns: None,
+        }
+    }
+
+    pub fn observe(
+        &mut self,
+        observation: &XnasPendingEnvelopeObservationV1,
+    ) -> Result<(), XnasObservationAccountingErrorV1> {
+        if observation.source_object_sha256() != self.source_digest {
+            return Err(XnasObservationAccountingErrorV1::SourceMismatch);
+        }
+        if self
+            .last_source_ordinal
+            .is_some_and(|last| observation.first_source_ordinal() <= last)
+        {
+            return Err(XnasObservationAccountingErrorV1::OrdinalRegression {
+                previous_last: self.last_source_ordinal.expect("checked as Some"),
+                observed_first: observation.first_source_ordinal(),
+            });
+        }
+        if self
+            .last_effective_available_ns
+            .is_some_and(|last| observation.effective_available_ns() < last)
+        {
+            return Err(XnasObservationAccountingErrorV1::AvailabilityRegression {
+                previous: self.last_effective_available_ns.expect("checked as Some"),
+                observed: observation.effective_available_ns(),
+            });
+        }
+        let expected = next_committed_observation_chain(
+            self.chain,
+            observation.committed_observation_sha256(),
+        );
+        if observation.committed_observation_chain_sha256() != expected {
+            return Err(XnasObservationAccountingErrorV1::ChainMismatch);
+        }
+        self.chain = expected;
+        self.observations_consumed = self
+            .observations_consumed
+            .checked_add(1)
+            .ok_or(XnasObservationAccountingErrorV1::CountOverflow)?;
+        self.last_source_ordinal = Some(observation.last_source_ordinal());
+        self.last_effective_available_ns = Some(observation.effective_available_ns());
+        Ok(())
+    }
+
+    pub fn finish(
+        self,
+        equivalence: &XnasReplayEquivalenceReceiptV1,
+    ) -> Result<XnasCommittedObservationClosureV1, XnasObservationAccountingErrorV1> {
+        let receipt = equivalence.exact_receipt();
+        if receipt != &self.qualification_receipt {
+            return Err(XnasObservationAccountingErrorV1::ReceiptBindingMismatch);
+        }
+        if self.observations_consumed != receipt.counts().completed_update_envelopes {
+            return Err(XnasObservationAccountingErrorV1::ObservationCountMismatch {
+                expected: receipt.counts().completed_update_envelopes,
+                observed: self.observations_consumed,
+            });
+        }
+        if self.chain != receipt.committed_observation_chain_sha256() {
+            return Err(XnasObservationAccountingErrorV1::TerminalChainMismatch);
+        }
+        Ok(XnasCommittedObservationClosureV1 {
+            observations_consumed: self.observations_consumed,
+            terminal_chain_sha256: self.chain,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum XnasObservationAccountingErrorV1 {
+    #[error("observation source digest differs from the qualified receipt")]
+    SourceMismatch,
+    #[error("observation ordinals overlap or regress: previous_last={previous_last}, observed_first={observed_first}")]
+    OrdinalRegression {
+        previous_last: u64,
+        observed_first: u64,
+    },
+    #[error("observation causal availability regressed: previous={previous}, observed={observed}")]
+    AvailabilityRegression { previous: u64, observed: u64 },
+    #[error("observation rolling-chain link does not match the independently recomputed link")]
+    ChainMismatch,
+    #[error("observation count overflow")]
+    CountOverflow,
+    #[error("completed equivalence receipt differs from the qualification receipt bound to this accumulator")]
+    ReceiptBindingMismatch,
+    #[error("observation population mismatch: expected={expected}, observed={observed}")]
+    ObservationCountMismatch { expected: u64, observed: u64 },
+    #[error("recomputed terminal observation chain differs from the receipt")]
+    TerminalChainMismatch,
+}
 
 /// A source/configuration pair that completed one strict terminal replay.
 ///
@@ -25,11 +164,63 @@ use std::sync::Arc;
 #[must_use = "a qualified plan must be revalidated while staging or deliberately discarded"]
 pub struct XnasQualifiedReplayPlanV1 {
     qualification: Arc<XnasReplayReceiptV1>,
+    expected_metadata: XnasDailyMetadataExpectationV1,
 }
 
 impl XnasQualifiedReplayPlanV1 {
+    /// Qualify one admitted historical XNAS object with the crate-owned
+    /// publisher policy and an independently declared metadata denominator.
+    ///
+    /// This constructor is crate-private so external callers must enter through
+    /// [`super::XnasReplayProbeRequestV1::qualify_xnas`], which independently
+    /// enforces catalog-release admission before any source is opened.
+    pub(crate) fn qualify_xnas(
+        expectation: CanonicalSourceExpectationV1,
+        expected_metadata: XnasDailyMetadataExpectationV1,
+        config: XnasReplayConfigV1,
+    ) -> Result<Self, XnasReplayErrorV1> {
+        let stream = StrictDbnLoaderV1::open_xnas_expected(expectation, expected_metadata.clone())?;
+        let replay = StrictXnasReplayV1::from_strict_stream(stream, config)?;
+        Ok(Self {
+            qualification: Arc::new(replay.run_to_eof()?),
+            expected_metadata,
+        })
+    }
+
+    /// Qualify an exact catalog-selected source while treating the DBN
+    /// instrument ID as vendor-observed provenance, not caller-authored
+    /// scientific intent.  The source/date/symbol denominator is validated by
+    /// the request boundary before this call.  Pass one must reach EOF; its
+    /// hash-bound metadata then becomes the mandatory expectation for pass two.
+    pub(crate) fn qualify_catalog_bound(
+        replay: StrictXnasReplayV1,
+        expected_session_date: &str,
+        expected_symbol: &str,
+    ) -> Result<Self, XnasReplayErrorV1> {
+        let qualification = replay.run_to_eof()?;
+        let binding = qualification
+            .source()
+            .xnas_historical_source()
+            .ok_or(XnasReplayErrorV1::MissingXnasMetadataBinding)?;
+        if binding.session_date() != expected_session_date
+            || binding.instruments().len() != 1
+            || binding.instruments()[0].symbol != expected_symbol
+        {
+            return Err(XnasReplayErrorV1::CatalogIntentMismatch);
+        }
+        let expected_metadata = XnasDailyMetadataExpectationV1::from_verified_binding(binding)?;
+        Ok(Self {
+            qualification: Arc::new(qualification),
+            expected_metadata,
+        })
+    }
+
     pub fn qualification_receipt(&self) -> &XnasReplayReceiptV1 {
         self.qualification.as_ref()
+    }
+
+    pub const fn metadata_expectation(&self) -> &XnasDailyMetadataExpectationV1 {
+        &self.expected_metadata
     }
 
     /// Open a second, exact replay of the same source and configuration.
@@ -40,25 +231,55 @@ impl XnasQualifiedReplayPlanV1 {
     pub fn open_revalidation_pass(
         &self,
     ) -> Result<XnasReplayRevalidationPassV1, XnasReplayErrorV1> {
-        let source_receipt = self.qualification.source();
-        let descriptor = source_receipt.source();
-        let expectation = CanonicalSourceExpectationV1::new(
-            descriptor.logical.clone(),
-            source_receipt.expected_records(),
-        );
-        let stream = StrictDbnLoaderV1::open(
-            expectation,
-            &descriptor.opened.configured_path,
-            PublisherPolicyIdV1::XnasItchHistorical,
-        )?;
-        let replay = StrictXnasReplayV1::from_strict_stream(stream, self.qualification.config())?;
-        Ok(XnasReplayRevalidationPassV1 {
-            qualification: self.qualification.clone(),
-            replay: Some(replay),
-            reached_eof: false,
-            failed: false,
-        })
+        open_revalidation_pass(&self.qualification, Some(&self.expected_metadata))
     }
+}
+
+/// A diagnostic-only replay plan that has no independently declared metadata
+/// denominator.
+///
+/// This is a distinct type so it cannot be passed to production feature
+/// carrier APIs that require [`XnasQualifiedReplayPlanV1`].
+#[derive(Debug, Clone)]
+#[must_use = "a development replay plan must be revalidated or deliberately discarded"]
+pub struct XnasUnboundDevelopmentReplayPlanV1 {
+    qualification: Arc<XnasReplayReceiptV1>,
+}
+
+impl XnasUnboundDevelopmentReplayPlanV1 {
+    pub fn qualification_receipt(&self) -> &XnasReplayReceiptV1 {
+        self.qualification.as_ref()
+    }
+
+    pub fn open_revalidation_pass(
+        &self,
+    ) -> Result<XnasReplayRevalidationPassV1, XnasReplayErrorV1> {
+        open_revalidation_pass(&self.qualification, None)
+    }
+}
+
+fn open_revalidation_pass(
+    qualification: &Arc<XnasReplayReceiptV1>,
+    expected_metadata: Option<&XnasDailyMetadataExpectationV1>,
+) -> Result<XnasReplayRevalidationPassV1, XnasReplayErrorV1> {
+    let descriptor = qualification.source().source();
+    let expectation = CanonicalSourceExpectationV1::new(
+        descriptor.logical.clone(),
+        descriptor.opened.custody_projection_path.clone().into(),
+        descriptor.opened.storage_root_path.clone().into(),
+    )
+    .map_err(StrictBoundaryErrorV1::SourceIdentity)?;
+    let stream = match expected_metadata {
+        Some(expected) => StrictDbnLoaderV1::open_xnas_expected(expectation, expected.clone())?,
+        None => StrictDbnLoaderV1::open(expectation, PublisherPolicyIdV1::XnasItchHistorical)?,
+    };
+    let replay = StrictXnasReplayV1::from_strict_stream(stream, qualification.config())?;
+    Ok(XnasReplayRevalidationPassV1 {
+        qualification: qualification.clone(),
+        replay: Some(replay),
+        reached_eof: false,
+        failed: false,
+    })
 }
 
 /// One committed envelope observed during the still-unverified second pass.
@@ -254,8 +475,10 @@ impl XnasReplayEquivalenceReceiptV1 {
 impl StrictXnasReplayV1 {
     /// Complete pass one and retain its exact terminal receipt as the plan for
     /// downstream private staging.
-    pub fn qualify(self) -> Result<XnasQualifiedReplayPlanV1, XnasReplayErrorV1> {
-        Ok(XnasQualifiedReplayPlanV1 {
+    pub fn qualify_unbound_development(
+        self,
+    ) -> Result<XnasUnboundDevelopmentReplayPlanV1, XnasReplayErrorV1> {
+        Ok(XnasUnboundDevelopmentReplayPlanV1 {
             qualification: Arc::new(self.run_to_eof()?),
         })
     }

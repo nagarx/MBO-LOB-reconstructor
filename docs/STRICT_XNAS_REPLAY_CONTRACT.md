@@ -71,8 +71,13 @@ Failures have exactly three owners:
 - source, custody, resource-bound, arithmetic, and internal reconciliation
   failures are replay-fatal and cannot be converted into selective record
   loss;
-- EOF-sealed incomplete initialization, open-tail, and unrecovered-invalid
-  states are terminal disqualifications and cannot mint a success receipt.
+- an identity that never qualified is a terminal disqualification; for an
+  identity that was previously valid, an EOF tail or unrecovered-invalid
+  interval is explicitly quarantined and recorded in the replay receipt while
+  earlier closed validity epochs remain attestable. That replay receipt proves
+  deterministic custody, not complete-day scientific admissibility. A
+  downstream day/generation qualifier must inspect terminal identity status,
+  validity epochs, and quarantine populations before publication.
 
 Envelope and book error classification is compiler-exhaustive: a new error
 variant cannot compile until its owner is chosen. Snapshot-driven recovery is
@@ -88,10 +93,18 @@ Downstream staging uses this closed lifecycle:
    same policy and configuration.
 3. `next_observation()` yields non-serializable
    `XnasPendingEnvelopeObservationV1` values for private staging only.
-4. The pass must be drained to physical EOF. A pass-two failure is fused and
+4. The consumer feeds each observation, in order, to
+   `XnasCommittedObservationAccumulatorV1`. Its closure is an in-memory token,
+   not a serializable receipt or publication capability.
+5. The pass must be drained to physical EOF. A pass-two failure is fused and
    cannot be resumed or finished.
-5. `finish()` requires field-for-field equality of the two complete terminal
+6. Replay `finish()` requires field-for-field equality of the two complete terminal
    receipts and returns `XnasReplayEquivalenceReceiptV1`.
+7. Accumulator `finish()` accepts only that post-EOF
+   `XnasReplayEquivalenceReceiptV1`; the pass-one qualification receipt is not a
+   valid closure capability. It checks the full qualification receipt,
+   consumed-observation denominator, and terminal rolling chain before
+   returning its non-serializable closure token.
 
 Each strict pass pre-hashes, decodes, and post-hashes the opened object. The
 two-pass path therefore traverses the source six times. This cost is deliberate
@@ -166,16 +179,14 @@ Primary regression gates:
 ```text
 cargo test --locked --features databento --lib
 cargo test --locked --features databento --test xnas_replay
-cargo test --locked --features databento
-cargo clippy --locked --features databento --lib --bins -- -D warnings
-RUSTDOCFLAGS='-D warnings' cargo doc --locked --features databento --no-deps
+cargo test --locked --workspace --all-features --all-targets
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --all-features --no-deps
 ```
 
-The production library/binary Clippy gate is warning-free. The broader
-`--all-targets` invocation is intentionally not claimed here: legacy test
-targets still exercise deprecated iterator compatibility and have separately
-tracked lint debt. That debt cannot be presented as a passing strict-path
-gate, and it must be removed before the repository-wide completion boundary.
+The repository-wide test, Clippy, and rustdoc targets are warning-free. The
+unqualified pathname iterator and its legacy test targets no longer exist;
+file-backed replay begins at the source-bound strict loader.
 
 The tests include fixed hash vectors, independent chain recomputation,
 quarantine/recovery two-pass equivalence, pass-two fused failure, source

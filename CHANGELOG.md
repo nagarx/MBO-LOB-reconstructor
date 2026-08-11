@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Removed the reconstructor-owned `NormalizationParams` fit/apply and JSON
+  persistence surface. Normalization is feature-layout and fitting-population
+  policy owned by the feature extractor; keeping a second producer here made
+  leakage controls and artifact identity unenforceable.
+
+- Removed the pathname-only compatibility DBN iterator. Without an expected
+  digest and record population it could not distinguish a complete object
+  from a physically truncated object whose decoder returned ordinary EOF.
+  File-backed replay now starts at `StrictDbnLoaderV1`.
+
 ### Added — strict XNAS backbone candidate
 
 - Added an expectation-bound DBN loader and canonical raw MBO event contract
@@ -20,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added a closed two-pass API for private downstream staging. Pending
   observations are non-serializable and an equivalence attestation is minted
   only after both EOF receipts agree field-for-field.
+- Added an in-memory committed-observation accumulator that independently
+  rejects skipped, duplicated, reordered, availability-regressing, or
+  receipt-mismatched downstream consumption before private staging can close.
+- Bound the immutable catalog-content SHA-256 into `LogicalSourceV1`; a
+  catalog release name alone is no longer accepted as complete provenance.
 - Added package-local build provenance and the stdout-at-EOF
   `xnas_replay_probe` v3 development boundary.
 - Added adversarial gates for digest sensitivity, independent rolling-chain
@@ -34,6 +49,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consumer used the developing strict V1 Rust API at this boundary.
 - See `docs/STRICT_XNAS_REPLAY_CONTRACT.md` for exact schemas, digest domains,
   authority limits, and mandatory extractor ownership.
+- `DbnBridge` now preserves `T` as `TradeAggregate` and `F` as `Fill`; neither
+  carrier mutates the compatibility or strict book. Side `S` is rejected.
+- `LobConfig` and `LobStats` reject unknown or semantically obsolete keys.
+  Stats require the exact `3.0.0` envelope and publish through a synced
+  same-directory temporary file with no direct-write fallback.
+- Removed every unqualified pathname-only DBN iterator. A caller without an
+  expected digest and record population cannot distinguish intended EOF from a
+  physically truncated source object.
+
+### Removed — unsafe compatibility producers
+
+- Removed the typed and untyped compatibility file iterators, warning/drop
+  conversion helpers, implicit
+  hot-store substitution, and `DbnSource` bridge on an infallible iterator
+  trait.
+- Removed the basename-only hot-store manager and decompression CLI. Existing
+  cache files could be accepted by existence without binding their content to
+  the requested compressed source, and `--force` did not refresh them.
+- Removed queue-position, order-lifecycle, and trade-aggregation modules whose
+  public behavior collapsed Databento T/F semantics.
+- Removed all reconstructor-owned Parquet writers and the legacy
+  `export_to_parquet` CLI. Writers truncated final paths directly and allowed
+  caller metadata to overwrite reserved identity keys; publication is now
+  exclusively an extractor-owned generation transaction.
 
 ## [0.3.0] — 2026-08-01
 

@@ -23,7 +23,7 @@
 //! tracker.record(
 //!     WarningCategory::InconsistentState,
 //!     "Order 12345 not found at price level 100.00",
-//!     Some(1234567890_000_000_000),
+//!     Some(1_234_567_890_000_000_000),
 //!     Some(12345),
 //! );
 //!
@@ -556,14 +556,14 @@ mod tests {
         let warning = Warning::new(1, WarningCategory::OrderNotFound, "Test message")
             .with_order_id(12345)
             .with_price(100_000_000_000)
-            .with_data_timestamp(1234567890_000_000_000);
+            .with_data_timestamp(1_234_567_890_000_000_000);
 
         assert_eq!(warning.id, 1);
         assert_eq!(warning.category, WarningCategory::OrderNotFound);
         assert_eq!(warning.message, "Test message");
         assert_eq!(warning.order_id, Some(12345));
         assert_eq!(warning.price, Some(100_000_000_000));
-        assert_eq!(warning.data_timestamp, Some(1234567890_000_000_000));
+        assert_eq!(warning.data_timestamp, Some(1_234_567_890_000_000_000));
     }
 
     #[test]
@@ -586,17 +586,21 @@ mod tests {
     fn test_warning_tracker_config_validate() {
         WarningTrackerConfig::default().validate().unwrap();
 
-        let mut config = WarningTrackerConfig::default();
-        config.max_warnings = 0;
+        let config = WarningTrackerConfig {
+            max_warnings: 0,
+            ..WarningTrackerConfig::default()
+        };
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_warning_tracker_deduplication() {
-        let mut config = WarningTrackerConfig::default();
-        config.deduplicate = true;
-        config.dedupe_window_ns = 1_000_000_000_000; // Very large window for test
-        config.log_to_stderr = false;
+        let config = WarningTrackerConfig {
+            deduplicate: true,
+            dedupe_window_ns: 1_000_000_000_000,
+            log_to_stderr: false,
+            ..WarningTrackerConfig::default()
+        };
 
         let mut tracker = WarningTracker::with_config(config);
 
@@ -611,8 +615,10 @@ mod tests {
 
     #[test]
     fn test_warning_tracker_summary() {
-        let mut config = WarningTrackerConfig::default();
-        config.log_to_stderr = false;
+        let config = WarningTrackerConfig {
+            log_to_stderr: false,
+            ..WarningTrackerConfig::default()
+        };
 
         let mut tracker = WarningTracker::with_config(config);
 
@@ -621,7 +627,7 @@ mod tests {
             "Order not found",
             12345,
             Some(100_000_000_000),
-            Some(1234567890_000_000_000),
+            Some(1_234_567_890_000_000_000),
         );
 
         tracker.record_order_warning(
@@ -656,8 +662,10 @@ mod tests {
 
     #[test]
     fn test_warning_export_roundtrip() {
-        let mut config = WarningTrackerConfig::default();
-        config.log_to_stderr = false;
+        let config = WarningTrackerConfig {
+            log_to_stderr: false,
+            ..WarningTrackerConfig::default()
+        };
 
         let mut tracker = WarningTracker::with_config(config);
 

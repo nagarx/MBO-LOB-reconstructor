@@ -55,11 +55,33 @@ field_order = [
 [source_descriptor]
 required = [
   "logical_catalog_release_id",
-  "logical_catalog_object_id",
-  "logical_canonical_path",
-  "logical_canonical_sha256",
-  "logical_canonical_bytes",
-  "configured_path",
+  "logical_catalog_storage_root_id",
+  "logical_custody_projection_schema",
+  "logical_custody_projection_file_sha256",
+  "logical_custody_projection_content_sha256",
+  "logical_canonical_profile_sha256",
+  "logical_embedded_per_file_tsv_sha256",
+  "logical_evidence_manifest_sha256",
+  "logical_terminal_validation_receipt_sha256",
+  "logical_terminal_validation_status",
+  "logical_relative_path",
+  "logical_compressed_sha256",
+  "logical_compressed_bytes",
+  "logical_expected_records",
+  "logical_metadata_start_ns",
+  "logical_metadata_end_ns",
+  "logical_requested_symbols_preview",
+  "logical_requested_symbols_sha256",
+  "logical_symbols_n",
+  "logical_active_instruments_n",
+  "logical_provenance_tier",
+  "logical_provider_manifest_relative_path",
+  "logical_provider_manifest_sha256",
+  "logical_provider_job_id",
+  "logical_provider_declared_data_file_count",
+  "opened_custody_projection_path",
+  "opened_storage_root_path",
+  "opened_relative_path",
   "opened_representation",
   "opened_path",
   "opened_sha256",
@@ -69,14 +91,31 @@ required = [
   "dataset",
   "schema",
 ]
-configured_opened_path_policy = "exact_match_in_strict_v1"
-logical_opened_digest_policy = "exact_match_for_canonical_object_before_reusable_output"
+catalog_membership_policy = "exact_object_membership_in_a_sha256_pinned_custody_projection"
+catalog_projection_path_policy = "operational_locator_only_file_sha256_and_content_sha256_must_match_an_accepted_release_binding"
+storage_root_path_policy = "operational_locator_only_never_part_of_stable_object_identity"
+relative_path_policy = "nonempty_portable_posix_components_no_absolute_dot_dotdot_backslash_control_or_symlink_component"
+opened_path_policy = "derived_only_from_storage_root_path_and_logical_relative_path_no_full_path_override"
+physical_open_policy = "descriptor_relative_nofollow_for_every_component_hash_and_decode_the_same_regular_file_descriptor"
+logical_opened_digest_policy = "exact_compressed_sha256_and_compressed_bytes_match_before_reusable_output"
 hot_store_substitution_policy = "unsupported_in_strict_v1"
 representation_model_variants = ["canonical_object", "derived_replica"]
 strict_v1_accepted_representation = "canonical_object_only"
 derived_replica_status = "reserved_for_a_future_contract_version"
 future_derived_replica_prerequisite = "verified_derivation_or_decode_equivalence_receipt"
 dbn_ts_out_policy = "must_be_false_for_v1"
+
+[[source_descriptor.accepted_catalog_releases]]
+release_id = "dbc-20260802-v1"
+storage_root_id = "apfs-0981c0ff-6bb8-4e7a-86db-5702f9344301:HFT-data"
+custody_projection_schema = "mbo_backbone_hashed_envelope_v1"
+custody_projection_file_sha256 = "8815f87137e72c9eaa6d5417f5853484b43f571bbb3251b8c11be41f445a027f"
+custody_projection_content_sha256 = "381fc79039efbe61cd31eb3bf7505e092edbc89572c8736d0f72203c2080bcba"
+canonical_profile_sha256 = "9c989973dc9e755a61552de3a15abd55d037763bdc95f93b8df27ae0eb1cb74b"
+embedded_per_file_tsv_sha256 = "f7aeb88933c239ec77d3c18e9ab2f68c156c51f7a81bdca4cac7c1b4a503179e"
+evidence_manifest_sha256 = "3e50950bfa08c6ced811f3042abea396c57481e44620eea3359469dc9b13bf4d"
+terminal_validation_receipt_sha256 = "5477c202277a7318f0f8430cb3b3c2f87e0bbbc67f2f28a3fc5a88eb9f553746"
+terminal_validation_status = "PASS"
 
 [raw_event_fields.source_object_sha256]
 rust_type = "Sha256DigestV1"

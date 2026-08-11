@@ -889,8 +889,7 @@ mod tests {
     use super::*;
     use hft_mbo_event_contract::{
         classify_full_order_book, validate_raw_event, BoundPublisherPolicyV1, EventDispositionV1,
-        LogicalSourceV1, OpenedReplicaV1, OpenedRepresentationV1, PublisherPolicyIdV1,
-        RawMboEventV1, SourceDescriptorV1, ACTION_ADD, ACTION_CANCEL, ACTION_CLEAR, ACTION_FILL,
+        PublisherPolicyIdV1, RawMboEventV1, ACTION_ADD, ACTION_CANCEL, ACTION_CLEAR, ACTION_FILL,
         ACTION_MODIFY, ACTION_TRADE, EXPECTED_MBO_RECORD_SIZE_BYTES, EXPECTED_MBO_RTYPE, FLAG_LAST,
         SIDE_ASK, SIDE_BID, SIDE_NONE, UNDEF_PRICE,
     };
@@ -905,26 +904,7 @@ mod tests {
     }
 
     fn policy() -> BoundPublisherPolicyV1 {
-        let source = SourceDescriptorV1 {
-            logical: LogicalSourceV1 {
-                catalog_release_id: "test-release".to_owned(),
-                catalog_object_id: "test-object".to_owned(),
-                canonical_path: "/test/source.dbn.zst".to_owned(),
-                canonical_sha256: digest(),
-                canonical_bytes: 1,
-                dbn_version: 1,
-                dbn_ts_out: false,
-                dataset: "XNAS.ITCH".to_owned(),
-                schema: "mbo".to_owned(),
-            },
-            opened: OpenedReplicaV1 {
-                configured_path: "/test/source.dbn.zst".to_owned(),
-                opened_path: "/test/source.dbn.zst".to_owned(),
-                representation: OpenedRepresentationV1::CanonicalObject,
-                opened_sha256: digest(),
-                opened_bytes: 1,
-            },
-        };
+        let source = crate::xnas::test_source_descriptor_v1(digest());
         BoundPublisherPolicyV1::bind(PublisherPolicyIdV1::XnasItchHistorical, &source).unwrap()
     }
 

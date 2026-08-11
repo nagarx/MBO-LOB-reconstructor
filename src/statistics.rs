@@ -1,7 +1,8 @@
-//! Statistics tracking for LOB data normalization.
+//! Descriptive statistics for reconstructed LOB state.
 //!
-//! This module provides structures for tracking per-day and per-session
-//! statistics needed for proper data normalization in ML preprocessing.
+//! This module owns measurement only. Feature normalization fit/apply policy
+//! belongs to the feature extractor, where the fitted population and feature
+//! layout can be bound explicitly.
 //!
 //! # Key Features
 //!
@@ -24,7 +25,7 @@
 //! println!("Price mean: {}, std: {}", summary.price_mean, summary.price_std);
 //! ```
 
-use crate::constants::{DIVISION_GUARD_EPS, NANODOLLARS_PER_DOLLAR_F64, NS_PER_SECOND_F64};
+use crate::constants::{NANODOLLARS_PER_DOLLAR_F64, NS_PER_SECOND_F64};
 use crate::types::LobState;
 use serde::{Deserialize, Serialize};
 
@@ -446,142 +447,6 @@ impl DayStats {
 }
 
 // ============================================================================
-// Normalization Parameters
-// ============================================================================
-
-/// Parameters for Z-score normalization derived from statistics.
-///
-/// These can be saved and loaded to ensure consistent normalization
-/// across training and inference.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NormalizationParams {
-    /// Mean for each feature
-    pub means: Vec<f64>,
-
-    /// Standard deviation for each feature
-    pub stds: Vec<f64>,
-
-    /// Feature names (for validation)
-    pub feature_names: Vec<String>,
-
-    /// Number of samples used to compute these parameters
-    pub sample_count: u64,
-
-    /// Source description (e.g., "NVDA 2025-02-03 to 2025-06-30")
-    pub source: String,
-}
-
-impl NormalizationParams {
-    /// Create new normalization parameters.
-    pub fn new(
-        means: Vec<f64>,
-        stds: Vec<f64>,
-        feature_names: Vec<String>,
-        sample_count: u64,
-        source: impl Into<String>,
-    ) -> Self {
-        assert_eq!(
-            means.len(),
-            stds.len(),
-            "means and stds must have same length"
-        );
-        assert_eq!(
-            means.len(),
-            feature_names.len(),
-            "feature_names must match means length"
-        );
-
-        Self {
-            means,
-            stds,
-            feature_names,
-            sample_count,
-            source: source.into(),
-        }
-    }
-
-    /// Create from DayStats for standard LOB features.
-    ///
-    /// Creates normalization parameters for the 40 standard LOB features
-    /// (10 levels × 4 features: ask_price, ask_size, bid_price, bid_size).
-    pub fn from_day_stats(stats: &DayStats, levels: usize) -> Self {
-        let mut means = Vec::with_capacity(levels * 4);
-        let mut stds = Vec::with_capacity(levels * 4);
-        let mut feature_names = Vec::with_capacity(levels * 4);
-
-        // For now, use best bid/ask statistics for all levels
-        // In practice, you'd want per-level statistics
-        let price_mean = stats.mid_price.mean;
-        let price_std = stats.mid_price.std().max(DIVISION_GUARD_EPS); // Avoid division by zero
-        let size_mean = (stats.best_bid_size.mean + stats.best_ask_size.mean) / 2.0;
-        let size_std =
-            ((stats.best_bid_size.std() + stats.best_ask_size.std()) / 2.0).max(DIVISION_GUARD_EPS);
-
-        for i in 0..levels {
-            // Ask price
-            means.push(price_mean);
-            stds.push(price_std);
-            feature_names.push(format!("ask_price_{i}"));
-
-            // Ask size
-            means.push(size_mean);
-            stds.push(size_std);
-            feature_names.push(format!("ask_size_{i}"));
-        }
-
-        for i in 0..levels {
-            // Bid price
-            means.push(price_mean);
-            stds.push(price_std);
-            feature_names.push(format!("bid_price_{i}"));
-
-            // Bid size
-            means.push(size_mean);
-            stds.push(size_std);
-            feature_names.push(format!("bid_size_{i}"));
-        }
-
-        Self {
-            means,
-            stds,
-            feature_names,
-            sample_count: stats.valid_snapshots,
-            source: stats.date.clone(),
-        }
-    }
-
-    /// Normalize a value given its feature index.
-    #[inline]
-    pub fn normalize(&self, value: f64, feature_idx: usize) -> f64 {
-        if feature_idx >= self.means.len() {
-            return value; // Return unchanged if index out of bounds
-        }
-        (value - self.means[feature_idx]) / self.stds[feature_idx]
-    }
-
-    /// Denormalize a value given its feature index.
-    #[inline]
-    pub fn denormalize(&self, value: f64, feature_idx: usize) -> f64 {
-        if feature_idx >= self.means.len() {
-            return value;
-        }
-        value * self.stds[feature_idx] + self.means[feature_idx]
-    }
-
-    /// Save to JSON file.
-    pub fn save_json(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
-        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
-    }
-
-    /// Load from JSON file.
-    pub fn load_json(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
-        let json = std::fs::read_to_string(path)?;
-        serde_json::from_str(&json).map_err(std::io::Error::other)
-    }
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
 
@@ -696,7 +561,7 @@ mod tests {
         state.best_ask = Some(100_010_000_000); // $100.01
         state.bid_sizes[0] = 100;
         state.ask_sizes[0] = 200;
-        state.timestamp = Some(1234567890_000_000_000);
+        state.timestamp = Some(1_234_567_890_000_000_000);
 
         stats.update(&state);
 
@@ -777,50 +642,5 @@ mod tests {
         let summary = stats.summary();
         assert!(summary.contains("2025-02-03"));
         assert!(summary.contains("Valid snapshots: 1"));
-    }
-
-    // -------------------------------------------------------------------------
-    // NormalizationParams tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_normalization_params_normalize() {
-        let params = NormalizationParams::new(
-            vec![100.0, 50.0],
-            vec![10.0, 5.0],
-            vec!["price".to_string(), "size".to_string()],
-            1000,
-            "test",
-        );
-
-        // Normalize value that is 2 std above mean
-        let normalized = params.normalize(120.0, 0);
-        assert!((normalized - 2.0).abs() < 1e-10);
-
-        // Denormalize back
-        let denormalized = params.denormalize(2.0, 0);
-        assert!((denormalized - 120.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_normalization_params_from_day_stats() {
-        let mut stats = DayStats::new("2025-02-03");
-
-        // Add some data
-        for price in [100.0, 101.0, 99.0, 100.5, 100.0] {
-            let mut state = LobState::new(10);
-            state.best_bid = Some((price * 1e9) as i64 - 5_000_000); // 0.5 cents below
-            state.best_ask = Some((price * 1e9) as i64 + 5_000_000); // 0.5 cents above
-            state.bid_sizes[0] = 100;
-            state.ask_sizes[0] = 150;
-            stats.update(&state);
-        }
-
-        let params = NormalizationParams::from_day_stats(&stats, 10);
-
-        assert_eq!(params.means.len(), 40); // 10 levels × 4 features
-        assert_eq!(params.stds.len(), 40);
-        assert_eq!(params.feature_names.len(), 40);
-        assert!(params.feature_names[0].starts_with("ask_price_"));
     }
 }

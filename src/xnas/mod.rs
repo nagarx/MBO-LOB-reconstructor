@@ -1,6 +1,7 @@
 mod book;
 mod diagnostics;
 mod envelope;
+mod probe_request;
 mod qualified;
 
 use crate::loader::{
@@ -50,12 +51,77 @@ impl XnasIdentityV1 {
 pub use book::{BookTransactionErrorV1, XnasBookCommitV1, XnasBookLevelV1, XnasBookSnapshotV1};
 pub use diagnostics::XnasReplayCountsV1;
 pub use envelope::EnvelopeAssemblyErrorV1 as XnasEnvelopeErrorV1;
+pub use probe_request::{XnasReplayProbeRequestErrorV1, XnasReplayProbeRequestV1};
 pub use qualified::{
-    XnasPendingEnvelopeObservationV1, XnasQualifiedReplayPlanV1, XnasReplayEquivalenceReceiptV1,
-    XnasReplayRevalidationPassV1,
+    XnasCommittedObservationAccumulatorV1, XnasCommittedObservationClosureV1,
+    XnasObservationAccountingErrorV1, XnasPendingEnvelopeObservationV1, XnasQualifiedReplayPlanV1,
+    XnasReplayEquivalenceReceiptV1, XnasReplayRevalidationPassV1,
+    XnasUnboundDevelopmentReplayPlanV1,
 };
 
 const XNAS_REPLAY_ALGORITHM_ID_V2: &str = "hft.xnas.strict_replay.v2";
+
+#[cfg(test)]
+pub(crate) fn test_source_descriptor_v1(
+    source_digest: Sha256DigestV1,
+) -> hft_mbo_event_contract::SourceDescriptorV1 {
+    use hft_mbo_event_contract::{
+        LogicalSourceV1, OpenedReplicaV1, OpenedRepresentationV1,
+        ACCEPTED_CATALOG_RELEASE_BINDINGS_V1,
+    };
+
+    let accepted = ACCEPTED_CATALOG_RELEASE_BINDINGS_V1[0];
+    let parse = |value: &str| Sha256DigestV1::from_hex(value).unwrap();
+    hft_mbo_event_contract::SourceDescriptorV1 {
+        logical: LogicalSourceV1 {
+            catalog_release_id: accepted.release_id.into(),
+            catalog_storage_root_id: accepted.storage_root_id.into(),
+            custody_projection_schema: accepted.custody_projection_schema.into(),
+            custody_projection_file_sha256: parse(accepted.custody_projection_file_sha256),
+            custody_projection_content_sha256: parse(accepted.custody_projection_content_sha256),
+            canonical_profile_sha256: parse(accepted.canonical_profile_sha256),
+            embedded_per_file_tsv_sha256: parse(accepted.embedded_per_file_tsv_sha256),
+            evidence_manifest_sha256: parse(accepted.evidence_manifest_sha256),
+            terminal_validation_receipt_sha256: parse(accepted.terminal_validation_receipt_sha256),
+            terminal_validation_status: accepted.terminal_validation_status.into(),
+            relative_path: "source.dbn.zst".into(),
+            compressed_sha256: source_digest,
+            compressed_bytes: 1,
+            expected_records: 1,
+            metadata_start_ns: 1,
+            metadata_end_ns: 2,
+            requested_symbols_preview: "NVDA".into(),
+            requested_symbols_sha256: Sha256DigestV1::from_bytes([9; 32]),
+            symbols_n: 1,
+            active_instruments_n: 1,
+            provenance_tier: "test_only".into(),
+            provider_manifest_relative_path: "manifest.json".into(),
+            provider_manifest_sha256: Sha256DigestV1::from_bytes([10; 32]),
+            provider_job_id: "test-job".into(),
+            provider_declared_data_file_count: 1,
+            dbn_version: 1,
+            dbn_ts_out: false,
+            dataset: "XNAS.ITCH".into(),
+            schema: "mbo".into(),
+        },
+        opened: OpenedReplicaV1 {
+            custody_projection_path: "/test/custody.json".into(),
+            storage_root_path: "/test".into(),
+            relative_path: "source.dbn.zst".into(),
+            opened_path: "/test/source.dbn.zst".into(),
+            representation: OpenedRepresentationV1::CanonicalObject,
+            opened_sha256: source_digest,
+            opened_bytes: 1,
+            device_id: 1,
+            inode: 1,
+            metadata_bytes: 1,
+            modified_seconds: 1,
+            modified_nanoseconds: 0,
+            changed_seconds: 1,
+            changed_nanoseconds: 0,
+        },
+    }
+}
 
 /// Reconstructor package/build identity of the code that executed a replay.
 ///
@@ -1089,7 +1155,7 @@ impl StrictXnasReplayV1 {
             .cloned()
             .ok_or(XnasReplayErrorV1::MissingXnasMetadataBinding)?;
         let source_digest = binding.source_object_sha256();
-        if input.source().logical.canonical_sha256 != source_digest {
+        if input.source().logical.compressed_sha256 != source_digest {
             return Err(XnasReplayErrorV1::MetadataSourceMismatch);
         }
         let mut identities = BTreeMap::new();
@@ -1364,7 +1430,7 @@ impl StrictXnasReplayV1 {
         // masking a concurrently changed or truncated source at clean EOF.
         let source = self.input.finish()?;
         let mut disqualification = if source.xnas_historical_source() != Some(&self.binding)
-            || source.source().logical.canonical_sha256 != self.source_digest
+            || source.source().logical.compressed_sha256 != self.source_digest
         {
             Some(XnasTerminalDisqualificationReasonV1::SourceBindingMismatch)
         } else if source.decoded_records() != self.counts.raw_records_ingested {
@@ -3047,6 +3113,8 @@ pub enum XnasReplayErrorV1 {
     MissingXnasMetadataBinding,
     #[error("strict stream source and XNAS metadata binding disagree")]
     MetadataSourceMismatch,
+    #[error("hash-bound XNAS metadata differs from the predeclared catalog date/symbol intent")]
+    CatalogIntentMismatch,
     #[error("XNAS metadata contains duplicate identity {0:?}")]
     DuplicateMetadataIdentity(XnasIdentityV1),
     #[error(transparent)]
@@ -3116,8 +3184,7 @@ impl XnasReplayErrorV1 {
 mod committed_observation_digest_tests {
     use super::*;
     use hft_mbo_event_contract::{
-        classify_full_order_book, validate_raw_event, BoundPublisherPolicyV1, LogicalSourceV1,
-        OpenedReplicaV1, OpenedRepresentationV1, PublisherPolicyIdV1, SourceDescriptorV1,
+        classify_full_order_book, validate_raw_event, BoundPublisherPolicyV1, PublisherPolicyIdV1,
         ACTION_ADD, ACTION_FILL, ACTION_TRADE, EXPECTED_MBO_RECORD_SIZE_BYTES, EXPECTED_MBO_RTYPE,
         FLAG_LAST, SIDE_ASK, SIDE_BID,
     };
@@ -3127,26 +3194,7 @@ mod committed_observation_digest_tests {
     fn policy() -> BoundPublisherPolicyV1 {
         BoundPublisherPolicyV1::bind(
             PublisherPolicyIdV1::XnasItchHistorical,
-            &SourceDescriptorV1 {
-                logical: LogicalSourceV1 {
-                    catalog_release_id: "test".into(),
-                    catalog_object_id: "test".into(),
-                    canonical_path: "/test.dbn".into(),
-                    canonical_sha256: SOURCE,
-                    canonical_bytes: 1,
-                    dbn_version: 1,
-                    dbn_ts_out: false,
-                    dataset: "XNAS.ITCH".into(),
-                    schema: "mbo".into(),
-                },
-                opened: OpenedReplicaV1 {
-                    configured_path: "/test.dbn".into(),
-                    opened_path: "/test.dbn".into(),
-                    representation: OpenedRepresentationV1::CanonicalObject,
-                    opened_sha256: SOURCE,
-                    opened_bytes: 1,
-                },
-            },
+            &test_source_descriptor_v1(SOURCE),
         )
         .unwrap()
     }

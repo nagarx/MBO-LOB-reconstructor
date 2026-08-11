@@ -77,20 +77,18 @@ fn main() {
     );
     println!();
 
-    // Event 4: Trade (partial fill) on bid1
-    let trade = MboMessage::new(
-        1001,
-        Action::Trade,
-        Side::Bid,
-        100_000_000_000,
-        50, // Partial fill: 50 of 100
-    );
+    // Event 4: Aggregate economic trade observation. `T` carries aggressor
+    // semantics and never identifies or mutates a resting order.
+    let trade = MboMessage::new(0, Action::TradeAggregate, Side::Ask, 100_000_000_000, 50);
 
     let state = lob.process_message(&trade).unwrap();
-    println!("Event 4: TRADE (partial fill)");
-    println!("  Order ID: 1001");
-    println!("  Filled: 50 shares");
-    println!("  Remaining at $100.00: {} shares", state.bid_sizes[0]);
+    println!("Event 4: AGGREGATE TRADE (book no-op)");
+    println!("  Aggressor: sell");
+    println!("  Executed: 50 shares");
+    println!(
+        "  Resting quantity at $100.00 remains: {} shares",
+        state.bid_sizes[0]
+    );
     println!();
 
     // Event 5: Cancel bid2

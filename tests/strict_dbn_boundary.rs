@@ -1,5 +1,7 @@
 #![cfg(feature = "databento")]
 
+mod support;
+
 use dbn::encode::{DbnEncoder, DynWriter, EncodeRecord};
 use dbn::{
     flags, Compression, MappingInterval, MboMsg, Metadata, RecordHeader, SType, Schema,
@@ -11,7 +13,7 @@ use hft_mbo_event_contract::{
 };
 use mbo_lob_reconstructor::{
     CanonicalSourceExpectationV1, StrictBoundaryErrorV1, StrictDbnLoaderV1,
-    VerifiedRejectionStageV1,
+    VerifiedRejectionStageV1, XnasDailyMetadataExpectationV1, XnasExpectedInstrumentIdentityV1,
 };
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -43,6 +45,27 @@ fn metadata(dataset: &str, schema: Option<Schema>, version: u8, ts_out: bool) ->
         }],
     }];
     metadata
+}
+
+fn metadata_for_instruments(instruments: &[(&str, u32)]) -> Metadata {
+    let mut value = metadata("XNAS.ITCH", Some(Schema::Mbo), 1, false);
+    let start_date = value.start().date();
+    value.symbols = instruments
+        .iter()
+        .map(|(symbol, _)| (*symbol).to_owned())
+        .collect();
+    value.mappings = instruments
+        .iter()
+        .map(|(symbol, instrument_id)| SymbolMapping {
+            raw_symbol: (*symbol).to_owned(),
+            intervals: vec![MappingInterval {
+                start_date,
+                end_date: start_date.next_day().unwrap(),
+                symbol: instrument_id.to_string(),
+            }],
+        })
+        .collect();
+    value
 }
 
 fn message(action: u8, side: u8, order_id: u64, size: u32, sequence: u32) -> MboMsg {
@@ -92,7 +115,6 @@ fn xnas_open_error(name: &str, actual_metadata: &Metadata) -> StrictBoundaryErro
     write_mbo(&path, Compression::None, actual_metadata, &[]);
     match StrictDbnLoaderV1::open(
         expectation(&path, "XNAS.ITCH", "mbo", 1, false, 0),
-        &path,
         PublisherPolicyIdV1::XnasItchHistorical,
     ) {
         Ok(_) => panic!("{name} metadata unexpectedly qualified"),
@@ -108,21 +130,7 @@ fn expectation(
     ts_out: bool,
     expected_records: u64,
 ) -> CanonicalSourceExpectationV1 {
-    let (digest, bytes) = digest_and_len(path);
-    CanonicalSourceExpectationV1::new(
-        LogicalSourceV1 {
-            catalog_release_id: "dbc-test-v1".into(),
-            catalog_object_id: "synthetic-object".into(),
-            canonical_path: path.to_str().unwrap().into(),
-            canonical_sha256: digest,
-            canonical_bytes: bytes,
-            dbn_version: version,
-            dbn_ts_out: ts_out,
-            dataset: dataset.into(),
-            schema: schema.into(),
-        },
-        expected_records,
-    )
+    support::expectation(path, dataset, schema, version, ts_out, expected_records)
 }
 
 fn valid_records() -> Vec<MboMsg> {
@@ -147,7 +155,6 @@ fn valid_compressed_and_uncompressed_streams_reconcile_exactly() {
         );
         let mut stream = StrictDbnLoaderV1::open(
             expectation(&path, "XNAS.ITCH", "mbo", 1, false, 4),
-            &path,
             PublisherPolicyIdV1::XnasItchHistorical,
         )
         .unwrap();
@@ -160,7 +167,7 @@ fn valid_compressed_and_uncompressed_streams_reconcile_exactly() {
         let mut ordinals = Vec::new();
         let mut book = 0;
         let mut execution = 0;
-        while let Some(item) = stream.next() {
+        for item in stream.by_ref() {
             let item = item.unwrap();
             let disposition = item.accepted().expect("fixture is accepted").disposition();
             ordinals.push(disposition.event().raw().raw_ordinal);
@@ -187,9 +194,269 @@ fn valid_compressed_and_uncompressed_streams_reconcile_exactly() {
                 .xnas_historical_source()
                 .unwrap()
                 .source_object_sha256(),
-            receipt.source().logical.canonical_sha256
+            receipt.source().logical.compressed_sha256
         );
     }
+}
+
+#[test]
+fn predeclared_xnas_metadata_is_bound_before_record_replay() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("metadata-bound.dbn");
+    write_mbo(
+        &path,
+        Compression::None,
+        &metadata("XNAS.ITCH", Some(Schema::Mbo), 1, false),
+        &valid_records(),
+    );
+    let source = expectation(&path, "XNAS.ITCH", "mbo", 1, false, 4);
+    let expected = support::xnas_metadata_expectation(&source, &[(2, 101, "TEST")]);
+    let stream = StrictDbnLoaderV1::open_xnas_expected(source, expected).unwrap();
+    assert_eq!(stream.decoded_records(), 0);
+    let binding = stream.xnas_historical_source().unwrap();
+    assert_eq!(binding.session_date(), "2025-07-01");
+    assert_eq!(binding.instruments().len(), 1);
+    assert_eq!(binding.instruments()[0].publisher_id, 2);
+    assert_eq!(binding.instruments()[0].instrument_id, 101);
+    assert_eq!(binding.instruments()[0].symbol, "TEST");
+}
+
+#[test]
+fn expectation_policy_digest_and_bounds_fail_before_source_io() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("pre-io.dbn");
+    write_mbo(
+        &path,
+        Compression::None,
+        &metadata("XNAS.ITCH", Some(Schema::Mbo), 1, false),
+        &[],
+    );
+    let source = expectation(&path, "XNAS.ITCH", "mbo", 1, false, 0);
+    fs::remove_file(&path).unwrap();
+
+    let wrong_publisher = XnasDailyMetadataExpectationV1::new(
+        source.logical().compressed_sha256,
+        support::START_NS,
+        support::END_NS,
+        "2025-07-01",
+        vec![XnasExpectedInstrumentIdentityV1::new(3, 101, "TEST").unwrap()],
+    )
+    .unwrap();
+    assert!(matches!(
+        StrictDbnLoaderV1::open_xnas_expected(source.clone(), wrong_publisher),
+        Err(StrictBoundaryErrorV1::XnasExpectedPublisherMismatch {
+            policy_publisher_id: 2
+        })
+    ));
+
+    let wrong_digest = XnasDailyMetadataExpectationV1::new(
+        Sha256DigestV1::from_bytes([0xA5; 32]),
+        support::START_NS,
+        support::END_NS,
+        "2025-07-01",
+        vec![XnasExpectedInstrumentIdentityV1::new(2, 101, "TEST").unwrap()],
+    )
+    .unwrap();
+    assert!(matches!(
+        StrictDbnLoaderV1::open_xnas_expected(source.clone(), wrong_digest),
+        Err(StrictBoundaryErrorV1::XnasExpectedSourceDigestMismatch { .. })
+    ));
+
+    let wrong_population = XnasDailyMetadataExpectationV1::new(
+        source.logical().compressed_sha256,
+        support::START_NS,
+        support::END_NS,
+        "2025-07-01",
+        vec![
+            XnasExpectedInstrumentIdentityV1::new(2, 101, "TEST").unwrap(),
+            XnasExpectedInstrumentIdentityV1::new(2, 202, "OTHER").unwrap(),
+        ],
+    )
+    .unwrap();
+    assert!(matches!(
+        StrictDbnLoaderV1::open_xnas_expected(source.clone(), wrong_population),
+        Err(StrictBoundaryErrorV1::XnasExpectedCatalogPopulationMismatch { .. })
+    ));
+
+    let wrong_singleton_symbol = XnasDailyMetadataExpectationV1::new(
+        source.logical().compressed_sha256,
+        support::START_NS,
+        support::END_NS,
+        "2025-07-01",
+        vec![XnasExpectedInstrumentIdentityV1::new(2, 101, "OTHER").unwrap()],
+    )
+    .unwrap();
+    assert!(matches!(
+        StrictDbnLoaderV1::open_xnas_expected(source.clone(), wrong_singleton_symbol),
+        Err(StrictBoundaryErrorV1::XnasExpectedCatalogSingletonSymbolMismatch { .. })
+    ));
+
+    let wrong_day = XnasDailyMetadataExpectationV1::new(
+        source.logical().compressed_sha256,
+        support::START_NS + 86_400_000_000_000,
+        support::END_NS + 86_400_000_000_000,
+        "2025-07-02",
+        vec![XnasExpectedInstrumentIdentityV1::new(2, 101, "TEST").unwrap()],
+    )
+    .unwrap();
+    assert!(matches!(
+        StrictDbnLoaderV1::open_xnas_expected(source, wrong_day),
+        Err(StrictBoundaryErrorV1::XnasExpectedCatalogBoundsMismatch { .. })
+    ));
+}
+
+#[test]
+fn invalid_session_date_and_duplicate_expected_identities_are_rejected_locally() {
+    let instrument = || XnasExpectedInstrumentIdentityV1::new(2, 101, "TEST").unwrap();
+    assert!(matches!(
+        XnasDailyMetadataExpectationV1::new(
+            Sha256DigestV1::from_bytes([0xA5; 32]),
+            support::START_NS,
+            support::END_NS,
+            "2025-07-02",
+            vec![instrument()],
+        ),
+        Err(StrictBoundaryErrorV1::XnasExpectedSessionNotCompleteUtcDay { .. })
+    ));
+    assert!(matches!(
+        XnasDailyMetadataExpectationV1::new(
+            Sha256DigestV1::from_bytes([0xA5; 32]),
+            support::START_NS,
+            support::END_NS,
+            "2025-07-01",
+            vec![instrument(), instrument()],
+        ),
+        Err(StrictBoundaryErrorV1::XnasExpectedDuplicateInstrumentIdentity { .. })
+    ));
+    assert!(matches!(
+        XnasDailyMetadataExpectationV1::new(
+            Sha256DigestV1::from_bytes([0xA5; 32]),
+            support::START_NS,
+            support::END_NS,
+            "2025-07-01",
+            vec![
+                XnasExpectedInstrumentIdentityV1::new(2, 101, "TEST").unwrap(),
+                XnasExpectedInstrumentIdentityV1::new(2, 202, "TEST").unwrap(),
+            ],
+        ),
+        Err(StrictBoundaryErrorV1::XnasExpectedDuplicateSymbol { .. })
+    ));
+    assert!(matches!(
+        XnasDailyMetadataExpectationV1::new(
+            Sha256DigestV1::from_bytes([0; 32]),
+            support::START_NS,
+            support::END_NS,
+            "2025-07-01",
+            vec![instrument()],
+        ),
+        Err(StrictBoundaryErrorV1::XnasExpectedZeroSourceDigest)
+    ));
+    assert!(matches!(
+        XnasDailyMetadataExpectationV1::new(
+            Sha256DigestV1::from_bytes([0xA5; 32]),
+            support::START_NS,
+            support::END_NS,
+            "2025-07-01",
+            vec![],
+        ),
+        Err(StrictBoundaryErrorV1::XnasExpectedEmptyInstrumentUniverse)
+    ));
+    for invalid in [
+        XnasExpectedInstrumentIdentityV1::new(0, 101, "TEST"),
+        XnasExpectedInstrumentIdentityV1::new(2, 0, "TEST"),
+        XnasExpectedInstrumentIdentityV1::new(2, 101, " TEST"),
+        XnasExpectedInstrumentIdentityV1::new(2, 101, "TEST\n"),
+    ] {
+        assert!(matches!(
+            invalid,
+            Err(StrictBoundaryErrorV1::XnasExpectedInvalidInstrumentIdentity { .. })
+        ));
+    }
+    assert!(matches!(
+        XnasDailyMetadataExpectationV1::new(
+            Sha256DigestV1::from_bytes([0xA5; 32]),
+            u64::MAX - 1,
+            u64::MAX,
+            "2262-04-11",
+            vec![instrument()],
+        ),
+        Err(StrictBoundaryErrorV1::XnasExpectedSessionNotCompleteUtcDay { .. })
+    ));
+}
+
+#[test]
+fn expected_instrument_universe_is_order_independent_and_exact() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("instrument-universe.dbn");
+    write_mbo(
+        &path,
+        Compression::None,
+        &metadata_for_instruments(&[("AAA", 101), ("BBB", 202)]),
+        &[],
+    );
+    let source = support::expectation_with_population(
+        &path,
+        "XNAS.ITCH",
+        "mbo",
+        1,
+        false,
+        0,
+        "AAA,BBB",
+        2,
+        2,
+    );
+
+    let reversed = support::xnas_metadata_expectation(&source, &[(2, 202, "BBB"), (2, 101, "AAA")]);
+    let stream = StrictDbnLoaderV1::open_xnas_expected(source.clone(), reversed).unwrap();
+    assert_eq!(stream.decoded_records(), 0);
+
+    for wrong in [
+        vec![(2, 101, "AAA")],
+        vec![(2, 101, "AAA"), (2, 202, "BBB"), (2, 303, "CCC")],
+        vec![(2, 101, "BBB"), (2, 202, "AAA")],
+    ] {
+        let expected = support::xnas_metadata_expectation(&source, &wrong);
+        assert!(matches!(
+            StrictDbnLoaderV1::open_xnas_expected(source.clone(), expected),
+            Err(StrictBoundaryErrorV1::XnasExpectedCatalogPopulationMismatch { .. })
+                | Err(StrictBoundaryErrorV1::XnasInstrumentUniverseMismatch { .. })
+        ));
+    }
+}
+
+#[test]
+fn actual_publisher_is_record_validated_not_claimed_as_metadata_observed() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("record-publisher.dbn");
+    let mut wrong_publisher = message(b'A', b'B', 10, 100, 1);
+    wrong_publisher.hd.publisher_id = 3;
+    write_mbo(
+        &path,
+        Compression::None,
+        &metadata("XNAS.ITCH", Some(Schema::Mbo), 1, false),
+        &[wrong_publisher],
+    );
+    let source = expectation(&path, "XNAS.ITCH", "mbo", 1, false, 1);
+
+    let wrong_symbol = support::xnas_metadata_expectation(&source, &[(2, 101, "WRONG")]);
+    assert!(matches!(
+        StrictDbnLoaderV1::open_xnas_expected(source.clone(), wrong_symbol),
+        Err(StrictBoundaryErrorV1::XnasExpectedCatalogSingletonSymbolMismatch { .. })
+    ));
+
+    let expected = support::xnas_metadata_expectation(&source, &[(2, 101, "TEST")]);
+    let mut stream = StrictDbnLoaderV1::open_xnas_expected(source, expected).unwrap();
+    assert_eq!(stream.decoded_records(), 0);
+    assert!(matches!(
+        stream.next().unwrap(),
+        Err(
+            StrictBoundaryErrorV1::RecordIdentityOutsideMetadataAndPolicyBinding {
+                raw_ordinal: 1,
+                publisher_id: 3,
+                instrument_id: 101,
+            }
+        )
+    ));
 }
 
 #[test]
@@ -204,29 +471,37 @@ fn wrong_source_digest_and_length_fail_before_iteration() {
     );
 
     let mut wrong_digest = expectation(&path, "XNAS.ITCH", "mbo", 1, false, 4);
+    let projection_path = wrong_digest.custody_projection_path().to_path_buf();
+    let storage_root = wrong_digest.storage_root_path().to_path_buf();
     wrong_digest = CanonicalSourceExpectationV1::new(
         LogicalSourceV1 {
-            canonical_sha256: Sha256DigestV1::from_bytes([0x55; 32]),
+            compressed_sha256: Sha256DigestV1::from_bytes([0x55; 32]),
             ..wrong_digest.logical().clone()
         },
-        4,
-    );
+        projection_path,
+        storage_root,
+    )
+    .unwrap();
     assert!(matches!(
-        StrictDbnLoaderV1::open(wrong_digest, &path, PublisherPolicyIdV1::XnasItchHistorical),
-        Err(StrictBoundaryErrorV1::SourceIdentity(_))
+        StrictDbnLoaderV1::open(wrong_digest, PublisherPolicyIdV1::XnasItchHistorical),
+        Err(StrictBoundaryErrorV1::CatalogSelection(_))
     ));
 
     let base = expectation(&path, "XNAS.ITCH", "mbo", 1, false, 4);
+    let projection_path = base.custody_projection_path().to_path_buf();
+    let storage_root = base.storage_root_path().to_path_buf();
     let wrong_length = CanonicalSourceExpectationV1::new(
         LogicalSourceV1 {
-            canonical_bytes: base.logical().canonical_bytes + 1,
+            compressed_bytes: base.logical().compressed_bytes + 1,
             ..base.logical().clone()
         },
-        4,
-    );
+        projection_path,
+        storage_root,
+    )
+    .unwrap();
     assert!(matches!(
-        StrictDbnLoaderV1::open(wrong_length, &path, PublisherPolicyIdV1::XnasItchHistorical),
-        Err(StrictBoundaryErrorV1::SourceIdentity(_))
+        StrictDbnLoaderV1::open(wrong_length, PublisherPolicyIdV1::XnasItchHistorical),
+        Err(StrictBoundaryErrorV1::CatalogSelection(_))
     ));
 }
 
@@ -280,7 +555,6 @@ fn metadata_identity_is_checked_before_first_record() {
         write_mbo(&path, Compression::None, &actual_metadata, &[]);
         let result = StrictDbnLoaderV1::open(
             expectation(&path, dataset, schema, version, ts_out, 0),
-            &path,
             PublisherPolicyIdV1::RejectAll,
         );
         match name {
@@ -308,7 +582,7 @@ fn xnas_daily_universe_binding_rejects_incomplete_or_ambiguous_metadata() {
     wrong_day.start += 1;
     assert!(matches!(
         xnas_open_error("wrong-day", &wrong_day),
-        StrictBoundaryErrorV1::XnasMetadataDayBoundary { .. }
+        StrictBoundaryErrorV1::MetadataCatalogBounds { .. }
     ));
 
     let mut limited = metadata("XNAS.ITCH", Some(Schema::Mbo), 1, false);
@@ -339,6 +613,21 @@ fn xnas_daily_universe_binding_rejects_incomplete_or_ambiguous_metadata() {
         StrictBoundaryErrorV1::XnasMetadataSymbols
     ));
 
+    let mut malformed_symbol = metadata("XNAS.ITCH", Some(Schema::Mbo), 1, false);
+    malformed_symbol.symbols[0] = " TEST".into();
+    malformed_symbol.mappings[0].raw_symbol = " TEST".into();
+    assert!(matches!(
+        xnas_open_error("malformed-symbol", &malformed_symbol),
+        StrictBoundaryErrorV1::XnasMetadataSymbols
+    ));
+
+    let mut zero_instrument = metadata("XNAS.ITCH", Some(Schema::Mbo), 1, false);
+    zero_instrument.mappings[0].intervals[0].symbol = "0".into();
+    assert!(matches!(
+        xnas_open_error("zero-instrument", &zero_instrument),
+        StrictBoundaryErrorV1::XnasMetadataMapping(symbol) if symbol == "TEST"
+    ));
+
     let mut missing_mapping = metadata("XNAS.ITCH", Some(Schema::Mbo), 1, false);
     missing_mapping.mappings.clear();
     assert!(matches!(
@@ -364,7 +653,6 @@ fn wrong_rtype_is_fatal_but_semantic_rejections_retain_exact_custody_to_eof() {
     write_trade_record_with_mbo_metadata(&wrong_rtype);
     let mut stream = StrictDbnLoaderV1::open(
         expectation(&wrong_rtype, "XNAS.ITCH", "mbo", 1, false, 1),
-        &wrong_rtype,
         PublisherPolicyIdV1::XnasItchHistorical,
     )
     .unwrap();
@@ -390,7 +678,6 @@ fn wrong_rtype_is_fatal_but_semantic_rejections_retain_exact_custody_to_eof() {
     );
     let mut stream = StrictDbnLoaderV1::open(
         expectation(&bad_action, "XNAS.ITCH", "mbo", 1, false, 2),
-        &bad_action,
         PublisherPolicyIdV1::XnasItchHistorical,
     )
     .unwrap();
@@ -450,17 +737,18 @@ fn record_identity_absent_from_opened_metadata_is_source_fatal_and_fuses() {
     );
     let mut stream = StrictDbnLoaderV1::open(
         expectation(&path, "XNAS.ITCH", "mbo", 1, false, 2),
-        &path,
         PublisherPolicyIdV1::XnasItchHistorical,
     )
     .unwrap();
     assert!(matches!(
         stream.next().unwrap(),
-        Err(StrictBoundaryErrorV1::RecordIdentityNotInMetadata {
-            raw_ordinal: 1,
-            publisher_id: 2,
-            instrument_id: 202,
-        })
+        Err(
+            StrictBoundaryErrorV1::RecordIdentityOutsideMetadataAndPolicyBinding {
+                raw_ordinal: 1,
+                publisher_id: 2,
+                instrument_id: 202,
+            }
+        )
     ));
     assert_eq!(stream.decoded_records(), 1);
     assert!(stream.next().is_none());
@@ -483,7 +771,6 @@ fn receipt_requires_eof_and_exact_expected_population() {
 
     let stream = StrictDbnLoaderV1::open(
         expectation(&path, "XNAS.ITCH", "mbo", 1, false, 4),
-        &path,
         PublisherPolicyIdV1::XnasItchHistorical,
     )
     .unwrap();
@@ -494,11 +781,10 @@ fn receipt_requires_eof_and_exact_expected_population() {
 
     let mut stream = StrictDbnLoaderV1::open(
         expectation(&path, "XNAS.ITCH", "mbo", 1, false, 5),
-        &path,
         PublisherPolicyIdV1::XnasItchHistorical,
     )
     .unwrap();
-    while let Some(item) = stream.next() {
+    for item in stream.by_ref() {
         item.unwrap();
     }
     assert!(matches!(
@@ -525,11 +811,10 @@ fn truncated_source_cannot_launder_decoder_none_into_success() {
 
     let mut stream = StrictDbnLoaderV1::open(
         expectation(&path, "XNAS.ITCH", "mbo", 1, false, 4),
-        &path,
         PublisherPolicyIdV1::XnasItchHistorical,
     )
     .unwrap();
-    while let Some(item) = stream.next() {
+    for item in stream.by_ref() {
         item.unwrap();
     }
     assert!(matches!(
@@ -550,10 +835,9 @@ fn pathname_replacement_after_open_does_not_substitute_decoded_bytes() {
         &valid_records(),
     );
     let expectation = expectation(&path, "XNAS.ITCH", "mbo", 1, false, 4);
-    let expected_digest = expectation.logical().canonical_sha256;
+    let expected_digest = expectation.logical().compressed_sha256;
     let mut stream =
-        StrictDbnLoaderV1::open(expectation, &path, PublisherPolicyIdV1::XnasItchHistorical)
-            .unwrap();
+        StrictDbnLoaderV1::open(expectation, PublisherPolicyIdV1::XnasItchHistorical).unwrap();
 
     fs::rename(&path, &moved).unwrap();
     write_mbo(
@@ -564,7 +848,7 @@ fn pathname_replacement_after_open_does_not_substitute_decoded_bytes() {
     );
 
     let mut seen = 0;
-    while let Some(item) = stream.next() {
+    for item in stream.by_ref() {
         let item = item.unwrap();
         assert_eq!(
             item.accepted()
@@ -578,8 +862,10 @@ fn pathname_replacement_after_open_does_not_substitute_decoded_bytes() {
         seen += 1;
     }
     assert_eq!(seen, 4);
-    let receipt = stream.finish().unwrap();
-    assert_eq!(receipt.source().opened.opened_sha256, expected_digest);
+    assert!(matches!(
+        stream.finish(),
+        Err(StrictBoundaryErrorV1::SourceRuntimeIdentityChanged)
+    ));
     assert_ne!(digest_and_len(&path).0, expected_digest);
 }
 
@@ -602,7 +888,6 @@ fn decoder_error_reports_the_next_position_without_claiming_a_row_ordinal() {
 
     let mut stream = StrictDbnLoaderV1::open(
         expectation(&path, "XNAS.ITCH", "mbo", 1, false, 2),
-        &path,
         PublisherPolicyIdV1::XnasItchHistorical,
     )
     .unwrap();
@@ -631,7 +916,6 @@ fn in_place_source_mutation_is_detected_before_receipt() {
     );
     let mut stream = StrictDbnLoaderV1::open(
         expectation(&path, "XNAS.ITCH", "mbo", 1, false, 4),
-        &path,
         PublisherPolicyIdV1::XnasItchHistorical,
     )
     .unwrap();
@@ -642,11 +926,11 @@ fn in_place_source_mutation_is_detected_before_receipt() {
     writer.write_all(&[last ^ 0xFF]).unwrap();
     writer.flush().unwrap();
 
-    while let Some(item) = stream.next() {
+    for item in stream.by_ref() {
         item.unwrap();
     }
     assert!(matches!(
         stream.finish(),
-        Err(StrictBoundaryErrorV1::SourceChangedDuringDecode { .. })
+        Err(StrictBoundaryErrorV1::SourceRuntimeIdentityChanged)
     ));
 }

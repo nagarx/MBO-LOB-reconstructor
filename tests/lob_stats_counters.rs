@@ -12,8 +12,8 @@ use mbo_lob_reconstructor::{
 };
 
 /// Helper — construct a test message via the public `MboMessage::new` API.
-/// Price in nanodollars (i64 fixed-point). System messages are detected by the
-/// loader/lob via `is_system_message()` (order_id == 0 || size == 0 || price <= 0).
+/// Price in nanodollars (i64 fixed-point). Explicit controls are detected by the
+/// loader/lob via `is_noop_control()` (`Action::None` only).
 fn msg(order_id: u64, action: Action, side: Side, price_dollars: f64, size: u32) -> MboMessage {
     MboMessage::new(order_id, action, side, (price_dollars * 1e9) as i64, size)
 }
@@ -73,13 +73,10 @@ fn test_lobstats_default_initializes_all_counters_to_zero() {
     // this test will fail to compile.
     let stats = LobStats::default();
     assert_eq!(stats.messages_processed, 0);
-    assert_eq!(stats.system_messages_skipped, 0);
+    assert_eq!(stats.noop_controls_skipped, 0);
     assert_eq!(stats.cancel_order_not_found, 0);
     assert_eq!(stats.cancel_price_level_missing, 0);
     assert_eq!(stats.cancel_order_at_level_missing, 0);
-    assert_eq!(stats.trade_order_not_found, 0);
-    assert_eq!(stats.trade_price_level_missing, 0);
-    assert_eq!(stats.trade_order_at_level_missing, 0);
     assert_eq!(stats.modify_order_not_found, 0);
     assert_eq!(stats.add_order_id_collision, 0);
     assert_eq!(stats.book_clears, 0);
@@ -135,12 +132,12 @@ fn test_lobstats_export_envelope_round_trip() {
 
 #[test]
 fn test_lobstats_schema_version_constant_is_pinned() {
-    // Phase M M.A.5: the public const must remain pinned at "2.0.0" until
+    // The public const must remain pinned at "3.0.0" until
     // the next intentional MAJOR bump. If a future commit silently bumps
     // this without a coordinated cycle, this test will fail.
     assert_eq!(
-        LOB_STATS_SCHEMA_VERSION, "2.0.0",
-        "LOB_STATS_SCHEMA_VERSION must remain pinned at 2.0.0 until next intentional MAJOR bump"
+        LOB_STATS_SCHEMA_VERSION, "3.0.0",
+        "LOB_STATS_SCHEMA_VERSION must remain pinned at the v1 T/F semantic-major boundary"
     );
 }
 
@@ -159,7 +156,7 @@ fn test_lobstats_envelope_load_rejects_malformed_envelope() {
     let malformed = r#"{
         "schema_version": "2.0.0",
         "messages_processed": 99,
-        "system_messages_skipped": 0,
+        "noop_controls_skipped": 0,
         "active_orders": 0,
         "bid_levels": 0,
         "ask_levels": 0,
@@ -184,6 +181,35 @@ fn test_lobstats_envelope_load_rejects_malformed_envelope() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_lobstats_v3_rejects_every_missing_required_counter() {
+    let required_counters = [
+        "aggregate_trades_observed",
+        "resting_fills_observed",
+        "modify_order_not_found",
+        "add_order_id_collision",
+    ];
+
+    for field in required_counters {
+        let mut envelope = serde_json::json!({
+            "schema_version": LOB_STATS_SCHEMA_VERSION,
+            "stats": LobStats::default(),
+        });
+        envelope["stats"].as_object_mut().unwrap().remove(field);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-required-counter.json");
+        std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
+        let error = LobStats::load_from_file(&path)
+            .expect_err("a v3 envelope missing a required counter must be rejected");
+        assert!(
+            error.to_string().contains(field),
+            "missing-field error must name {field}; got {error}"
+        );
+    }
 }
 
 #[test]

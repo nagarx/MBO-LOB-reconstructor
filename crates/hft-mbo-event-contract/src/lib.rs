@@ -19,6 +19,25 @@ pub struct RawEventFieldDescriptor {
     pub wire_encoding: Option<&'static str>,
 }
 
+/// Build-time admitted catalog-release authority.
+///
+/// The root contract plane owns these values. Runtime source selection must
+/// prove exact membership in the corresponding SHA-256-pinned custody
+/// projection before any market-data object is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptedCatalogReleaseBindingDescriptorV1 {
+    pub release_id: &'static str,
+    pub storage_root_id: &'static str,
+    pub custody_projection_schema: &'static str,
+    pub custody_projection_file_sha256: &'static str,
+    pub custody_projection_content_sha256: &'static str,
+    pub canonical_profile_sha256: &'static str,
+    pub embedded_per_file_tsv_sha256: &'static str,
+    pub evidence_manifest_sha256: &'static str,
+    pub terminal_validation_receipt_sha256: &'static str,
+    pub terminal_validation_status: &'static str,
+}
+
 include!(concat!(env!("OUT_DIR"), "/mbo_event_contract_generated.rs"));
 
 /// Exact SHA-256 bytes for a logical source object or receipt.
@@ -125,14 +144,38 @@ pub enum DigestParseErrorV1 {
     InvalidHex { index: usize, byte: u8 },
 }
 
-/// The catalog-level byte object whose row identity remains stable.
+/// Catalog-release and exact object identity whose row identity remains stable.
+///
+/// Every authority coordinate is copied from a SHA-256-pinned custody
+/// projection. `relative_path`, not an absolute filesystem path, participates
+/// in the stable object key `(release_id, relative_path, compressed_sha256)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogicalSourceV1 {
     pub catalog_release_id: String,
-    pub catalog_object_id: String,
-    pub canonical_path: String,
-    pub canonical_sha256: Sha256DigestV1,
-    pub canonical_bytes: u64,
+    pub catalog_storage_root_id: String,
+    pub custody_projection_schema: String,
+    pub custody_projection_file_sha256: Sha256DigestV1,
+    pub custody_projection_content_sha256: Sha256DigestV1,
+    pub canonical_profile_sha256: Sha256DigestV1,
+    pub embedded_per_file_tsv_sha256: Sha256DigestV1,
+    pub evidence_manifest_sha256: Sha256DigestV1,
+    pub terminal_validation_receipt_sha256: Sha256DigestV1,
+    pub terminal_validation_status: String,
+    pub relative_path: String,
+    pub compressed_sha256: Sha256DigestV1,
+    pub compressed_bytes: u64,
+    pub expected_records: u64,
+    pub metadata_start_ns: u64,
+    pub metadata_end_ns: u64,
+    pub requested_symbols_preview: String,
+    pub requested_symbols_sha256: Sha256DigestV1,
+    pub symbols_n: u64,
+    pub active_instruments_n: u64,
+    pub provenance_tier: String,
+    pub provider_manifest_relative_path: String,
+    pub provider_manifest_sha256: Sha256DigestV1,
+    pub provider_job_id: String,
+    pub provider_declared_data_file_count: u64,
     pub dbn_version: u8,
     pub dbn_ts_out: bool,
     pub dataset: String,
@@ -152,14 +195,23 @@ pub enum OpenedRepresentationV1 {
     },
 }
 
-/// The exact bytes and path actually opened by the decoder.
+/// The exact bytes, derived locator, and runtime file identity opened by the decoder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenedReplicaV1 {
-    pub configured_path: String,
+    pub custody_projection_path: String,
+    pub storage_root_path: String,
+    pub relative_path: String,
     pub opened_path: String,
     pub representation: OpenedRepresentationV1,
     pub opened_sha256: Sha256DigestV1,
     pub opened_bytes: u64,
+    pub device_id: u64,
+    pub inode: u64,
+    pub metadata_bytes: u64,
+    pub modified_seconds: i64,
+    pub modified_nanoseconds: i64,
+    pub changed_seconds: i64,
+    pub changed_nanoseconds: i64,
 }
 
 /// Source identity carried once per stream and bound into every row identity.
@@ -169,43 +221,110 @@ pub struct SourceDescriptorV1 {
     pub opened: OpenedReplicaV1,
 }
 
-impl SourceDescriptorV1 {
-    /// Strict v1 accepts only the configured canonical byte object itself.
+impl LogicalSourceV1 {
+    /// Validate the complete external catalog authority before filesystem I/O.
     pub fn validate_strict(&self) -> Result<(), SourceIdentityErrorV1> {
         for (field, value) in [
+            ("catalog_release_id", self.catalog_release_id.as_str()),
             (
-                "catalog_release_id",
-                self.logical.catalog_release_id.as_str(),
+                "catalog_storage_root_id",
+                self.catalog_storage_root_id.as_str(),
             ),
-            ("catalog_object_id", self.logical.catalog_object_id.as_str()),
-            ("canonical_path", self.logical.canonical_path.as_str()),
-            ("dataset", self.logical.dataset.as_str()),
-            ("schema", self.logical.schema.as_str()),
-            ("configured_path", self.opened.configured_path.as_str()),
+            (
+                "custody_projection_schema",
+                self.custody_projection_schema.as_str(),
+            ),
+            (
+                "terminal_validation_status",
+                self.terminal_validation_status.as_str(),
+            ),
+            ("relative_path", self.relative_path.as_str()),
+            (
+                "requested_symbols_preview",
+                self.requested_symbols_preview.as_str(),
+            ),
+            ("provenance_tier", self.provenance_tier.as_str()),
+            (
+                "provider_manifest_relative_path",
+                self.provider_manifest_relative_path.as_str(),
+            ),
+            ("provider_job_id", self.provider_job_id.as_str()),
+            ("dataset", self.dataset.as_str()),
+            ("schema", self.schema.as_str()),
+        ] {
+            if value.is_empty() {
+                return Err(SourceIdentityErrorV1::EmptyField(field));
+            }
+        }
+        if self.schema != "mbo" {
+            return Err(SourceIdentityErrorV1::WrongSchema(self.schema.clone()));
+        }
+        if !(1..=3).contains(&self.dbn_version) {
+            return Err(SourceIdentityErrorV1::UnsupportedDbnVersion(
+                self.dbn_version,
+            ));
+        }
+        if self.dbn_ts_out {
+            return Err(SourceIdentityErrorV1::TsOutUnsupported);
+        }
+        if self.compressed_bytes == 0 {
+            return Err(SourceIdentityErrorV1::EmptyObject);
+        }
+        if self.custody_projection_file_sha256.is_zero()
+            || self.custody_projection_content_sha256.is_zero()
+            || self.canonical_profile_sha256.is_zero()
+            || self.embedded_per_file_tsv_sha256.is_zero()
+            || self.evidence_manifest_sha256.is_zero()
+            || self.terminal_validation_receipt_sha256.is_zero()
+            || self.compressed_sha256.is_zero()
+            || self.requested_symbols_sha256.is_zero()
+            || self.provider_manifest_sha256.is_zero()
+        {
+            return Err(SourceIdentityErrorV1::PlaceholderDigest);
+        }
+        if self.terminal_validation_status != "PASS" {
+            return Err(SourceIdentityErrorV1::CatalogValidationNotPassed(
+                self.terminal_validation_status.clone(),
+            ));
+        }
+        if self.metadata_start_ns >= self.metadata_end_ns {
+            return Err(SourceIdentityErrorV1::InvalidMetadataBounds {
+                start_ns: self.metadata_start_ns,
+                end_ns: self.metadata_end_ns,
+            });
+        }
+        if self.symbols_n == 0
+            || self.active_instruments_n == 0
+            || self.active_instruments_n > self.symbols_n
+            || self.provider_declared_data_file_count == 0
+        {
+            return Err(SourceIdentityErrorV1::InvalidPopulationIdentity);
+        }
+        validate_catalog_relative_path_v1(&self.relative_path)?;
+        validate_catalog_relative_path_v1(&self.provider_manifest_relative_path)?;
+        Ok(())
+    }
+}
+
+impl SourceDescriptorV1 {
+    /// Strict v1 accepts only the catalog-selected canonical byte object itself.
+    pub fn validate_strict(&self) -> Result<(), SourceIdentityErrorV1> {
+        self.logical.validate_strict()?;
+        for (field, value) in [
+            (
+                "custody_projection_path",
+                self.opened.custody_projection_path.as_str(),
+            ),
+            ("storage_root_path", self.opened.storage_root_path.as_str()),
+            ("opened_relative_path", self.opened.relative_path.as_str()),
             ("opened_path", self.opened.opened_path.as_str()),
         ] {
             if value.is_empty() {
                 return Err(SourceIdentityErrorV1::EmptyField(field));
             }
         }
-        if self.logical.schema != "mbo" {
-            return Err(SourceIdentityErrorV1::WrongSchema(
-                self.logical.schema.clone(),
-            ));
-        }
-        if !(1..=3).contains(&self.logical.dbn_version) {
-            return Err(SourceIdentityErrorV1::UnsupportedDbnVersion(
-                self.logical.dbn_version,
-            ));
-        }
-        if self.logical.dbn_ts_out {
-            return Err(SourceIdentityErrorV1::TsOutUnsupported);
-        }
-        if self.logical.canonical_bytes == 0 || self.opened.opened_bytes == 0 {
+        if self.opened.opened_bytes == 0 || self.opened.opened_sha256.is_zero() {
             return Err(SourceIdentityErrorV1::EmptyObject);
-        }
-        if self.logical.canonical_sha256.is_zero() || self.opened.opened_sha256.is_zero() {
-            return Err(SourceIdentityErrorV1::PlaceholderDigest);
         }
         if !matches!(
             self.opened.representation,
@@ -213,27 +332,80 @@ impl SourceDescriptorV1 {
         ) {
             return Err(SourceIdentityErrorV1::DerivedReplicaNotAllowed);
         }
-        if self.opened.configured_path != self.opened.opened_path {
+        let expected_path =
+            std::path::Path::new(&self.opened.storage_root_path).join(&self.logical.relative_path);
+        if self.opened.relative_path != self.logical.relative_path
+            || expected_path.to_str() != Some(self.opened.opened_path.as_str())
+        {
             return Err(SourceIdentityErrorV1::PathSubstitution {
-                canonical: self.logical.canonical_path.clone(),
-                configured: self.opened.configured_path.clone(),
+                expected: expected_path.to_string_lossy().into_owned(),
                 opened: self.opened.opened_path.clone(),
             });
         }
-        if self.opened.opened_sha256 != self.logical.canonical_sha256 {
+        if self.opened.opened_sha256 != self.logical.compressed_sha256 {
             return Err(SourceIdentityErrorV1::DigestMismatch {
-                expected: self.logical.canonical_sha256,
+                expected: self.logical.compressed_sha256,
                 opened: self.opened.opened_sha256,
             });
         }
-        if self.opened.opened_bytes != self.logical.canonical_bytes {
+        if self.opened.opened_bytes != self.logical.compressed_bytes
+            || self.opened.metadata_bytes != self.logical.compressed_bytes
+        {
             return Err(SourceIdentityErrorV1::ByteLengthMismatch {
-                expected: self.logical.canonical_bytes,
+                expected: self.logical.compressed_bytes,
                 opened: self.opened.opened_bytes,
             });
         }
         Ok(())
     }
+}
+
+/// Require an externally supplied source to match one release admitted by the
+/// root event-contract authority. Low-level synthetic tests may validate a
+/// self-consistent projection without this admission; every production probe
+/// calls this function before opening bytes.
+pub fn validate_accepted_catalog_release_v1(
+    logical: &LogicalSourceV1,
+) -> Result<(), SourceIdentityErrorV1> {
+    logical.validate_strict()?;
+    let accepted = ACCEPTED_CATALOG_RELEASE_BINDINGS_V1.iter().any(|binding| {
+        binding.release_id == logical.catalog_release_id
+            && binding.storage_root_id == logical.catalog_storage_root_id
+            && binding.custody_projection_schema == logical.custody_projection_schema
+            && binding.custody_projection_file_sha256
+                == logical.custody_projection_file_sha256.to_hex()
+            && binding.custody_projection_content_sha256
+                == logical.custody_projection_content_sha256.to_hex()
+            && binding.canonical_profile_sha256 == logical.canonical_profile_sha256.to_hex()
+            && binding.embedded_per_file_tsv_sha256 == logical.embedded_per_file_tsv_sha256.to_hex()
+            && binding.evidence_manifest_sha256 == logical.evidence_manifest_sha256.to_hex()
+            && binding.terminal_validation_receipt_sha256
+                == logical.terminal_validation_receipt_sha256.to_hex()
+            && binding.terminal_validation_status == logical.terminal_validation_status
+    });
+    if !accepted {
+        return Err(SourceIdentityErrorV1::CatalogReleaseNotAccepted(
+            logical.catalog_release_id.clone(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reject every path spelling that could escape or ambiguously alias the
+/// catalog's portable POSIX-relative object coordinate.
+pub fn validate_catalog_relative_path_v1(value: &str) -> Result<(), SourceIdentityErrorV1> {
+    if value.is_empty()
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.contains('\\')
+        || value.bytes().any(|byte| !(0x21..=0x7e).contains(&byte))
+        || value
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err(SourceIdentityErrorV1::InvalidRelativePath(value.to_owned()));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -246,18 +418,24 @@ pub enum SourceIdentityErrorV1 {
     UnsupportedDbnVersion(u8),
     #[error("canonical MBO event v1 rejects DBN metadata with ts_out=true")]
     TsOutUnsupported,
+    #[error("catalog terminal validation status must be PASS, found {0}")]
+    CatalogValidationNotPassed(String),
+    #[error("catalog release authority is not accepted by this event-contract build: {0}")]
+    CatalogReleaseNotAccepted(String),
+    #[error("invalid catalog-relative path {0:?}")]
+    InvalidRelativePath(String),
+    #[error("invalid catalog metadata bounds [{start_ns}, {end_ns})")]
+    InvalidMetadataBounds { start_ns: u64, end_ns: u64 },
+    #[error("catalog symbol/provider population identity is empty or inconsistent")]
+    InvalidPopulationIdentity,
     #[error("source object must not be empty")]
     EmptyObject,
-    #[error("source SHA-256 must not be an all-zero placeholder")]
+    #[error("catalog, source, and opened SHA-256 values must not be all-zero placeholders")]
     PlaceholderDigest,
     #[error("strict canonical MBO event v1 rejects every derived replica")]
     DerivedReplicaNotAllowed,
-    #[error("strict source path substitution: canonical={canonical}, configured={configured}, opened={opened}")]
-    PathSubstitution {
-        canonical: String,
-        configured: String,
-        opened: String,
-    },
+    #[error("strict source path substitution: expected={expected}, opened={opened}")]
+    PathSubstitution { expected: String, opened: String },
     #[error("opened source digest mismatch: expected={expected}, opened={opened}")]
     DigestMismatch {
         expected: Sha256DigestV1,
@@ -717,7 +895,7 @@ impl BoundPublisherPolicyV1 {
         }
         Ok(Self {
             id,
-            source_object_sha256: source.logical.canonical_sha256,
+            source_object_sha256: source.logical.compressed_sha256,
         })
     }
 
@@ -1311,24 +1489,59 @@ mod tests {
     }
 
     fn source_descriptor() -> SourceDescriptorV1 {
+        let accepted = ACCEPTED_CATALOG_RELEASE_BINDINGS_V1[0];
+        let parse = |value: &str| Sha256DigestV1::from_hex(value).unwrap();
         SourceDescriptorV1 {
             logical: LogicalSourceV1 {
-                catalog_release_id: "dbc-test-v1".into(),
-                catalog_object_id: "object-1".into(),
-                canonical_path: "/data/object.dbn.zst".into(),
-                canonical_sha256: DIGEST,
-                canonical_bytes: 123,
+                catalog_release_id: accepted.release_id.into(),
+                catalog_storage_root_id: accepted.storage_root_id.into(),
+                custody_projection_schema: accepted.custody_projection_schema.into(),
+                custody_projection_file_sha256: parse(accepted.custody_projection_file_sha256),
+                custody_projection_content_sha256: parse(
+                    accepted.custody_projection_content_sha256,
+                ),
+                canonical_profile_sha256: parse(accepted.canonical_profile_sha256),
+                embedded_per_file_tsv_sha256: parse(accepted.embedded_per_file_tsv_sha256),
+                evidence_manifest_sha256: parse(accepted.evidence_manifest_sha256),
+                terminal_validation_receipt_sha256: parse(
+                    accepted.terminal_validation_receipt_sha256,
+                ),
+                terminal_validation_status: accepted.terminal_validation_status.into(),
+                relative_path: "object.dbn.zst".into(),
+                compressed_sha256: DIGEST,
+                compressed_bytes: 123,
+                expected_records: 1,
+                metadata_start_ns: 1,
+                metadata_end_ns: 2,
+                requested_symbols_preview: "NVDA".into(),
+                requested_symbols_sha256: Sha256DigestV1::from_bytes([7; 32]),
+                symbols_n: 1,
+                active_instruments_n: 1,
+                provenance_tier: "test_only".into(),
+                provider_manifest_relative_path: "manifest.json".into(),
+                provider_manifest_sha256: Sha256DigestV1::from_bytes([8; 32]),
+                provider_job_id: "test-job".into(),
+                provider_declared_data_file_count: 1,
                 dbn_version: 1,
                 dbn_ts_out: false,
                 dataset: "XNAS.ITCH".into(),
                 schema: "mbo".into(),
             },
             opened: OpenedReplicaV1 {
-                configured_path: "/data/object.dbn.zst".into(),
+                custody_projection_path: "/data/custody.json".into(),
+                storage_root_path: "/data".into(),
+                relative_path: "object.dbn.zst".into(),
                 opened_path: "/data/object.dbn.zst".into(),
                 representation: OpenedRepresentationV1::CanonicalObject,
                 opened_sha256: DIGEST,
                 opened_bytes: 123,
+                device_id: 1,
+                inode: 1,
+                metadata_bytes: 123,
+                modified_seconds: 1,
+                modified_nanoseconds: 0,
+                changed_seconds: 1,
+                changed_nanoseconds: 0,
             },
         }
     }
@@ -1337,10 +1550,6 @@ mod tests {
     fn strict_source_identity_rejects_substitution_and_derived_replica() {
         let source = source_descriptor();
         assert!(source.validate_strict().is_ok());
-
-        let mut canonical_alias = source.clone();
-        canonical_alias.logical.canonical_path = "/catalog/object.dbn.zst".into();
-        assert!(canonical_alias.validate_strict().is_ok());
 
         let mut substituted = source.clone();
         substituted.opened.opened_path = "/hot/object.dbn".into();
@@ -1362,7 +1571,7 @@ mod tests {
     #[test]
     fn zero_digest_placeholders_fail_before_accepted_identity_or_event() {
         let mut source = source_descriptor();
-        source.logical.canonical_sha256 = Sha256DigestV1::from_bytes([0; 32]);
+        source.logical.compressed_sha256 = Sha256DigestV1::from_bytes([0; 32]);
         assert_eq!(
             source.validate_strict().unwrap_err(),
             SourceIdentityErrorV1::PlaceholderDigest

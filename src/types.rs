@@ -39,9 +39,11 @@ pub enum Action {
     Modify = b'M',
     /// Cancel/remove order
     Cancel = b'C',
-    /// Trade execution (full or partial fill)
-    Trade = b'T',
-    /// Fill (alternative trade representation)
+    /// Aggregate economic execution. Its side is the aggressor side and its
+    /// order ID is not a resting-book identity. It never mutates the book.
+    TradeAggregate = b'T',
+    /// Resting-order execution evidence. Its side is the resting side. The
+    /// authoritative paired cancel/modify owns quantity mutation.
     Fill = b'F',
     /// Clear/Reset the book
     Clear = b'R',
@@ -56,7 +58,7 @@ impl Action {
             b'A' => Some(Action::Add),
             b'M' => Some(Action::Modify),
             b'C' => Some(Action::Cancel),
-            b'T' => Some(Action::Trade),
+            b'T' => Some(Action::TradeAggregate),
             b'F' => Some(Action::Fill),
             b'R' => Some(Action::Clear),
             b'N' => Some(Action::None),
@@ -163,37 +165,49 @@ impl MboMessage {
         self.price as f64 / NANODOLLARS_PER_DOLLAR_F64
     }
 
-    /// Returns `true` if this message represents a system event (heartbeat,
-    /// status update, metadata) rather than a valid order.
+    /// Returns `true` only for an explicit no-op/control event.
     ///
-    /// System messages are identified by any of:
-    /// - `order_id == 0` (no associated order)
-    /// - `size == 0` (no quantity)
-    /// - `price <= 0` (no valid price)
-    ///
-    /// These messages are common in Databento MBO data (~10-15% of messages)
-    /// and should typically be filtered before LOB reconstruction.
+    /// Field-shape heuristics are not event semantics: valid aggregate trades
+    /// carry `order_id == 0`, while malformed order events can also contain
+    /// zero/sentinel fields. Treating either shape as a system message silently
+    /// drops scientific data or corruption. Call [`Self::validate`] to check
+    /// action-specific field requirements.
     #[inline]
-    pub fn is_system_message(&self) -> bool {
-        self.order_id == 0 || self.size == 0 || self.price <= 0
+    pub fn is_noop_control(&self) -> bool {
+        self.action == Action::None
     }
 
     /// Validate the message fields.
     ///
-    /// Unlike [`Self::is_system_message()`], this method checks whether a message
+    /// Unlike [`Self::is_noop_control()`], this method checks whether a message
     /// that *should* represent a valid order actually has valid field values.
-    /// System messages (heartbeats, status) should be filtered first.
+    /// Explicit no-op controls may be filtered first.
     pub fn validate(&self) -> crate::error::Result<()> {
         use crate::error::TlobError;
+
+        match self.action {
+            Action::None | Action::Clear => return Ok(()),
+            Action::TradeAggregate | Action::Fill => {
+                if self.price <= 0 {
+                    return Err(TlobError::InvalidPrice(self.price));
+                }
+                if self.size == 0 {
+                    return Err(TlobError::InvalidSize(0));
+                }
+                return Ok(());
+            }
+            Action::Add | Action::Modify | Action::Cancel => {}
+        }
 
         if self.order_id == 0 {
             return Err(TlobError::InvalidOrderId(0));
         }
-
+        if self.side == Side::None {
+            return Err(TlobError::InvalidSide(self.side.to_byte()));
+        }
         if self.price <= 0 {
             return Err(TlobError::InvalidPrice(self.price));
         }
-
         if self.size == 0 {
             return Err(TlobError::InvalidSize(0));
         }
@@ -437,12 +451,12 @@ impl LobState {
         self.triggering_side == Some(Side::Ask)
     }
 
-    /// Check if this is a trade/fill event.
+    /// Check if this state was triggered by an execution carrier.
     #[inline]
-    pub fn is_trade_event(&self) -> bool {
+    pub fn is_execution_event(&self) -> bool {
         matches!(
             self.triggering_action,
-            Some(Action::Trade) | Some(Action::Fill)
+            Some(Action::TradeAggregate) | Some(Action::Fill)
         )
     }
 
@@ -768,7 +782,7 @@ mod tests {
         assert_eq!(Action::from_byte(b'A'), Some(Action::Add));
         assert_eq!(Action::from_byte(b'M'), Some(Action::Modify));
         assert_eq!(Action::from_byte(b'C'), Some(Action::Cancel));
-        assert_eq!(Action::from_byte(b'T'), Some(Action::Trade));
+        assert_eq!(Action::from_byte(b'T'), Some(Action::TradeAggregate));
         assert_eq!(Action::from_byte(b'F'), Some(Action::Fill));
         assert_eq!(Action::from_byte(b'R'), Some(Action::Clear));
         assert_eq!(Action::from_byte(b'N'), Some(Action::None));
@@ -780,7 +794,7 @@ mod tests {
         assert_eq!(Action::Add.to_byte(), b'A');
         assert_eq!(Action::Modify.to_byte(), b'M');
         assert_eq!(Action::Cancel.to_byte(), b'C');
-        assert_eq!(Action::Trade.to_byte(), b'T');
+        assert_eq!(Action::TradeAggregate.to_byte(), b'T');
         assert_eq!(Action::Fill.to_byte(), b'F');
         assert_eq!(Action::Clear.to_byte(), b'R');
         assert_eq!(Action::None.to_byte(), b'N');
@@ -824,9 +838,9 @@ mod tests {
     #[test]
     fn test_mbo_message_with_timestamp() {
         let msg = MboMessage::new(123, Action::Add, Side::Bid, 100_000_000_000, 100)
-            .with_timestamp(1234567890_000_000_000);
+            .with_timestamp(1_234_567_890_000_000_000);
 
-        assert_eq!(msg.timestamp, Some(1234567890_000_000_000));
+        assert_eq!(msg.timestamp, Some(1_234_567_890_000_000_000));
     }
 
     #[test]
@@ -1193,10 +1207,10 @@ mod tests {
         assert!(state.timestamp.is_none());
         assert_eq!(state.sequence, 0);
 
-        state.timestamp = Some(1234567890_000_000_000);
+        state.timestamp = Some(1_234_567_890_000_000_000);
         state.sequence = 42;
 
-        assert_eq!(state.timestamp, Some(1234567890_000_000_000));
+        assert_eq!(state.timestamp, Some(1_234_567_890_000_000_000));
         assert_eq!(state.sequence, 42);
     }
 
@@ -1267,18 +1281,18 @@ mod tests {
 
         // No action set
         assert!(!state.was_triggered_by(Action::Add));
-        assert!(!state.was_triggered_by(Action::Trade));
+        assert!(!state.was_triggered_by(Action::TradeAggregate));
 
         // Set to Add
         state.triggering_action = Some(Action::Add);
         assert!(state.was_triggered_by(Action::Add));
-        assert!(!state.was_triggered_by(Action::Trade));
+        assert!(!state.was_triggered_by(Action::TradeAggregate));
         assert!(!state.was_triggered_by(Action::Cancel));
 
         // Set to Trade
-        state.triggering_action = Some(Action::Trade);
+        state.triggering_action = Some(Action::TradeAggregate);
         assert!(!state.was_triggered_by(Action::Add));
-        assert!(state.was_triggered_by(Action::Trade));
+        assert!(state.was_triggered_by(Action::TradeAggregate));
     }
 
     #[test]
@@ -1305,31 +1319,31 @@ mod tests {
         let mut state = LobState::new(10);
 
         // No action
-        assert!(!state.is_trade_event());
+        assert!(!state.is_execution_event());
         assert!(!state.is_add_event());
         assert!(!state.is_cancel_event());
 
         // Trade event
-        state.triggering_action = Some(Action::Trade);
-        assert!(state.is_trade_event());
+        state.triggering_action = Some(Action::TradeAggregate);
+        assert!(state.is_execution_event());
         assert!(!state.is_add_event());
         assert!(!state.is_cancel_event());
 
         // Fill event (also a trade)
         state.triggering_action = Some(Action::Fill);
-        assert!(state.is_trade_event());
+        assert!(state.is_execution_event());
         assert!(!state.is_add_event());
         assert!(!state.is_cancel_event());
 
         // Add event
         state.triggering_action = Some(Action::Add);
-        assert!(!state.is_trade_event());
+        assert!(!state.is_execution_event());
         assert!(state.is_add_event());
         assert!(!state.is_cancel_event());
 
         // Cancel event
         state.triggering_action = Some(Action::Cancel);
-        assert!(!state.is_trade_event());
+        assert!(!state.is_execution_event());
         assert!(!state.is_add_event());
         assert!(state.is_cancel_event());
     }
@@ -1355,12 +1369,12 @@ mod tests {
         state.previous_timestamp = Some(1_000_000_000);
         state.timestamp = Some(1_001_000_000); // 1ms later
         state.delta_ns = 1_000_000; // 1ms
-        state.triggering_action = Some(Action::Trade);
+        state.triggering_action = Some(Action::TradeAggregate);
         state.triggering_side = Some(Side::Ask);
 
         assert!((state.delta_seconds().unwrap() - 0.001).abs() < 1e-9);
         assert!((state.event_intensity().unwrap() - 1000.0).abs() < 1e-6);
-        assert!(state.is_trade_event());
+        assert!(state.is_execution_event());
         assert!(state.was_triggered_on_ask());
     }
 

@@ -8,24 +8,13 @@
 //!
 //! - **Provider Agnostic**: Works with Databento, other vendors, or mock data
 //! - **Iterator-Based**: Simple streaming interface
-//! - **Metadata Support**: Access to source information (symbol, date, path)
+//! - **Metadata Support**: Access to caller-supplied symbol/date hints
 //! - **Testable**: Easy to mock for unit tests
 //!
-//! # Example
-//!
-//! ```ignore
-//! use mbo_lob_reconstructor::source::{MarketDataSource, DbnSource};
-//!
-//! // Use with Databento files
-//! let source = DbnSource::new("data/NVDA.mbo.dbn.zst")?;
-//!
-//! for msg in source.messages()? {
-//!     // Process message...
-//! }
-//!
-//! // Or with hot store
-//! let source = DbnSource::with_hot_store("data/raw/NVDA.mbo.dbn.zst", &hot_store)?;
-//! ```
+//! `MarketDataSource` is intentionally limited to already-decoded in-memory or
+//! synthetic messages. Physical DBN files require typed decode errors and
+//! source-identity binding, so production file consumers use `StrictDbnLoaderV1`
+//! directly rather than this infallible iterator trait.
 //!
 //! # Implementing Custom Sources
 //!
@@ -51,27 +40,9 @@
 //! }
 //! ```
 
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-
 use crate::error::Result;
 use crate::types::MboMessage;
-
-#[cfg(feature = "databento")]
-use crate::hotstore::HotStoreManager;
-#[cfg(feature = "databento")]
-use crate::loader::DbnLoader;
-#[cfg(feature = "legacy-iterator-api")]
-use crate::loader::MessageIterator;
-// Phase M M.A.12: `File` and `BufReader` are only consumed by the
-// `MarketDataSource for DbnSource` impl (gated under both `databento` AND
-// `legacy-iterator-api`). Widen the import gate to match — pre-M.A.12 the
-// imports were `databento`-only, producing dead-code warnings under
-// `--features databento --no-default-features` (Agent V1 CRITICAL).
-#[cfg(all(feature = "databento", feature = "legacy-iterator-api"))]
-use std::fs::File;
-#[cfg(all(feature = "databento", feature = "legacy-iterator-api"))]
-use std::io::BufReader;
+use serde::{Deserialize, Serialize};
 
 // ============================================================================
 // Source Metadata
@@ -89,17 +60,11 @@ pub struct SourceMetadata {
     /// Trading date in YYYY-MM-DD format
     pub date: Option<String>,
 
-    /// Original file path (if loaded from file)
-    pub file_path: Option<PathBuf>,
-
     /// Data provider name (e.g., "databento", "custom")
     pub provider: Option<String>,
 
     /// Estimated message count (for progress tracking)
     pub estimated_messages: Option<u64>,
-
-    /// File size in bytes (if applicable)
-    pub file_size: Option<u64>,
 }
 
 impl SourceMetadata {
@@ -120,12 +85,6 @@ impl SourceMetadata {
         self
     }
 
-    /// Set the file path.
-    pub fn with_file_path(mut self, path: impl AsRef<Path>) -> Self {
-        self.file_path = Some(path.as_ref().to_path_buf());
-        self
-    }
-
     /// Set the provider.
     pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
         self.provider = Some(provider.into());
@@ -136,55 +95,6 @@ impl SourceMetadata {
     pub fn with_estimated_messages(mut self, count: u64) -> Self {
         self.estimated_messages = Some(count);
         self
-    }
-
-    /// Set the file size.
-    pub fn with_file_size(mut self, size: u64) -> Self {
-        self.file_size = Some(size);
-        self
-    }
-
-    /// Extract metadata from a file path.
-    ///
-    /// Attempts to parse symbol and date from common filename patterns:
-    /// - `NVDA_2025-02-03.mbo.dbn.zst` → symbol="NVDA", date="2025-02-03"
-    /// - `NVDA.mbo.dbn.zst` → symbol="NVDA"
-    pub fn from_path(path: impl AsRef<Path>) -> Self {
-        let path = path.as_ref();
-        let mut metadata = Self::new().with_file_path(path);
-
-        // Get file size
-        if let Ok(meta) = std::fs::metadata(path) {
-            metadata.file_size = Some(meta.len());
-        }
-
-        // Parse filename for symbol and date
-        if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-            // Remove extensions
-            let base = filename
-                .trim_end_matches(".zst")
-                .trim_end_matches(".dbn")
-                .trim_end_matches(".mbo")
-                .trim_end_matches(".mbp-10");
-
-            // Try to extract symbol and date
-            // Pattern: SYMBOL_YYYY-MM-DD or SYMBOL
-            if let Some(underscore_pos) = base.find('_') {
-                let symbol = &base[..underscore_pos];
-                let rest = &base[underscore_pos + 1..];
-
-                metadata.symbol = Some(symbol.to_string());
-
-                // Check if rest looks like a date (YYYY-MM-DD)
-                if rest.len() >= 10 && rest.chars().nth(4) == Some('-') {
-                    metadata.date = Some(rest[..10].to_string());
-                }
-            } else {
-                metadata.symbol = Some(base.to_string());
-            }
-        }
-
-        metadata
     }
 }
 
@@ -305,158 +215,6 @@ impl MarketDataSource for VecSource {
 }
 
 // ============================================================================
-// DBN Source (Databento)
-// ============================================================================
-
-/// Market data source for Databento DBN files.
-///
-/// Wraps `DbnLoader` with the `MarketDataSource` trait, providing:
-/// - Automatic metadata extraction from filename
-/// - Optional hot store integration for faster loading
-/// - Consistent interface with other data sources
-///
-/// # Example
-///
-/// ```ignore
-/// use mbo_lob_reconstructor::source::{DbnSource, MarketDataSource};
-///
-/// // Load from compressed file
-/// let source = DbnSource::new("data/NVDA_2025-02-03.mbo.dbn.zst")?;
-///
-/// println!("Symbol: {:?}", source.metadata().symbol);
-/// println!("Date: {:?}", source.metadata().date);
-///
-/// for msg in source.messages()? {
-///     // Process messages...
-/// }
-/// ```
-///
-/// # Hot Store Integration
-///
-/// For faster loading with pre-decompressed files:
-///
-/// ```ignore
-/// use mbo_lob_reconstructor::source::DbnSource;
-/// use mbo_lob_reconstructor::hotstore::HotStoreManager;
-///
-/// let hot_store = HotStoreManager::for_dbn("data/hot/");
-/// let source = DbnSource::with_hot_store("data/raw/NVDA.mbo.dbn.zst", &hot_store)?;
-///
-/// // Automatically uses decompressed file if available (~5x faster)
-/// for msg in source.messages()? {
-///     // ...
-/// }
-/// ```
-#[cfg(feature = "databento")]
-#[cfg_attr(docsrs, doc(cfg(feature = "databento")))]
-pub struct DbnSource {
-    loader: DbnLoader,
-    metadata: SourceMetadata,
-}
-
-#[cfg(feature = "databento")]
-impl DbnSource {
-    /// Create a new DBN source from a file path.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - Path to the .dbn or .dbn.zst file
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(DbnSource)` - Ready to iterate
-    /// * `Err(...)` - File not found or invalid
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref();
-        let loader = DbnLoader::new(path)?;
-        let mut metadata = SourceMetadata::from_path(path);
-        metadata.provider = Some("databento".to_string());
-
-        Ok(Self { loader, metadata })
-    }
-
-    /// Create a new DBN source with hot store path resolution.
-    ///
-    /// If a decompressed version exists in the hot store, it will be used
-    /// for significantly faster loading (~5x speedup).
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - Path to the .dbn.zst file
-    /// * `hot_store` - Hot store manager for path resolution
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(DbnSource)` - Using resolved path (decompressed if available)
-    /// * `Err(...)` - File not found in either location
-    pub fn with_hot_store<P: AsRef<Path>>(path: P, hot_store: &HotStoreManager) -> Result<Self> {
-        let original_path = path.as_ref();
-        let loader = DbnLoader::with_hot_store(original_path, hot_store)?;
-
-        // Metadata from original path (for consistent symbol/date extraction)
-        let mut metadata = SourceMetadata::from_path(original_path);
-        metadata.provider = Some("databento".to_string());
-
-        // Update file_path and file_size to reflect resolved path
-        let resolved_path = loader.path();
-        if resolved_path != original_path {
-            log::info!(
-                "Using hot store: {} -> {}",
-                original_path.display(),
-                resolved_path.display()
-            );
-            metadata.file_path = Some(resolved_path.to_path_buf());
-            if let Ok(meta) = std::fs::metadata(resolved_path) {
-                metadata.file_size = Some(meta.len());
-            }
-        }
-
-        Ok(Self { loader, metadata })
-    }
-
-    /// Enable skipping invalid messages.
-    ///
-    /// When enabled, messages that fail to decode will be logged and skipped.
-    pub fn skip_invalid(mut self, skip: bool) -> Self {
-        self.loader = self.loader.skip_invalid(skip);
-        self
-    }
-
-    /// Get the resolved file path being used.
-    pub fn path(&self) -> &Path {
-        self.loader.path()
-    }
-}
-
-/// Type alias for the DBN message iterator (auto-detects compression).
-///
-/// Phase M M.A.2: inner reader is wrapped in [`CountingReader`] for byte-tracking
-/// observability (closes F-008 — `LoaderStats::bytes_read` now correctly populated).
-///
-/// **DEPRECATED in 0.2.0** — uses legacy `MessageIterator` (gated under
-/// `legacy-iterator-api` feature). The `MarketDataSource` trait integration
-/// will migrate to [`TypedMessageIterator`] in a follow-up cycle once the
-/// trait is updated to support `Item = Result<MboMessage, BoundaryError>`.
-#[cfg(all(feature = "databento", feature = "legacy-iterator-api"))]
-type DbnMessageIterator = MessageIterator<
-    dbn::decode::DynDecoder<'static, crate::loader::CountingReader<BufReader<File>>>,
->;
-
-#[cfg(all(feature = "databento", feature = "legacy-iterator-api"))]
-impl MarketDataSource for DbnSource {
-    type MessageIter = DbnMessageIterator;
-
-    fn messages(self) -> Result<Self::MessageIter> {
-        #[allow(deprecated)] // intentional bridge to MarketDataSource trait
-        self.loader.iter_messages()
-    }
-
-    fn metadata(&self) -> &SourceMetadata {
-        &self.metadata
-    }
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
 
@@ -484,24 +242,6 @@ mod tests {
         assert_eq!(meta.date, Some("2025-02-03".to_string()));
         assert_eq!(meta.provider, Some("databento".to_string()));
         assert_eq!(meta.estimated_messages, Some(1000));
-    }
-
-    #[test]
-    fn test_source_metadata_from_path() {
-        // Full pattern: SYMBOL_DATE.mbo.dbn.zst
-        let meta = SourceMetadata::from_path("/data/NVDA_2025-02-03.mbo.dbn.zst");
-        assert_eq!(meta.symbol, Some("NVDA".to_string()));
-        assert_eq!(meta.date, Some("2025-02-03".to_string()));
-
-        // Symbol only
-        let meta = SourceMetadata::from_path("/data/AAPL.mbo.dbn.zst");
-        assert_eq!(meta.symbol, Some("AAPL".to_string()));
-        assert!(meta.date.is_none());
-
-        // Complex symbol
-        let meta = SourceMetadata::from_path("/data/ES_2025-03-15.mbo.dbn.zst");
-        assert_eq!(meta.symbol, Some("ES".to_string()));
-        assert_eq!(meta.date, Some("2025-03-15".to_string()));
     }
 
     #[test]
@@ -550,74 +290,5 @@ mod tests {
 
         let collected: Vec<_> = source.messages().unwrap().collect();
         assert!(collected.is_empty());
-    }
-
-    // ========================================================================
-    // DbnSource tests (require databento feature)
-    // ========================================================================
-
-    // Phase M M.A.12: gated under BOTH features. The tests call
-    // `source.metadata()` and `source.messages()` which come from the
-    // `MarketDataSource for DbnSource` trait impl that is itself gated
-    // `#[cfg(all(databento, legacy-iterator-api))]`. Pre-M.A.12 only the
-    // `databento` gate was applied here, producing E0599 errors when
-    // building with `--features databento --no-default-features` (Agent V1
-    // CRITICAL feature-gating finding).
-    #[cfg(all(feature = "databento", feature = "legacy-iterator-api"))]
-    mod dbn_tests {
-        use super::*;
-
-        #[test]
-        fn test_dbn_source_nonexistent_file() {
-            let result = DbnSource::new("/nonexistent/file.dbn.zst");
-            assert!(result.is_err());
-        }
-
-        #[test]
-        fn test_dbn_source_metadata_extraction() {
-            // Test metadata extraction from path (doesn't require file to exist)
-            let meta = SourceMetadata::from_path("/data/NVDA_2025-02-03.mbo.dbn.zst");
-            assert_eq!(meta.symbol, Some("NVDA".to_string()));
-            assert_eq!(meta.date, Some("2025-02-03".to_string()));
-        }
-
-        #[test]
-        fn test_dbn_source_with_real_file() {
-            // Only run if test file exists
-            let test_file = std::env::var("TEST_DBN_FILE").unwrap_or_else(|_| {
-                // Try common test file locations
-                let candidates = [
-                    "../data/XNAS_ITCH/NVDA/mbo_2025-02-03_to_2026-01-07/xnas-itch-20250203.mbo.dbn.zst",
-                    "../../data/XNAS_ITCH/NVDA/mbo_2025-02-03_to_2026-01-07/xnas-itch-20250203.mbo.dbn.zst",
-                ];
-                for path in candidates {
-                    if std::path::Path::new(path).exists() {
-                        return path.to_string();
-                    }
-                }
-                String::new()
-            });
-
-            if test_file.is_empty() || !std::path::Path::new(&test_file).exists() {
-                eprintln!("Skipping test_dbn_source_with_real_file: no test file available");
-                return;
-            }
-
-            let source = DbnSource::new(&test_file).expect("Failed to create source");
-
-            assert_eq!(source.metadata().provider, Some("databento".to_string()));
-            assert!(source.metadata().symbol.is_some());
-
-            // Count a few messages
-            let mut count = 0;
-            for _msg in source.messages().expect("Failed to get messages") {
-                count += 1;
-                if count >= 100 {
-                    break;
-                }
-            }
-
-            assert!(count > 0, "Should have read at least one message");
-        }
     }
 }

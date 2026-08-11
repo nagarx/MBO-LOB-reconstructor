@@ -312,7 +312,7 @@ impl DayBoundaryStats {
 /// let mut detector = DayBoundaryDetector::new(DayBoundaryConfig::us_equity());
 ///
 /// // Simulate messages
-/// let ts1 = 1704067200_000_000_000i64; // Day 1
+/// let ts1 = 1_704_067_200_000_000_000_i64; // Day 1
 /// let ts2 = ts1 + 3600_000_000_000;     // 1 hour later (same day)
 /// let ts3 = ts1 + 20 * 3600_000_000_000; // 20 hours later (next day)
 ///
@@ -469,7 +469,7 @@ mod tests {
     #[test]
     fn test_detector_first_message_no_boundary() {
         let mut detector = DayBoundaryDetector::new(DayBoundaryConfig::us_equity());
-        let ts = 1704067200_000_000_000i64;
+        let ts = 1_704_067_200_000_000_000_i64;
         assert!(detector.check_boundary(ts).is_none());
         assert_eq!(detector.current_day_index(), 0);
     }
@@ -477,8 +477,8 @@ mod tests {
     #[test]
     fn test_detector_same_day_no_boundary() {
         let mut detector = DayBoundaryDetector::new(DayBoundaryConfig::us_equity());
-        let ts1 = 1704067200_000_000_000i64;
-        let ts2 = ts1 + 1 * NS_PER_HOUR; // 1 hour later
+        let ts1 = 1_704_067_200_000_000_000_i64;
+        let ts2 = ts1 + NS_PER_HOUR; // 1 hour later
 
         detector.check_boundary(ts1);
         assert!(detector.check_boundary(ts2).is_none());
@@ -490,7 +490,7 @@ mod tests {
         let config = DayBoundaryConfig::us_equity().with_gap_threshold_hours(4);
         let mut detector = DayBoundaryDetector::new(config);
 
-        let ts1 = 1704067200_000_000_000i64;
+        let ts1 = 1_704_067_200_000_000_000_i64;
         let ts2 = ts1 + 5 * NS_PER_HOUR; // 5 hours later (exceeds 4h threshold)
 
         detector.check_boundary(ts1);
@@ -509,7 +509,7 @@ mod tests {
         let config = DayBoundaryConfig::us_equity().with_gap_threshold_hours(4);
         let mut detector = DayBoundaryDetector::new(config);
 
-        let ts1 = 1704067200_000_000_000i64;
+        let ts1 = 1_704_067_200_000_000_000_i64;
         let ts2 = ts1 + 20 * NS_PER_HOUR; // Day 2
         let ts3 = ts2 + 20 * NS_PER_HOUR; // Day 3
 
@@ -528,7 +528,7 @@ mod tests {
         let mut detector = DayBoundaryDetector::new(config);
 
         // Day 1 timestamp (some time during the day)
-        let ts1 = 1704067200_000_000_000i64; // Jan 1, 2024 00:00:00 UTC
+        let ts1 = 1_704_067_200_000_000_000_i64; // Jan 1, 2024 00:00:00 UTC
         let ts2 = ts1 + 23 * NS_PER_HOUR; // 23:00 same day
         let ts3 = ts1 + 25 * NS_PER_HOUR; // 01:00 next day
 
@@ -572,7 +572,7 @@ mod tests {
     fn test_detector_reset() {
         let mut detector = DayBoundaryDetector::new(DayBoundaryConfig::us_equity());
 
-        let ts1 = 1704067200_000_000_000i64;
+        let ts1 = 1_704_067_200_000_000_000_i64;
         let ts2 = ts1 + 20 * NS_PER_HOUR;
 
         detector.check_boundary(ts1);

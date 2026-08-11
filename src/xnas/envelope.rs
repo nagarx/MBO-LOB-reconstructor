@@ -611,8 +611,7 @@ pub enum EnvelopeAssemblyErrorV1 {
 mod tests {
     use super::*;
     use hft_mbo_event_contract::{
-        classify_full_order_book, validate_raw_event, BoundPublisherPolicyV1, LogicalSourceV1,
-        OpenedReplicaV1, OpenedRepresentationV1, PublisherPolicyIdV1, SourceDescriptorV1,
+        classify_full_order_book, validate_raw_event, BoundPublisherPolicyV1, PublisherPolicyIdV1,
         ACTION_ADD, ACTION_CANCEL, ACTION_CLEAR, ACTION_FILL, ACTION_MODIFY, ACTION_NONE,
         ACTION_TRADE, EXPECTED_MBO_RECORD_SIZE_BYTES, EXPECTED_MBO_RTYPE, SIDE_ASK, SIDE_BID,
         SIDE_NONE, UNDEF_PRICE,
@@ -623,26 +622,7 @@ mod tests {
     }
 
     fn policy(source_digest: Sha256DigestV1) -> BoundPublisherPolicyV1 {
-        let source = SourceDescriptorV1 {
-            logical: LogicalSourceV1 {
-                catalog_release_id: "test".into(),
-                catalog_object_id: "test".into(),
-                canonical_path: "/test.dbn".into(),
-                canonical_sha256: source_digest,
-                canonical_bytes: 1,
-                dbn_version: 1,
-                dbn_ts_out: false,
-                dataset: "XNAS.ITCH".into(),
-                schema: "mbo".into(),
-            },
-            opened: OpenedReplicaV1 {
-                configured_path: "/test.dbn".into(),
-                opened_path: "/test.dbn".into(),
-                representation: OpenedRepresentationV1::CanonicalObject,
-                opened_sha256: source_digest,
-                opened_bytes: 1,
-            },
-        };
+        let source = crate::xnas::test_source_descriptor_v1(source_digest);
         BoundPublisherPolicyV1::bind(PublisherPolicyIdV1::XnasItchHistorical, &source).unwrap()
     }
 

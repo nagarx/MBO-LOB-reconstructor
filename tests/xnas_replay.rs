@@ -1,24 +1,27 @@
 #![cfg(feature = "databento")]
 
+mod support;
+
 use dbn::encode::{DbnEncoder, DynWriter, EncodeRecord};
 use dbn::{
     flags, Compression, MappingInterval, MboMsg, Metadata, RecordHeader, SType, Schema,
     SymbolMapping,
 };
 use hft_mbo_event_contract::{
-    LogicalSourceV1, PublisherPolicyIdV1, Sha256DigestV1, ValidationReasonV1, UNDEF_PRICE,
+    PublisherPolicyIdV1, Sha256DigestV1, ValidationReasonV1, UNDEF_PRICE,
 };
 use mbo_lob_reconstructor::{
     BookTransactionErrorV1, CanonicalSourceExpectationV1, StrictDbnLoaderV1, StrictXnasReplayV1,
-    VerifiedRejectionStageV1, XnasEofTailReasonV1, XnasQuarantineReasonV1,
-    XnasRejectedRecordPhaseV1, XnasReplayConfigV1, XnasReplayErrorV1, XnasReplayRunV1,
-    XnasSelectedOrdinalRoleV1, XnasTerminalDisqualificationReasonV1, XnasTerminalIdentityStatusV1,
-    XnasValidityInvalidationReasonV1,
+    VerifiedRejectionStageV1, XnasCommittedObservationAccumulatorV1, XnasEofTailReasonV1,
+    XnasObservationAccountingErrorV1, XnasQuarantineReasonV1, XnasRejectedRecordPhaseV1,
+    XnasReplayConfigV1, XnasReplayErrorV1, XnasReplayProbeRequestErrorV1, XnasReplayProbeRequestV1,
+    XnasReplayRunV1, XnasSelectedOrdinalRoleV1, XnasTerminalDisqualificationReasonV1,
+    XnasTerminalIdentityStatusV1, XnasValidityInvalidationReasonV1,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::process::Command;
@@ -153,35 +156,35 @@ fn write_dbn_with_metadata(
     encoder.flush().unwrap();
 }
 
-fn digest_and_len(path: &Path) -> (Sha256DigestV1, u64) {
-    let mut bytes = Vec::new();
-    File::open(path).unwrap().read_to_end(&mut bytes).unwrap();
-    (
-        Sha256DigestV1::from_bytes(Sha256::digest(&bytes).into()),
-        bytes.len() as u64,
-    )
+fn expectation(path: &Path, expected_records: u64) -> CanonicalSourceExpectationV1 {
+    support::expectation(path, "XNAS.ITCH", "mbo", 1, false, expected_records)
 }
 
-fn expectation(path: &Path, expected_records: u64) -> CanonicalSourceExpectationV1 {
-    let (digest, bytes) = digest_and_len(path);
-    CanonicalSourceExpectationV1::new(
-        LogicalSourceV1 {
-            catalog_release_id: "synthetic-xnas-v1".into(),
-            catalog_object_id: "synthetic-object".into(),
-            canonical_path: path.to_str().unwrap().into(),
-            canonical_sha256: digest,
-            canonical_bytes: bytes,
-            dbn_version: 1,
-            dbn_ts_out: false,
-            dataset: "XNAS.ITCH".into(),
-            schema: "mbo".into(),
-        },
+fn two_identity_expectation(path: &Path, expected_records: u64) -> CanonicalSourceExpectationV1 {
+    support::expectation_with_population(
+        path,
+        "XNAS.ITCH",
+        "mbo",
+        1,
+        false,
         expected_records,
+        "ONE,TWO",
+        2,
+        2,
     )
 }
 
 fn open_replay(path: &Path, records: u64) -> StrictXnasReplayV1 {
     open_replay_with_config(path, records, replay_config())
+}
+
+fn open_two_identity_replay(path: &Path, records: u64) -> StrictXnasReplayV1 {
+    let stream = StrictDbnLoaderV1::open(
+        two_identity_expectation(path, records),
+        PublisherPolicyIdV1::XnasItchHistorical,
+    )
+    .unwrap();
+    StrictXnasReplayV1::from_strict_stream(stream, replay_config()).unwrap()
 }
 
 fn open_replay_with_config(
@@ -191,7 +194,6 @@ fn open_replay_with_config(
 ) -> StrictXnasReplayV1 {
     let stream = StrictDbnLoaderV1::open(
         expectation(path, records),
-        path,
         PublisherPolicyIdV1::XnasItchHistorical,
     )
     .unwrap();
@@ -540,7 +542,7 @@ fn strict_loader_replay_proves_repeated_last_multiblock_and_population_semantics
         assert_eq!(updates[0].events().len(), 1);
         assert_eq!(
             updates[0].source_object_sha256(),
-            expectation(&path, 10).logical().canonical_sha256
+            expectation(&path, 10).logical().compressed_sha256
         );
         assert_eq!(updates[0].validity_epoch_index(), 1);
         assert_eq!(updates[0].first_source_ordinal(), 2);
@@ -668,9 +670,11 @@ fn qualified_two_pass_replay_exposes_pending_envelopes_then_exact_equivalence() 
     write_dbn(&path, Compression::None, &records);
     let expected_source = expectation(&path, records.len() as u64)
         .logical()
-        .canonical_sha256;
+        .compressed_sha256;
 
-    let plan = open_replay(&path, records.len() as u64).qualify().unwrap();
+    let plan = open_replay(&path, records.len() as u64)
+        .qualify_unbound_development()
+        .unwrap();
     assert_eq!(
         plan.qualification_receipt().source().decoded_records(),
         records.len() as u64
@@ -718,10 +722,12 @@ fn qualified_two_pass_replay_exposes_pending_envelopes_then_exact_equivalence() 
         assert_eq!(build.rustc_version(), rustc_verbose.lines().next().unwrap());
     }
     let mut pass = plan.open_revalidation_pass().unwrap();
+    let mut accounting = XnasCommittedObservationAccumulatorV1::new(plan.qualification_receipt());
     let mut observations = Vec::new();
     let mut observation_digests = Vec::new();
     let mut observation_chains = Vec::new();
     while let Some(observation) = pass.next_observation().unwrap() {
+        accounting.observe(&observation).unwrap();
         observation_digests.push(observation.committed_observation_sha256());
         observation_chains.push(observation.committed_observation_chain_sha256());
         observations.push((
@@ -767,6 +773,9 @@ fn qualified_two_pass_replay_exposes_pending_envelopes_then_exact_equivalence() 
     );
 
     let equivalence = pass.finish().unwrap();
+    let closure = accounting.finish(&equivalence).unwrap();
+    assert_eq!(closure.observations_consumed(), 4);
+    assert_eq!(closure.terminal_chain_sha256(), independent_chain);
     assert_eq!(equivalence.schema(), "xnas_replay_equivalence_receipt_v1");
     assert_eq!(equivalence.exact_receipt(), plan.qualification_receipt());
     assert_eq!(equivalence.verified_complete_replays(), 2);
@@ -783,13 +792,110 @@ fn qualified_two_pass_replay_exposes_pending_envelopes_then_exact_equivalence() 
 }
 
 #[test]
+fn observation_accounting_detects_skipped_duplicated_and_reordered_pass_two_items() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("observation-accounting.dbn");
+    let records = conformance_records(START_NS + 1, START_NS + 2);
+    write_dbn(&path, Compression::None, &records);
+    let plan = open_replay(&path, records.len() as u64)
+        .qualify_unbound_development()
+        .unwrap();
+
+    let mut skipped_pass = plan.open_revalidation_pass().unwrap();
+    let _skipped = skipped_pass.next_observation().unwrap().unwrap();
+    let second = skipped_pass.next_observation().unwrap().unwrap();
+    let mut skipped = XnasCommittedObservationAccumulatorV1::new(plan.qualification_receipt());
+    assert!(matches!(
+        skipped.observe(&second),
+        Err(XnasObservationAccountingErrorV1::ChainMismatch)
+    ));
+
+    let mut duplicate_pass = plan.open_revalidation_pass().unwrap();
+    let first = duplicate_pass.next_observation().unwrap().unwrap();
+    let mut duplicate = XnasCommittedObservationAccumulatorV1::new(plan.qualification_receipt());
+    duplicate.observe(&first).unwrap();
+    assert!(matches!(
+        duplicate.observe(&first),
+        Err(XnasObservationAccountingErrorV1::OrdinalRegression { .. })
+    ));
+
+    let mut reordered_pass = plan.open_revalidation_pass().unwrap();
+    let _first = reordered_pass.next_observation().unwrap().unwrap();
+    let second = reordered_pass.next_observation().unwrap().unwrap();
+    let mut reordered = XnasCommittedObservationAccumulatorV1::new(plan.qualification_receipt());
+    assert!(matches!(
+        reordered.observe(&second),
+        Err(XnasObservationAccountingErrorV1::ChainMismatch)
+    ));
+}
+
+#[test]
+fn observation_accounting_finish_detects_omitted_tail_item() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("observation-accounting-tail.dbn");
+    let records = conformance_records(START_NS + 1, START_NS + 2);
+    write_dbn(&path, Compression::None, &records);
+    let plan = open_replay(&path, records.len() as u64)
+        .qualify_unbound_development()
+        .unwrap();
+
+    let mut pass = plan.open_revalidation_pass().unwrap();
+    let mut accounting = XnasCommittedObservationAccumulatorV1::new(plan.qualification_receipt());
+    let mut held_back = None;
+    while let Some(observation) = pass.next_observation().unwrap() {
+        if let Some(previous) = held_back.replace(observation) {
+            accounting.observe(&previous).unwrap();
+        }
+    }
+    assert!(
+        held_back.is_some(),
+        "fixture must produce an omitted tail item"
+    );
+    let equivalence = pass.finish().unwrap();
+    assert!(matches!(
+        accounting.finish(&equivalence),
+        Err(XnasObservationAccountingErrorV1::ObservationCountMismatch { .. })
+    ));
+}
+
+#[test]
+fn observation_accounting_is_bound_to_the_exact_qualification_receipt() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("observation-accounting-receipt.dbn");
+    let records = conformance_records(START_NS + 1, START_NS + 2);
+    write_dbn(&path, Compression::None, &records);
+    let plan = open_replay(&path, records.len() as u64)
+        .qualify_unbound_development()
+        .unwrap();
+    let other_config = XnasReplayConfigV1::new(
+        NonZeroUsize::new(5).unwrap(),
+        NonZeroUsize::new(64).unwrap(),
+        NonZeroUsize::new(64).unwrap(),
+    );
+    let other = open_replay_with_config(&path, records.len() as u64, other_config)
+        .qualify_unbound_development()
+        .unwrap();
+    let mut other_pass = other.open_revalidation_pass().unwrap();
+    while other_pass.next_observation().unwrap().is_some() {}
+    let other_equivalence = other_pass.finish().unwrap();
+
+    let accounting = XnasCommittedObservationAccumulatorV1::new(plan.qualification_receipt());
+    assert!(matches!(
+        accounting.finish(&other_equivalence),
+        Err(XnasObservationAccountingErrorV1::ReceiptBindingMismatch)
+    ));
+}
+
+#[test]
 fn qualified_two_pass_replay_preserves_quarantine_recovery_and_epoch_semantics() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("two-pass-recovery.dbn");
     let records = recoverable_failure_records(RecoverableFailureFixtureV1::MissingModify);
     write_dbn(&path, Compression::None, &records);
 
-    let plan = open_replay(&path, records.len() as u64).qualify().unwrap();
+    let plan = open_replay(&path, records.len() as u64)
+        .qualify_unbound_development()
+        .unwrap();
     assert_eq!(
         plan.qualification_receipt()
             .counts()
@@ -822,7 +928,9 @@ fn revalidation_cannot_finish_before_eof_or_after_source_mutation() {
     let path = dir.path().join("two-pass-terminal-gate.dbn");
     let records = conformance_records(START_NS + 1, START_NS + 2);
     write_dbn(&path, Compression::None, &records);
-    let plan = open_replay(&path, records.len() as u64).qualify().unwrap();
+    let plan = open_replay(&path, records.len() as u64)
+        .qualify_unbound_development()
+        .unwrap();
 
     let pass = plan.open_revalidation_pass().unwrap();
     assert!(matches!(
@@ -843,7 +951,7 @@ fn revalidation_cannot_finish_before_eof_or_after_source_mutation() {
     assert!(matches!(
         pass.finish(),
         Err(XnasReplayErrorV1::Boundary(
-            mbo_lob_reconstructor::StrictBoundaryErrorV1::SourceChangedDuringDecode { .. }
+            mbo_lob_reconstructor::StrictBoundaryErrorV1::SourceRuntimeIdentityChanged
         ))
     ));
 }
@@ -878,7 +986,9 @@ fn revalidation_stream_error_is_returned_once_then_fused_and_cannot_finish() {
     assert!(!differences.is_empty());
     assert!(differences.iter().all(|(offset, _, _)| *offset > 1_000_000));
 
-    let plan = open_replay(&path, records.len() as u64).qualify().unwrap();
+    let plan = open_replay(&path, records.len() as u64)
+        .qualify_unbound_development()
+        .unwrap();
     let mut pass = plan.open_revalidation_pass().unwrap();
     let mut source = std::fs::OpenOptions::new()
         .read(true)
@@ -905,7 +1015,7 @@ fn revalidation_stream_error_is_returned_once_then_fused_and_cannot_finish() {
 }
 
 #[test]
-fn revalidation_receipt_mismatch_detects_late_same_length_mutation_restored_before_posthash() {
+fn runtime_identity_detects_late_same_length_mutation_restored_before_posthash() {
     const TRADE_COUNT: usize = 30_000;
     const CHANGED_TRADE: usize = 29_000;
 
@@ -923,7 +1033,7 @@ fn revalidation_receipt_mismatch_detects_late_same_length_mutation_restored_befo
     assert!(differences.iter().all(|(offset, _, _)| *offset > 1_000_000));
 
     let plan = open_replay(&source_path, source_records.len() as u64)
-        .qualify()
+        .qualify_unbound_development()
         .unwrap();
     let mut pass = plan.open_revalidation_pass().unwrap();
     let mut source = std::fs::OpenOptions::new()
@@ -939,19 +1049,12 @@ fn revalidation_receipt_mismatch_detects_late_same_length_mutation_restored_befo
     drop(source);
     assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
 
-    match pass.finish() {
-        Err(XnasReplayErrorV1::RevalidationReceiptMismatch {
-            qualification,
-            revalidation,
-        }) => {
-            assert_eq!(qualification.source(), revalidation.source());
-            assert_ne!(
-                qualification.committed_observation_chain_sha256(),
-                revalidation.committed_observation_chain_sha256()
-            );
-        }
-        other => panic!("expected an exact receipt mismatch, found {other:?}"),
-    }
+    assert!(matches!(
+        pass.finish(),
+        Err(XnasReplayErrorV1::Boundary(
+            mbo_lob_reconstructor::StrictBoundaryErrorV1::SourceRuntimeIdentityChanged
+        ))
+    ));
 }
 
 #[test]
@@ -1042,7 +1145,7 @@ fn cross_identity_records_never_witness_but_do_raise_global_availability() {
     ];
     write_dbn_with_metadata(&path, Compression::None, &records, &two_identity_metadata());
     let run = run_with_all_traces(
-        open_replay(&path, records.len() as u64),
+        open_two_identity_replay(&path, records.len() as u64),
         records.len() as u64,
     );
     assert_eq!(run.traces().len(), 2);
@@ -1163,7 +1266,7 @@ fn decoded_rejection_advances_global_causal_watermark_without_cross_identity_qua
     ];
     write_dbn_with_metadata(&path, Compression::None, &records, &two_identity_metadata());
     let run = run_with_all_traces(
-        open_replay(&path, records.len() as u64),
+        open_two_identity_replay(&path, records.len() as u64),
         records.len() as u64,
     );
 
@@ -1317,7 +1420,7 @@ fn one_identity_quarantine_does_not_contaminate_an_interleaved_identity() {
     ];
     write_dbn_with_metadata(&path, Compression::None, &records, &two_identity_metadata());
     let run = run_with_all_traces(
-        open_replay(&path, records.len() as u64),
+        open_two_identity_replay(&path, records.len() as u64),
         records.len() as u64,
     );
     assert_eq!(run.traces().len(), 3);
@@ -1423,7 +1526,6 @@ fn every_initial_control_signature_field_is_fail_loud() {
         write_dbn(&path, Compression::None, &[mutation]);
         let stream = StrictDbnLoaderV1::open(
             expectation(&path, 1),
-            &path,
             PublisherPolicyIdV1::XnasItchHistorical,
         )
         .unwrap();
@@ -2745,7 +2847,7 @@ fn configured_envelope_resource_limits_fail_before_unbounded_growth() {
 }
 
 #[test]
-fn probe_serializes_only_eof_terminal_outcomes_and_uses_distinct_exit_codes() {
+fn production_probe_rejects_every_unadmitted_source_before_terminal_output() {
     let dir = tempdir().unwrap();
     let source_path = dir.path().join("probe-source.dbn");
     let records = vec![
@@ -2763,24 +2865,26 @@ fn probe_serializes_only_eof_terminal_outcomes_and_uses_distinct_exit_codes() {
         ),
     ];
     write_dbn(&source_path, Compression::None, &records);
-    let (source_sha256, source_bytes) = digest_and_len(&source_path);
     let expectation_path = dir.path().join("probe-expectation.json");
-    let expectation = serde_json::json!({
-        "catalog_release_id": "synthetic-xnas-v1",
-        "catalog_content_sha256": Sha256DigestV1::from_bytes([9; 32]),
-        "catalog_object_id": "probe-source.dbn",
-        "canonical_path": source_path,
-        "canonical_sha256": source_sha256,
-        "canonical_bytes": source_bytes,
-        "expected_records": records.len(),
-        "dbn_version": 1,
-        "dbn_ts_out": false,
-        "dataset": "XNAS.ITCH",
-        "schema": "mbo",
-        "snapshot_depth": 10,
-        "max_envelope_members": 64,
-        "max_sequence_blocks": 64
-    });
+    let expectation = support::probe_request_value(&source_path, records.len() as u64);
+    let parsed: XnasReplayProbeRequestV1 = serde_json::from_value(expectation.clone()).unwrap();
+    parsed.validate().unwrap();
+    let predeclared = parsed.logical_source().unwrap();
+    assert_eq!(
+        predeclared.relative_path,
+        source_path.file_name().unwrap().to_str().unwrap()
+    );
+    assert_eq!(predeclared.compressed_sha256, parsed.compressed_sha256());
+    assert_eq!(predeclared.expected_records, parsed.expected_records());
+    assert!(matches!(
+        parsed.validate_admitted(),
+        Err(XnasReplayProbeRequestErrorV1::SourceIdentity(
+            hft_mbo_event_contract::SourceIdentityErrorV1::CatalogReleaseNotAccepted(_)
+        ))
+    ));
+    let mut unknown = expectation.clone();
+    unknown["unknown_field"] = true.into();
+    assert!(serde_json::from_value::<XnasReplayProbeRequestV1>(unknown).is_err());
     std::fs::write(
         &expectation_path,
         serde_json::to_vec_pretty(&expectation).unwrap(),
@@ -2790,23 +2894,9 @@ fn probe_serializes_only_eof_terminal_outcomes_and_uses_distinct_exit_codes() {
         .arg(&expectation_path)
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stderr.is_empty());
-    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(terminal["schema"], "xnas_strict_replay_probe_v3");
-    assert_eq!(terminal["outcome"]["qualification"], "disqualified");
-    assert_eq!(
-        terminal["outcome"]["diagnostic"]["schema"],
-        "xnas_terminal_disqualification_v1"
-    );
-    assert_eq!(
-        terminal["outcome"]["diagnostic"]["authority"],
-        "nonconsumable_terminal_diagnostic"
-    );
-    assert_eq!(
-        terminal["outcome"]["diagnostic"]["source"]["decoded_records"],
-        2
-    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
 
     let qualified_source_path = dir.path().join("probe-qualified.dbn");
     let qualified_records = conformance_records(START_NS + 1, START_NS + 2);
@@ -2815,14 +2905,8 @@ fn probe_serializes_only_eof_terminal_outcomes_and_uses_distinct_exit_codes() {
         Compression::None,
         &qualified_records,
     );
-    let (qualified_sha256, qualified_bytes) = digest_and_len(&qualified_source_path);
-    let mut qualified = expectation.clone();
-    qualified["catalog_object_id"] = serde_json::Value::String("probe-qualified.dbn".into());
-    qualified["canonical_path"] =
-        serde_json::Value::String(qualified_source_path.to_str().unwrap().into());
-    qualified["canonical_sha256"] = serde_json::Value::String(qualified_sha256.to_hex());
-    qualified["canonical_bytes"] = serde_json::Value::from(qualified_bytes);
-    qualified["expected_records"] = serde_json::Value::from(qualified_records.len() as u64);
+    let qualified =
+        support::probe_request_value(&qualified_source_path, qualified_records.len() as u64);
     std::fs::write(
         &expectation_path,
         serde_json::to_vec_pretty(&qualified).unwrap(),
@@ -2832,36 +2916,9 @@ fn probe_serializes_only_eof_terminal_outcomes_and_uses_distinct_exit_codes() {
         .arg(&expectation_path)
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(0));
-    assert!(output.stderr.is_empty());
-    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(terminal["schema"], "xnas_strict_replay_probe_v3");
-    assert_eq!(terminal["outcome"]["qualification"], "qualified");
-    assert_eq!(
-        terminal["outcome"]["run"]["receipt"]["source"]["decoded_records"],
-        qualified_records.len() as u64
-    );
-    let probe_receipt = &terminal["outcome"]["run"]["receipt"];
-    assert!(probe_receipt
-        .get("committed_observation_chain_sha256")
-        .is_some());
-    assert!(probe_receipt.get("staged_update_chain_sha256").is_none());
-    assert_eq!(
-        probe_receipt["build"]["replay_algorithm_id"],
-        "hft.xnas.strict_replay.v2"
-    );
-    assert_eq!(probe_receipt["build"]["package_version"], "1.0.0");
-    assert!(probe_receipt["build"]["enabled_features"]
-        .as_str()
-        .unwrap()
-        .split(',')
-        .any(|feature| feature == "CARGO_FEATURE_DATABENTO"));
-    let package_lock = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"))
-        .expect("package lock is present in the repository");
-    assert_eq!(
-        probe_receipt["build"]["package_repository_cargo_lock_sha256"],
-        Sha256DigestV1::from_bytes(Sha256::digest(package_lock).into()).to_hex()
-    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
 
     let midstream_source_path = dir.path().join("probe-midstream-fatal.dbn");
     let midstream_records = vec![
@@ -2895,14 +2952,8 @@ fn probe_serializes_only_eof_terminal_outcomes_and_uses_distinct_exit_codes() {
         Compression::None,
         &midstream_records,
     );
-    let (midstream_sha256, midstream_bytes) = digest_and_len(&midstream_source_path);
-    let mut midstream = expectation.clone();
-    midstream["catalog_object_id"] = serde_json::Value::String("probe-midstream-fatal.dbn".into());
-    midstream["canonical_path"] =
-        serde_json::Value::String(midstream_source_path.to_str().unwrap().into());
-    midstream["canonical_sha256"] = serde_json::Value::String(midstream_sha256.to_hex());
-    midstream["canonical_bytes"] = serde_json::Value::from(midstream_bytes);
-    midstream["expected_records"] = serde_json::Value::from(midstream_records.len() as u64);
+    let midstream =
+        support::probe_request_value(&midstream_source_path, midstream_records.len() as u64);
     std::fs::write(
         &expectation_path,
         serde_json::to_vec_pretty(&midstream).unwrap(),
@@ -2916,8 +2967,8 @@ fn probe_serializes_only_eof_terminal_outcomes_and_uses_distinct_exit_codes() {
     assert!(output.stdout.is_empty());
     assert!(!output.stderr.is_empty());
 
-    let mut wrong_count = qualified.clone();
-    wrong_count["expected_records"] = serde_json::Value::from(qualified_records.len() as u64 + 1);
+    let wrong_count =
+        support::probe_request_value(&qualified_source_path, qualified_records.len() as u64 + 1);
     std::fs::write(
         &expectation_path,
         serde_json::to_vec_pretty(&wrong_count).unwrap(),
@@ -2932,7 +2983,7 @@ fn probe_serializes_only_eof_terminal_outcomes_and_uses_distinct_exit_codes() {
     assert!(!output.stderr.is_empty());
 
     let mut wrong_identity = expectation;
-    wrong_identity["canonical_sha256"] =
+    wrong_identity["compressed_sha256"] =
         serde_json::Value::String(Sha256DigestV1::from_bytes([7; 32]).to_hex());
     std::fs::write(
         &expectation_path,

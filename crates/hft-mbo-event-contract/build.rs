@@ -10,7 +10,7 @@ const DIGEST_RELATIVE: &str = "contracts/mbo_event_contract.sha256";
 // not sufficient to change the compiled contract. Updating this value requires
 // a reviewed Rust source change as well as a root-authority change.
 const EXPECTED_CONTRACT_SHA256: &str =
-    "2d88212e5209ac4fc4b375bb84cddf812b074ae1c28799b03a9720e9abdde72d";
+    "d854960b71d00acad5fa201f95665175b0bb78bd4d5c4420e861adc52847098e";
 
 fn required_table<'a>(root: &'a toml::Value, name: &str) -> &'a toml::value::Table {
     root.get(name)
@@ -138,9 +138,94 @@ fn validate_closed_contract(root: &toml::Value) {
 
     let source = required_table(root, "source_descriptor");
     assert_eq!(
+        required_string_array(source, "required"),
+        [
+            "logical_catalog_release_id",
+            "logical_catalog_storage_root_id",
+            "logical_custody_projection_schema",
+            "logical_custody_projection_file_sha256",
+            "logical_custody_projection_content_sha256",
+            "logical_canonical_profile_sha256",
+            "logical_embedded_per_file_tsv_sha256",
+            "logical_evidence_manifest_sha256",
+            "logical_terminal_validation_receipt_sha256",
+            "logical_terminal_validation_status",
+            "logical_relative_path",
+            "logical_compressed_sha256",
+            "logical_compressed_bytes",
+            "logical_expected_records",
+            "logical_metadata_start_ns",
+            "logical_metadata_end_ns",
+            "logical_requested_symbols_preview",
+            "logical_requested_symbols_sha256",
+            "logical_symbols_n",
+            "logical_active_instruments_n",
+            "logical_provenance_tier",
+            "logical_provider_manifest_relative_path",
+            "logical_provider_manifest_sha256",
+            "logical_provider_job_id",
+            "logical_provider_declared_data_file_count",
+            "opened_custody_projection_path",
+            "opened_storage_root_path",
+            "opened_relative_path",
+            "opened_representation",
+            "opened_path",
+            "opened_sha256",
+            "opened_bytes",
+            "dbn_version",
+            "dbn_ts_out",
+            "dataset",
+            "schema",
+        ]
+    );
+    assert_eq!(
         required_str(source, "dbn_ts_out_policy"),
         "must_be_false_for_v1"
     );
+    let accepted = source["accepted_catalog_releases"]
+        .as_array()
+        .expect("source_descriptor.accepted_catalog_releases must be an array of tables");
+    assert!(
+        !accepted.is_empty(),
+        "at least one catalog release must be accepted"
+    );
+    for binding in accepted {
+        let binding = binding
+            .as_table()
+            .expect("accepted catalog release must be a table");
+        for field in [
+            "release_id",
+            "storage_root_id",
+            "custody_projection_schema",
+            "custody_projection_file_sha256",
+            "custody_projection_content_sha256",
+            "canonical_profile_sha256",
+            "embedded_per_file_tsv_sha256",
+            "evidence_manifest_sha256",
+            "terminal_validation_receipt_sha256",
+            "terminal_validation_status",
+        ] {
+            assert!(!required_str(binding, field).is_empty(), "empty {field}");
+        }
+        for field in [
+            "custody_projection_file_sha256",
+            "custody_projection_content_sha256",
+            "canonical_profile_sha256",
+            "embedded_per_file_tsv_sha256",
+            "evidence_manifest_sha256",
+            "terminal_validation_receipt_sha256",
+        ] {
+            let digest = required_str(binding, field);
+            assert_eq!(digest.len(), 64, "{field} is not one SHA-256");
+            assert!(
+                digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "{field} is not lowercase hexadecimal"
+            );
+        }
+        assert_eq!(required_str(binding, "terminal_validation_status"), "PASS");
+    }
 
     let sentinels = required_table(root, "sentinels");
     assert_eq!(required_integer(sentinels, "price_undefined"), i64::MAX);
@@ -334,6 +419,7 @@ fn generate(root: &toml::Value, contract_sha256: &str) -> String {
     let flags = required_table(root, "flags");
     let fields = required_table(root, "raw_event_fields");
     let policies = required_table(root, "publisher_policies");
+    let source_descriptor = required_table(root, "source_descriptor");
 
     let mut code = String::with_capacity(16_000);
     writeln!(
@@ -392,6 +478,42 @@ fn generate(root: &toml::Value, contract_sha256: &str) -> String {
     // u64::MAX is emitted from the closed v1 invariant because TOML's data
     // model exposes only signed 64-bit integers through `toml::Value`.
     writeln!(code, "pub const UNDEF_TIMESTAMP: u64 = u64::MAX;\n").unwrap();
+
+    let accepted = source_descriptor["accepted_catalog_releases"]
+        .as_array()
+        .expect("validated accepted catalog releases");
+    writeln!(
+        code,
+        "pub const ACCEPTED_CATALOG_RELEASE_BINDINGS_V1: &[AcceptedCatalogReleaseBindingDescriptorV1] = &["
+    )
+    .unwrap();
+    for binding in accepted {
+        let binding = binding
+            .as_table()
+            .expect("validated accepted catalog release");
+        writeln!(code, "    AcceptedCatalogReleaseBindingDescriptorV1 {{").unwrap();
+        for field in [
+            "release_id",
+            "storage_root_id",
+            "custody_projection_schema",
+            "custody_projection_file_sha256",
+            "custody_projection_content_sha256",
+            "canonical_profile_sha256",
+            "embedded_per_file_tsv_sha256",
+            "evidence_manifest_sha256",
+            "terminal_validation_receipt_sha256",
+            "terminal_validation_status",
+        ] {
+            writeln!(
+                code,
+                "        {field}: {},",
+                rust_string(required_str(binding, field))
+            )
+            .unwrap();
+        }
+        writeln!(code, "    }},").unwrap();
+    }
+    writeln!(code, "];\n").unwrap();
 
     for (constant_name, table_name) in [
         ("PUBLISHER_POLICY_REJECT_ALL_V1_ID", "reject_all_v1"),
