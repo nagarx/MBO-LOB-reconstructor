@@ -31,6 +31,18 @@ This document catalogs known warnings, issues, and edge cases that may occur dur
 > value as an open defect, not as expected feed behaviour. The "Common Causes" list below is
 > retained as the *pre-correction* hypothesis and is NOT supported by the measurement.
 
+> **FINDING-122 scope boundary (validated 2026-08-01).** The decoder merge has
+> two different observed consequences. A direct raw-tape consumer sees total
+> signed-direction annihilation because `T` carries aggressor side and `F`
+> carries resting side. The current NVDA/XNAS feature-extractor path does not
+> see that merged population: its separate structural filter drops exactly the
+> true-Trade rows (`order_id == 0`) and leaves Fills. Those two defects cancel
+> exactly for sign on that bounded path, so existing direction closures are not
+> decoder artifacts; the path instead loses coverage. Do not generalize this
+> result beyond the named current producer/data path, and do not describe it as
+> a property of direct raw-tape consumers. After producer behavior changes, the
+> cancellation statement is historical by construction.
+
 **Common Causes** *(superseded — see correction above; retained for history)*:
 - Order was already cancelled by a previous message
 - Late/out-of-order message delivery
@@ -95,7 +107,16 @@ below).
 
 **Tracked In**: `LobStats.book_clears`
 
-**Note** (Phase O Cycle 1 / B.2a — 2026-05-03): pre-B.2a default-config callers (`LobConfig::skip_system_messages = true` — DEFAULT) had a silent regression where `Action::Clear` messages matched the `is_system_message()` predicate (zero `order_id`/`size`/`price` by structural definition) and were filtered at the inner system-message filter in `src/lob/reconstructor.rs::process_message_into` BEFORE reaching the `Action::Clear` arm of the match dispatch — the book was NEVER reset on a real-data Clear message under default config; `LobStats.book_clears` permanently shadowed at zero. Fix at `src/lob/reconstructor.rs:1179` exempts `Action::Clear` from the inner `is_system_message()` filter; `:1206` exempts Clear from `validate_message`. Post-B.2a the BOOK_CLEARED tracking above operates as documented for default-config callers. Companion fix in sibling `feature-extractor-MBO-LOB` extractor (`crates/hft-extractor/src/pipeline.rs:346` — B.2b; grep `msg.action != Action::Clear` if the line drifts) exempts Clear from the OUTER filter so Clear flows from extractor → reconstructor → handler. See `CHANGELOG.md` `[0.2.1]` for full closure note + `CLAUDE.md` § "System Message Filtering" for the Phase O exemption note.
+**Note** (Phase O Cycle 1 / B.2a — 2026-05-03): wire `R` means clear all
+orders for the instrument. It legitimately has the zero-shaped fields that
+also satisfy the crate-local `is_system_message()` heuristic. Pre-B.2a,
+default-config callers filtered Clear before dispatch, so the book never reset
+and `LobStats.book_clears` stayed zero. Current v0.3.0 code exempts
+`Action::Clear` from the inner structural filter and message validation; the
+sibling extractor carries the companion outer-filter exemption. This is why
+`order_id == 0 || size == 0 || price <= 0` must not be documented as a universal
+DBN heartbeat/status taxonomy. Preserve the dated closure record in
+`CHANGELOG.md [0.2.1]`.
 
 ---
 
@@ -164,9 +185,45 @@ below).
 
 ---
 
+### ⚠️ THE 2026-08-01 CORRECTION IS ITSELF SUPERSEDED (2026-08-12)
+
+**Every `95.56% / 95.73%` figure in this file, in `README.md`, in `CODEBASE.md` and in root
+`CLAUDE.md` comes from `data/validation_results_july2025.json`, and THAT ARTIFACT HAS NO EMITTING
+CODE.** Measured 2026-08-12, unscoped over the whole tree: **68 files reference it and every single
+one is a `.md`** — not one `.rs`, `.py` or `.sh`. It is hand-transcribed, dated `2025-12-01`, and
+its own `book_state_events.book_clears` is **21** where today's reconstructor emits **0** — i.e. it
+describes a book the current code does not produce.
+
+So the 2026-08-01 correction replaced one unsourced number (`99.17%`) with **another number from an
+artifact with no emitter**. Both are provenance-free. Do not quote either as a current measurement.
+
+**WHAT TO CITE INSTEAD — there is now a real, reproducible measurement.** The ten-level MBP-10
+oracle (2026-08-11), script and frozen per-day verdicts git-backed at
+`hft-wiki/audit/2026-08-11-mbo-backbone-second-opinion/evidence/phase8_census_oracle/`
+(`O1_mbp10_10level_scratch/oracle10.py`, report `O1-mbp10-oracle-10-level.md`):
+
+| arm | ten-level conformance vs the vendor MBP-10 |
+|---|---|
+| candidate — `F` as a book **no-op** (the router fix) | **100.000%**, 465,065,790 level-comparisons, **0 misses**, 14 days, price bit-identical L1 and L10 |
+| shipped — `F` merged into `Trade` | **83.632% at L1 → 94.935% at L10** (stratum A) |
+
+The shipped book **improving with depth** is the F-merge signature: a fill hits the resting order
+**at the touch**, so the damage concentrates at L1. It also establishes there is **no second,
+depth-specific book-construction defect**.
+
+⚠️ SCOPE, stated because the numbers above are strong: 14 of 21 available days (input set
+deliberately frozen), **NVDA / XNAS / July-2025 only**, and the `T` stratum (6.19%) excluded exactly
+as the shipped gate excludes it. There is **no ARCX MBP-10 anywhere on the data volume** — a
+full-volume search for `*mbp*10*` returns 21 XNAS + 20 GLBX + **0 ARCX** — so no external-oracle
+conformance claim can be made for ARCX at all, and the two venues are structurally different (XNAS
+carries 0 filter-escaping `T` records on 12/12 sampled days; ARCX carries 25,901–97,956 per day,
+100.0000% `side='N'`).
+
+---
+
 ### Size Estimation Variance
 
-**Observation** *(corrected 2026-08-01)*: OLD — "~91% exact match vs ~99% for prices".
+**Observation** *(corrected 2026-08-01; ⚠️ its SOURCE is superseded — see the block above)*: OLD — "~91% exact match vs ~99% for prices".
 NEW — the source artifact reports size exact-match **83.66% bid / 83.06% ask** against price
 exact-match **95.56% bid / 95.73% ask**. The old pair (91%/99%) is not in the artifact.
 
@@ -293,4 +350,3 @@ For issues not covered here, please:
    - Data sample (anonymized if needed)
    - Warning counts from `LobStats`
    - Expected vs actual behavior
-

@@ -27,15 +27,15 @@ Additional standalone modules that can be used alongside LOB reconstruction:
 - **Queue Position Tracking**: FIFO queue position, volume ahead (for execution probability)
 - **Order Lifecycle Tracking**: Track orders through Add→Modify→Cancel/Fill lifecycle
 - **Day Boundary Detection**: Automatic trading day detection for train/test splits
-- **Trade Aggregation**: Aggregate fills into trades with aggressor side detection
+- **Trade Aggregation**: Fill-only helper that reverses resting side to derive aggressor side. It is unused and unsafe on current `DbnLoader` output because v0.3.0 merges wire Trade and Fill actions before this helper.
 
 ## Feature Flags
 
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `databento` | Yes | Enable Databento DBN file support |
-| `legacy-iterator-api` | Yes | Gates the **deprecated** legacy `iter_messages()` API (implies `databento`). New code should use `iter_messages_typed()` instead; scheduled for removal in the next MAJOR release (0.3.0; calendar removal 2026-10-29) |
-| `export` | No | Enable Apache Parquet export for raw LOB snapshots and MBO events (+ TOML config for CLI) |
+| `legacy-iterator-api` | Yes | Gates the **deprecated** legacy `iter_messages()` API (implies `databento`). New code uses `iter_messages_typed()`. The feature is still present in v0.3.0; removal is calendar-driven for 2026-10-29, not tied to the v0.3.0 release. |
+| `export` | No | Enable Apache Parquet export for reconstructed LOB snapshots and a reduced six-field MBO projection (+ TOML config for CLI) |
 
 ## Quick Start
 
@@ -101,9 +101,20 @@ norm_params.save_json("normalization.json")?;
 ```
 
 > **Legacy API note**: the older `iter_messages()` (yielding `MboMessage` directly) is
-> `#[deprecated]` and gated behind the default-on `legacy-iterator-api` feature. It is
-> scheduled for removal in the next MAJOR release (0.3.0; calendar 2026-10-29) — do not
-> write new code against it.
+> `#[deprecated]` and gated behind the default-on `legacy-iterator-api` feature. It is still
+> present in v0.3.0. Its documented removal trigger is 2026-10-29; do not write new code
+> against it.
+
+> **Current DBN boundary (v0.3.0).** This crate pins `dbn` tag `v0.64.0`
+> (`64e5416f53b8ebecc9f1799d715dec8baa4c17eb`) and decodes with
+> `VersionUpgradePolicy::AsIs`. Databento MBO uses `ts_recv` as its primary/index
+> timestamp, but the current `DbnBridge` stores `hd.ts_event` in
+> `MboMessage.timestamp`; that field is therefore the matching-engine-received
+> timestamp, not the DBN primary timestamp. The bridge also still maps both wire
+> actions `T` and `F` to internal `Action::Trade`. On the wire, `T` carries the
+> aggressor side and `F` the resting side, and both are documented as book no-ops.
+> This is an active current-behavior limitation, not the DBN contract; see
+> `WARNINGS.md` and FINDING-122 for the bounded downstream interpretation.
 
 ## Using with Feature Extractor
 
@@ -214,7 +225,12 @@ println!("Book pressure: {:.4}", metrics.book_pressure());
 
 ## Composable Tracking Modules
 
-These modules are **standalone** - they process `MboMessage` independently and can be used alongside or without LOB reconstruction.
+These modules are **standalone**, but they do not share one uniform API or filter.
+Queue-position and lifecycle trackers process `MboMessage` after rejecting the
+internal structural shape and `Side::None`; `TradeAggregator` processes messages
+without that structural filter; `DayBoundaryDetector` instead uses
+`check_boundary(timestamp)` and `record_message(...)`. They can be used alongside
+or without LOB reconstruction only when those separate contracts are honored.
 
 ### Queue Position Tracking
 
@@ -255,6 +271,13 @@ for msg in messages {
 ```
 
 ### Trade Aggregation with Aggressor Detection
+
+> **Fill-only precondition.** `TradeAggregator` reverses side for every internal
+> `Action::Trade | Action::Fill`, which is correct only when the input is known
+> to carry resting-side Fill semantics. Current v0.3.0 `DbnBridge` maps both wire
+> `T` (aggressor-side Trade) and wire `F` (resting-side Fill) to
+> `Action::Trade`; therefore direct `DbnLoader` output is not a valid input to
+> this example. The helper is unused by the current pipeline.
 
 ```rust
 use mbo_lob_reconstructor::{TradeAggregator, TradeAggregatorConfig};
@@ -365,9 +388,13 @@ let denormalized = params.denormalize(normalized, feature_idx);
 
 ## Parquet Export (feature: `export`)
 
-Export raw LOB snapshots and MBO events to Apache Parquet files for downstream
-statistical analysis (e.g., the `MBO-LOB-analyzer` Python repository). This captures the
-unbiased LOB state before any feature extraction transforms.
+Export reconstructed LOB snapshots and converted MBO projections to Apache
+Parquet for downstream analysis (for example, `MBO-LOB-analyzer`). This is not
+vendor-raw DBN. Snapshot rows include only accepted, valid reconstructed states
+and may be downsampled; event rows are unsampled after successful bridge
+conversion but retain only six fields. The bridge uses `hd.ts_event`, merges
+wire `T` and `F` into `Action::Trade`, and drops DBN fields such as publisher,
+instrument ID, `ts_recv`, flags, channel ID, and `ts_in_delta`.
 
 ### CLI
 
@@ -409,16 +436,16 @@ println!("Wrote {} snapshots", stats.rows_written);
 
 | File | Scope | Description |
 |------|-------|-------------|
-| `{date}_lob_snapshots.parquet` | per day | Full LOB state at each message (~7M rows/day) |
-| `{date}_mbo_events.parquet` | per day | Raw MBO messages (order_id, action, side, price, size). Omitted with `--no-mbo`. |
+| `{date}_lob_snapshots.parquet` | per day | Accepted reconstructed states; optional downsampling and validity/order checks mean this is not one row per source record. |
+| `{date}_mbo_events.parquet` | per day | Unsampled successfully converted six-field projections (`timestamp_ns`, `order_id`, `action`, `side`, `price`, `size`); lossy relative to DBN and omitted with `--no-mbo`. |
 | `{date}_reconstruction_stats.json` | per day | Schema-versioned reconstruction / provenance stats — a `LobStatsExportEnvelope` (`{ schema_version, stats }`) written atomically (tmp + fsync + rename). Re-exported at the crate root and read by external consumers. |
 | `_export_summary.json` | per run | Run-level summary across all days: totals, throughput, and per-category skipped-row anomaly counts (fail-loud observability per the monorepo development rule "hft-rules §8 — Data Integrity & Error Policy"; that rules file lives at the monorepo root, not in this repo). |
 
 ### Data Contract
 
-- **Prices**: `Int64` in nanodollars (divide by 1e9 for dollars)
-- **Sizes**: `UInt32` in shares
-- **Timestamps**: `Int64` nanoseconds since epoch
+- **Prices**: raw `Int64` fixed-point values; sentinel-check first, then divide by `1_000_000_000`. The generic DBN result is in the instrument-native price unit; the current XNAS/ARCX equity exports interpret that unit as USD and retain the historical footer label `price_unit = "nanodollars"`.
+- **Sizes**: raw `UInt32` instrument/publisher-native quantities; the current equity exports interpret them as shares and retain `size_unit = "shares"`.
+- **Timestamps**: `Int64` nanoseconds since epoch. In the current v0.3.0 export they come from internal `MboMessage.timestamp`, which `DbnBridge` populates from `hd.ts_event`, not from MBO's DBN primary/index timestamp `ts_recv`.
 - **Parquet schema version**: `1.0` (embedded in file metadata)
 - **Reconstruction-stats JSON**: carries its **own** `LOB_STATS_SCHEMA_VERSION` — independent of the Parquet version above (bumped on any change to the stats envelope). See `CHANGELOG.md` / `src/lob/reconstructor.rs` for the current value.
 
@@ -440,7 +467,7 @@ mbo_lob_reconstructor/
         queue_position.rs   # QueuePositionTracker (FIFO tracking, handle_order_reduction())
         order_lifecycle.rs  # OrderLifecycleTracker (Add→Modify→Cancel/Fill)
         day_boundary.rs     # DayBoundaryDetector (trading day detection)
-        trade_aggregator.rs # TradeAggregator (fills→trades, aggressor side)
+        trade_aggregator.rs # Fill-only helper; unsafe on current T/F-merged bridge output
     export/               # Parquet export (requires `export` feature)
         mod.rs            # ExportConfig, DownsampleConfig, re-exports
         schema.rs         # Arrow schema definitions (LOB + MBO)

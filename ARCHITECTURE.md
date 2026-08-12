@@ -1,19 +1,19 @@
 # ARCHITECTURE.md -- MBO-LOB-Reconstructor
 
-Primary technical reference for LLM coders. Baseline: every claim verified against source code as of 2026-04-30 (post Phase M REV 3 — Boundary Discipline cycle). Partial re-verification 2026-07-07 (Phase-2 doc-truth pass — §2 Feature Flags, §3 Ingestion APIs, §4 Module Map; `src/` unchanged since 2026-05-03): sections not named there carry the 2026-04-30 baseline.
+Primary technical reference for LLM coders. Baseline: source-verified 2026-04-30, partially re-verified 2026-07-07, with the Databento/version/action/timestamp boundary refreshed against the v0.3.0 source and `dbn` v0.64.0 on 2026-08-02. Sections not named by a later refresh retain their dated baseline.
 
 ---
 
 ## 1. Overview
 
-**mbo-lob-reconstructor** v0.2.1 (Rust edition 2021, MSRV 1.82) converts Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshots. It is the order-book ingestion front-end of the **intraday trading research pipeline** (origin: HFT microstructure; names historical, mission now general — see root `CLAUDE.md` §Research Scope & Charter), consumed directly by `feature-extractor-MBO-LOB` (which depends on it via `.cargo/config.toml` path override).
+**mbo-lob-reconstructor** v0.3.0 (Rust edition 2021, MSRV 1.82) converts Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshots. It is the order-book ingestion front-end of the **intraday trading research pipeline** (origin: HFT microstructure; names historical, mission now general — see root `AGENTS.md`). The verified direct-dependency topology has three consumers: `feature-extractor-MBO-LOB/crates/hft-extractor` and `mbo-statistical-profiler` each declare git tag `v0.3.0`; `xsec_equity_discovery/extractor` declares a sibling path dependency, which resolves the current package version `0.3.0`. Local `.cargo/config.toml` patches may redirect a tag dependency during development, but do not change its declared tag contract.
 
 The crate provides:
 
-- **LOB reconstruction**: MBO messages (Add/Modify/Cancel/Trade) to aggregated price-level snapshots (`LobState`, ~560 bytes stack-allocated).
-- **Composable trackers**: Four standalone modules (queue position, order lifecycle, trade aggregation, day boundary detection) that each consume `MboMessage` independently -- no dependency on `LobReconstructor`.
+- **LOB reconstruction**: MBO messages (Add/Modify/Cancel/Trade) to aggregated price-level snapshots (`LobState`, 576 bytes on the audited target; `repr(Rust)` is not ABI-stable).
+- **Composable stateful helpers**: Four standalone modules (queue position, order lifecycle, trade aggregation, day boundary detection) with distinct APIs and filters; none depends on `LobReconstructor`. The trade helper has a current-bridge safety restriction documented below.
 - **ML analytics**: Microprice, VWAP, depth imbalance, market impact simulation, running statistics (Welford's algorithm), normalization parameters.
-- **Parquet export**: Raw LOB snapshots and MBO events to Apache Parquet with schema versioning.
+- **Parquet export**: Accepted reconstructed LOB snapshots and a lossy six-field MBO projection to Apache Parquet with schema versioning.
 - **Databento integration**: Streaming loader for `.dbn.zst` files with hot store management.
 
 Performance: ~1M msgs/sec, ~1 us/msg latency. Primary bottleneck is single-threaded zstd decompression; pre-decompressing to a hot store yields ~5x speedup.
@@ -26,8 +26,8 @@ Defined in `Cargo.toml`:
 
 | Feature | Default | Gates | Dependencies |
 |---------|---------|-------|--------------|
-| `databento` | Yes | `loader/`, `hotstore.rs`, `dbn_bridge.rs`, `DbnSource` in `source.rs` | `dbn` (git tag v0.20.0), `zstd` 0.13 |
-| `legacy-iterator-api` | Yes | The **deprecated** legacy untyped ingestion API (`iter_messages()` / `MessageIterator` + the legacy read-all/count helpers), all `#[deprecated]`. Removal scheduled for the next MAJOR (0.3.0; calendar 2026-10-29) — new code uses `iter_messages_typed()` (see §3 Ingestion APIs) | implies `databento` |
+| `databento` | Yes | `loader/`, `hotstore.rs`, `dbn_bridge.rs`, `DbnSource` in `source.rs` | `dbn` (git tag v0.64.0, resolved `64e5416f…`), `zstd` 0.13 |
+| `legacy-iterator-api` | Yes | Deprecated untyped ingestion API (`iter_messages()` / `MessageIterator` plus legacy read-all/count helpers), all `#[deprecated]`. Still present in v0.3.0; calendar removal trigger 2026-10-29. New code uses `iter_messages_typed()` (see §3). | implies `databento` |
 | `export` | No | `export/` module (mod.rs, schema.rs, lob_writer.rs, mbo_writer.rs, batch.rs) | `arrow` 55, `parquet` 55, `toml` 0.8 |
 
 Build without Databento: `cargo build --no-default-features`
@@ -57,7 +57,7 @@ MboMessage (src/types.rs)               -- Core event: order_id, action, side, p
     +--------> LobReconstructor (src/lob/reconstructor.rs)
     |              |
     |              v
-    |          LobState (~560B stack-allocated)
+    |          LobState (576B on audited target; stack-allocated)
     |              |
     |              +---> DayStats / NormalizationParams (src/statistics.rs)
     |              +---> DepthStats / MarketImpact / LiquidityMetrics (src/analytics.rs)
@@ -93,13 +93,45 @@ MboMessage (src/types.rs)               -- Core event: order_id, action, side, p
                MBO events -> Parquet
 ```
 
-All trackers are composable: each consumes `MboMessage` independently and can be used alongside or without `LobReconstructor`.
+These stateful helpers are composable but do not share a uniform message API:
+queue position, lifecycle, and trade aggregation consume `MboMessage`, while day
+boundary detection consumes a timestamp followed by an explicit statistics
+record. Their filters also differ; see the source-verified API table below.
+
+### DBN boundary: wire contract versus v0.3.0 behavior
+
+- The crate pins `dbn` v0.64.0 at commit `64e5416f…` and explicitly uses
+  `VersionUpgradePolicy::AsIs`.
+- DBN MBO's primary/index timestamp is `ts_recv`. The common-header
+  `hd.ts_event` is the matching-engine-received timestamp. Current
+  `DbnBridge::convert()` stores `hd.ts_event` in `MboMessage.timestamp` and
+  does not carry `ts_recv`; consumers must not describe the internal field as
+  DBN's primary timestamp.
+- Wire `T` means Trade with aggressor `side`; wire `F` means Fill with resting
+  `side`; both are documented as having no book effect. Wire `R` means clear
+  the instrument book. Current `DbnBridge` still merges `T|F` into
+  `Action::Trade`, and current `LobReconstructor` mutates the book for
+  `Action::Trade | Action::Fill`. Those are current implementation facts and
+  known limitations, not Databento semantics.
+- `MboMessage::is_system_message()` is an internal structural heuristic
+  (`order_id == 0 || size == 0 || price <= 0`), not a DBN record taxonomy. On
+  the measured NVDA/XNAS path, `order_id == 0` also identifies true Trade rows;
+  `Action::Clear` is explicitly exempted so reset semantics survive.
+- Fixed `i64` prices use a 1e9 storage scale after sentinel handling. The
+  decoded value is instrument-native; USD/share terminology is valid only
+  after the selected equity dataset and instrument context establish it.
+
+FINDING-122 bounds the downstream consequence: raw-tape signed direction is
+annihilated by the current T/F merge, while the current NVDA/XNAS feature path
+filters true Trades and receives Fills, causing exact sign cancellation between
+two defects but losing coverage. This does not generalize to direct raw-tape
+consumers and becomes historical when producer behavior changes.
 
 ### Ingestion APIs (which entry point to use)
 
 Two ingestion entry points read MBO into the pipeline; they are **not interchangeable**:
 
-- **`DbnLoader`** (`src/loader/mod.rs`) — the **canonical** streaming reader for Databento `.dbn`/`.dbn.zst`. Preferred API: `iter_messages_typed()`, which yields `Result<MboMessage, BoundaryError>` so decode/convert failures surface as a **typed error at the boundary** (propagate via `?`). The older `iter_messages()` is **deprecated** and gated behind the `legacy-iterator-api` feature (default-on during transition; slated for removal in the next MAJOR — see `Cargo.toml` `[features]` and `CHANGELOG.md`). **Reach for `DbnLoader` in pipeline / ingestion code.**
+- **`DbnLoader`** (`src/loader/mod.rs`) — the **canonical** streaming reader for Databento `.dbn`/`.dbn.zst`. Preferred API: `iter_messages_typed()`, which yields `Result<MboMessage, BoundaryError>` so decode/convert failures surface as a **typed error at the boundary** (propagate via `?`). The older `iter_messages()` is **deprecated** and gated behind the `legacy-iterator-api` feature (default-on during transition; its documented calendar removal trigger is **2026-10-29**, not a particular semver release — see `Cargo.toml` `[features]` and `CHANGELOG.md`). **Reach for `DbnLoader` in pipeline / ingestion code.**
 - **`MarketDataSource`** (`src/source.rs`) — a **provider-agnostic** trait (`SourceMetadata` + `messages()`) for ingestion code that must not be Databento-specific or needs an in-memory source. `DbnSource` is a thin wrapper over `DbnLoader`; `VecSource` wraps an in-memory `Vec<MboMessage>` (mocks / tests). **Reach for `MarketDataSource` in provider-agnostic or testable code.**
 
 **Migration status**: the `MarketDataSource for DbnSource` impl is currently gated behind `legacy-iterator-api` and returns the legacy (non-typed) iterator; it migrates to the typed iterator once the trait's associated `Item` becomes `Result<MboMessage, BoundaryError>`. Until then, code needing typed boundary errors from a Databento file should call `DbnLoader::iter_messages_typed()` directly rather than routing through the trait.
@@ -130,7 +162,7 @@ Two ingestion entry points read MBO into the pipeline; they are **not interchang
 | `src/lob/price_level.rs` | Orders at a price with O(1) cached total_size | `PriceLevel` |
 | `src/lob/queue_position.rs` | FIFO queue position tracking | `QueuePositionTracker`, `QueuePositionConfig`, `QueuePositionInfo`, `PositionChange`, `PositionChangeReason`, `QueueStats` |
 | `src/lob/order_lifecycle.rs` | Order lifecycle Add->Modify->Cancel/Fill | `OrderLifecycleTracker`, `OrderLifecycleConfig`, `OrderLifecycle`, `LifecycleEvent`, `LifecycleStats`, `OrderOrigin`, `TerminalState`, `OrderModification`, `ActiveOrderFeatures`, `CompletionStats` |
-| `src/lob/trade_aggregator.rs` | Fills to trades with aggressor detection | `TradeAggregator`, `TradeAggregatorConfig`, `Trade`, `Fill` |
+| `src/lob/trade_aggregator.rs` | Fill-only aggregation helper; unsafe on current T/F-merged bridge output | `TradeAggregator`, `TradeAggregatorConfig`, `Trade`, `Fill` |
 | `src/lob/day_boundary.rs` | Trading day boundary detection | `DayBoundaryDetector`, `DayBoundaryConfig`, `DayBoundary`, `DayBoundaryStats` |
 | `src/lob/multi_symbol.rs` | Multi-symbol LOB manager | `MultiSymbolLob` |
 
@@ -168,39 +200,48 @@ Two ingestion entry points read MBO into the pipeline; they are **not interchang
 
 ### MboMessage (`src/types.rs`)
 
-```
+```rust
 pub struct MboMessage {
-    pub order_id: u64,              // Unique order identifier
-    pub action: Action,             // What happened (Add, Modify, Cancel, Trade, Fill, Clear, None)
+    pub order_id: u64,              // Venue order identifier; zero is not universally a heartbeat
+    pub action: Action,             // Internal action after DbnBridge conversion
     pub side: Side,                 // Bid, Ask, or None
-    pub price: i64,                 // Fixed-point nanodollars (divide by 1e9 for USD)
-    pub size: u32,                  // Shares/contracts
-    pub timestamp: Option<i64>,     // Nanoseconds since epoch (optional)
+    pub price: i64,                 // Raw fixed-point; sentinel-check, then divide by 1e9
+    pub size: u32,                  // Instrument/publisher-native quantity
+    pub timestamp: Option<i64>,     // Current bridge: hd.ts_event, UNIX nanoseconds
 }
 ```
 
-Key methods:
-- `is_system_message() -> bool`: Returns true if `order_id == 0 || size == 0 || price <= 0`. These are heartbeats/status updates (~10-15% of real data).
-- `price_as_f64() -> f64`: Converts price to dollars.
-- `validate() -> Result<()>`: Checks order_id != 0, price > 0, size > 0.
-- `with_timestamp(i64) -> Self`: Builder for setting timestamp.
+Key methods and limitations:
+
+- `is_system_message() -> bool` is the crate's structural predicate
+  `order_id == 0 || size == 0 || price <= 0`; it is not a universal DBN
+  heartbeat definition. `Action::Clear` is exempt in reconstruction.
+- `price_as_f64() -> f64` divides by the crate's 1e9 constant. The result is
+  instrument-native; callers may label it dollars only when instrument context
+  establishes a USD-quoted product.
+- `validate() -> Result<()>` checks the crate's order-shaped invariants.
+- `with_timestamp(i64) -> Self` sets the internal timestamp.
+- DBN MBO's primary/index timestamp is `ts_recv`, but current
+  `DbnBridge::convert()` populates this field from `hd.ts_event`.
 
 ### Action (`src/types.rs`)
 
-```
+```rust
 #[repr(u8)]
 pub enum Action {
     Add    = b'A',   // New order
-    Modify = b'M',   // Modify existing
-    Cancel = b'C',   // Cancel/remove
-    Trade  = b'T',   // Trade execution
-    Fill   = b'F',   // Fill (alternative trade)
-    Clear  = b'R',   // Reset book
-    None   = b'N',   // No-op
+    Modify = b'M',   // Existing order price and/or size changed
+    Cancel = b'C',   // Existing order fully or partially cancelled
+    Trade  = b'T',   // Wire T: aggressor side; DBN says no book effect
+    Fill   = b'F',   // Wire F: resting side; DBN says no book effect
+    Clear  = b'R',   // Reset all orders for the instrument
+    None   = b'N',   // No book effect; may carry other information
 }
 ```
 
-Methods: `from_byte(u8) -> Option<Self>`, `to_byte() -> u8`.
+`Action::from_byte()` preserves `T` and `F` as distinct internal variants. The
+current DBN-specific bridge does not: it maps both bytes to `Action::Trade`.
+That bridge behavior is the known v0.3.0 limitation described above.
 
 ### Side (`src/types.rs`)
 
@@ -217,7 +258,10 @@ Methods: `from_byte(u8) -> Option<Self>`, `to_byte() -> u8`, `is_bid() -> bool`,
 
 ### LobState (`src/types.rs`)
 
-~560 bytes, stack-allocated. All arrays are `[_; MAX_LOB_LEVELS]` where `MAX_LOB_LEVELS = 20`.
+576 bytes on the audited target and stack-allocated. All arrays are
+`[_; MAX_LOB_LEVELS]` where `MAX_LOB_LEVELS = 20`. The source test permits
+`500 < size < 700`; `repr(Rust)` size is target/compiler-qualified, not a
+stable ABI contract.
 
 ```
 pub struct LobState {
@@ -530,7 +574,7 @@ The same pattern exists in `QueuePositionTracker` (`src/lob/queue_position.rs`) 
 
 ### Zero-Allocation Hot Path
 
-`process_message_into(&mut self, msg: &MboMessage, state: &mut LobState) -> Result<()>` fills a pre-allocated `LobState` buffer (~560 bytes, stack-allocated). This is the single source of truth for dispatch, stats, and policy logic. `process_message()` delegates to it with a fresh buffer.
+`process_message_into(&mut self, msg: &MboMessage, state: &mut LobState) -> Result<()>` fills a pre-allocated stack `LobState` buffer (576 bytes on the audited target; no stable ABI-size promise). This is the single source of truth for dispatch, stats, and policy logic. `process_message()` delegates to it with a fresh buffer.
 
 ### Temporal Field Chain
 
@@ -541,13 +585,28 @@ When using `process_message_into()` with a reused `LobState` buffer, `fill_lob_s
 
 When using `process_message()` (fresh buffer each call), `delta_ns` is always 0 and `previous_timestamp` is always None -- no temporal chain exists.
 
-### Composable Standalone Trackers
+### Composable Standalone Helpers
 
-All four trackers (`QueuePositionTracker`, `OrderLifecycleTracker`, `TradeAggregator`, `DayBoundaryDetector`) have `process_message(&mut self, msg: &MboMessage)` methods that operate independently. Each filters system messages internally, maintains its own stats, and requires no access to `LobReconstructor`.
+The four helpers are independent of `LobReconstructor`, but their live APIs and
+filters are intentionally different:
+
+| Helper | Update API | Filtering / semantic boundary |
+|--------|------------|-------------------------------|
+| `QueuePositionTracker` | `process_message(&mut self, &MboMessage) -> ()` | Rejects `msg.is_system_message()` and `Side::None` before action dispatch. |
+| `OrderLifecycleTracker` | `process_message(&mut self, &MboMessage) -> Option<LifecycleEvent>` | Rejects `msg.is_system_message()` and `Side::None` before action dispatch. |
+| `TradeAggregator` | `process_message(&mut self, &MboMessage) -> Option<Trade>` | Has no structural/system-shape filter. It accepts only internal `Action::Trade | Action::Fill`, skips `Side::None`, and reverses side unconditionally. It is valid only for independently supplied resting-side Fill input; it is unused and unsafe on current `DbnBridge` output because the bridge merges wire `T` and `F`. |
+| `DayBoundaryDetector` | `check_boundary(timestamp: i64) -> Option<DayBoundary>`, then `record_message(timestamp: Option<i64>, is_trade: bool, size: u32)` | Consumes a timestamp/statistics projection, not `MboMessage`; it therefore applies no message-shape filter itself. |
 
 ### System Message Filtering
 
-`MboMessage::is_system_message()` (`src/types.rs`): returns true if `order_id == 0 || size == 0 || price <= 0`. Called by `LobReconstructor` (when `skip_system_messages` is true), all four trackers, and exposed for external filtering.
+`MboMessage::is_system_message()` (`src/types.rs`) returns true for the internal
+structural shape `order_id == 0 || size == 0 || price <= 0`. The
+`LobReconstructor` uses it when `skip_system_messages` is true, but exempts
+`Action::Clear`; external consumers may also apply it. Do not equate this
+predicate with a DBN heartbeat/status record class. FINDING-122 measured
+`order_id == 0` on every true-Trade row and on no Fill row in the bounded
+NVDA/XNAS census, so applying the predicate upstream changes trade coverage and
+which side convention reaches the feature engine.
 
 ### QueueLevel vs PriceLevel Zero-Size Handling
 
@@ -597,7 +656,7 @@ Validation rules include: levels in [1, 20], max_warnings > 0, batch_size > 0, a
 | `OrderNotFound(u64)` | order_id | Hard |
 | `InvalidPrice(i64)` | price | Hard (validation) |
 | `InvalidSize(u32)` | size | Hard (validation) |
-| `InvalidTimestamp(i64)` | timestamp | Hard (decode) — DBN ts_event ≤ 0 / u64→i64 overflow (M.A.6 F-023) |
+| `InvalidTimestamp(i64)` | timestamp | Hard (decode) — `ts_event > i64::MAX` is always rejected; `ts_event == 0` is rejected only for a non-structural/order-shaped row. A zero timestamp on the internal structural shape (`order_id == 0 || size == 0 || price <= 0`) is accepted as `timestamp: None`. |
 | `InvalidAction(u8)` | byte | Hard (decode) |
 | `InvalidSide(u8)` | byte | Hard (decode) |
 | `SymbolNotFound(String)` | symbol | Hard (multi-symbol) |
@@ -665,8 +724,8 @@ When `UseLastValid` or `SkipUpdate` returns a last-valid snapshot, temporal fiel
 
 | Constant | Type | Value | Purpose |
 |----------|------|-------|---------|
-| `NANODOLLARS_PER_DOLLAR` | `i64` | `1_000_000_000` | Integer price conversion |
-| `NANODOLLARS_PER_DOLLAR_F64` | `f64` | `1_000_000_000.0` | Float price conversion (exact in IEEE 754) |
+| `NANODOLLARS_PER_DOLLAR` | `i64` | `1_000_000_000` | Crate's historical name for the DBN fixed-value scale; divide raw fixed prices after sentinel handling |
+| `NANODOLLARS_PER_DOLLAR_F64` | `f64` | `1_000_000_000.0` | Floating form of the fixed-value scale; output is instrument-native, USD only under USD instrument context |
 | `BASIS_POINTS_PER_UNIT` | `f64` | `10_000.0` | Ratio to bps conversion |
 | `DIVISION_GUARD_EPS` | `f64` | `1e-8` | Near-zero denominator guard (~sqrt(f64::EPSILON)) |
 | `NS_PER_MILLISECOND` | `i64` | `1_000_000` | Time conversion |
@@ -741,7 +800,14 @@ From `src/export/mod.rs`: `SCHEMA_VERSION: &str = "1.0"`, `DEFAULT_BATCH_SIZE: u
 
 ### File Metadata
 
-Every Parquet file includes: `schema_version`, `source` ("mbo-lob-reconstructor"), `reconstructor_version`, `price_unit` ("nanodollars"), `size_unit` ("shares"), `timestamp_unit` ("nanoseconds_since_epoch"). `LobSnapshotWriter` additionally embeds `lob_levels` and any user-provided `extra_metadata`.
+Every Parquet file includes `schema_version`, `source`
+(`"mbo-lob-reconstructor"`), `reconstructor_version`, `price_unit`
+(`"nanodollars"`), `size_unit` (`"shares"`), and `timestamp_unit`
+(`"nanoseconds_since_epoch"`). Those unit strings are the crate's current
+equity-oriented export contract, not universal DBN format semantics. The
+current timestamp values originate from `DbnBridge`'s `hd.ts_event` mapping,
+not MBO's primary `ts_recv`. `LobSnapshotWriter` additionally embeds
+`lob_levels` and user-provided `extra_metadata`.
 
 ### Writers
 
@@ -777,8 +843,8 @@ Supports TOML config files with `[export]`, `[input]`, `[output]` sections. CLI 
 
 | File | Scope | Notes |
 |------|-------|-------|
-| `{date}_lob_snapshots.parquet` | per day | LOB state at each message |
-| `{date}_mbo_events.parquet` | per day | Raw MBO events; omitted with `--no-mbo` |
+| `{date}_lob_snapshots.parquet` | per day | Accepted reconstructed states; may be downsampled and is not guaranteed one-to-one with source records |
+| `{date}_mbo_events.parquet` | per day | Unsampled after successful bridge conversion, but a lossy six-field projection rather than raw DBN; omitted with `--no-mbo` |
 | `{date}_reconstruction_stats.json` | per day | `LobStatsExportEnvelope` — schema-versioned via `LOB_STATS_SCHEMA_VERSION` (independent of §13's Parquet `SCHEMA_VERSION`), atomic-write (tmp + fsync + rename, with a direct-write fallback of identical envelope shape). Re-exported at the crate root; read by external consumers for provenance auditing |
 | `_export_summary.json` | per run | Aggregate summary across all days: symbol, days processed/failed, totals, throughput, and per-category skipped-row anomaly counts (hft-rules §8 fail-loud observability — e.g. `decode_or_convert_error`, `downsample_out_of_order`) |
 
@@ -848,4 +914,4 @@ Feature gates:
 - `[databento]`: `loader.rs`, `hotstore.rs`, `dbn_bridge.rs`, `DbnSource` in `source.rs`
 - `[export]`: entire `export/` module
 
-All modules under `lob/` depend on subsets of `types.rs`, `constants.rs`, and `error.rs`. The four standalone trackers (`queue_position`, `order_lifecycle`, `trade_aggregator`, `day_boundary`) do NOT depend on `reconstructor.rs` or `price_level.rs` -- they are fully independent.
+All modules under `lob/` depend on subsets of `types.rs`, `constants.rs`, and `error.rs`. The four standalone stateful helpers (`queue_position`, `order_lifecycle`, `trade_aggregator`, `day_boundary`) do NOT depend on `reconstructor.rs` or `price_level.rs` -- they are structurally independent, while retaining the distinct update/filter contracts documented in Section 8.

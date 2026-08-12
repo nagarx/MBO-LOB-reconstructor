@@ -37,7 +37,7 @@ Converts Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshot
 | Capability | Description |
 |------------|-------------|
 | LOB Reconstruction | MBO events → price-level aggregation |
-| System Message Filtering | Auto-skip heartbeats, status updates (order_id=0) |
+| System-shaped filtering | Internal predicate `order_id == 0 || size == 0 || price <= 0`; Clear exempt. This is not a universal DBN heartbeat taxonomy and affects true-Trade coverage on the bounded NVDA/XNAS feature path. |
 | Crossed Quote Handling | Configurable policies for bid ≥ ask |
 | Temporal Fields | Time delta, triggering action/side (FI-2010 u6-u9) |
 | Analytics | Microprice, VWAP, depth imbalance, market impact |
@@ -46,7 +46,7 @@ Converts Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshot
 | Queue Position Tracking | FIFO position, volume ahead (composable module) |
 | Order Lifecycle Tracking | Add→Modify→Cancel/Fill lifecycle (composable module) |
 | Day Boundary Detection | Trading day boundaries for train/test splits |
-| Trade Aggregation | Fills→trades with aggressor side detection |
+| Trade Aggregation | Fill-only helper with aggressor-side inversion. It is not safe on current `DbnLoader` output: the v0.3.0 bridge merges wire `T` (aggressor side) and `F` (resting side), while `TradeAggregator` reverses side for both. Use only with independently supplied, resting-side Fill semantics. |
 | DBN Support | Native Databento file loading (feature-gated) |
 
 ### Directory Structure
@@ -129,10 +129,10 @@ src/
 | `lob/queue_position` | FIFO queue position tracking | `QueuePositionTracker`, `QueuePositionConfig`, `QueuePositionInfo`, `QueueStats` |
 | `lob/order_lifecycle` | Order lifecycle tracking | `OrderLifecycleTracker`, `OrderLifecycle`, `LifecycleEvent`, `LifecycleStats`, `ActiveOrderFeatures` |
 | `lob/day_boundary` | Trading day detection | `DayBoundaryDetector`, `DayBoundaryConfig`, `DayBoundary`, `DayBoundaryStats` |
-| `lob/trade_aggregator` | Trade aggregation | `TradeAggregator`, `Trade`, `Fill` |
+| `lob/trade_aggregator` | Fill-only aggregation helper; unsafe on current bridge output because it cannot distinguish wire Trade from Fill and reverses side unconditionally | `TradeAggregator`, `Trade`, `Fill` |
 | `source` | Provider abstraction | `MarketDataSource`, `SourceMetadata`, `DbnSource`, `VecSource` |
 | `hotstore` | Decompressed data caching | `HotStoreConfig`, `HotStoreManager` |
-| `loader` | DBN file streaming | `DbnLoader`, `TypedMessageIterator` (preferred: `iter_messages_typed()` → `Result<MboMessage, BoundaryError>`), `BoundaryError` (`loader/error.rs`), `LoaderStats`, `MessageIterator` (legacy — `#[deprecated]`, gated behind default-on `legacy-iterator-api`; removal 0.3.0 / 2026-10-29) |
+| `loader` | DBN file streaming | `DbnLoader`, `TypedMessageIterator` (preferred: `iter_messages_typed()` -> `Result<MboMessage, BoundaryError>`), `BoundaryError`, `LoaderStats`, `MessageIterator` (legacy, `#[deprecated]`, default-on and still present in v0.3.0; calendar removal trigger 2026-10-29) |
 | `dbn_bridge` | DBN → internal conversion | `DbnBridge` |
 | `statistics` | ML statistics | `RunningStats`, `DayStats`, `NormalizationParams` |
 | `analytics` | Market microstructure | `DepthStats`, `MarketImpact`, `LiquidityMetrics` |
@@ -145,34 +145,56 @@ src/
 
 ### MboMessage (src/types.rs)
 
-Input message representing a single order book event.
+Input message representing one event after the DBN bridge. It is narrower than
+`dbn::MboMsg` and must not be treated as a lossless wire mirror.
 
 ```rust
 pub struct MboMessage {
-    pub order_id: u64,        // Unique order identifier (0 = system message)
-    pub action: Action,       // Add, Modify, Cancel, Trade, Fill, Clear, None
-    pub side: Side,           // Bid, Ask, None
-    pub price: i64,           // Fixed-point nanodollars (divide by NANODOLLARS_PER_DOLLAR_F64 for dollars)
-    pub size: u32,            // Shares/contracts
-    pub timestamp: Option<i64>, // Nanoseconds since epoch
+    pub order_id: u64,          // Venue order ID; zero is not universally a heartbeat
+    pub action: Action,         // Internal action after bridge conversion
+    pub side: Side,             // Bid, Ask, None
+    pub price: i64,             // Raw fixed-point; sentinel-check, then / 1e9
+    pub size: u32,              // Instrument/publisher-native quantity
+    pub timestamp: Option<i64>, // Current bridge copies hd.ts_event
 }
 ```
 
-**Critical**: Messages with `order_id=0`, `size=0`, or `price<=0` are **system messages** (heartbeats, status updates), not valid orders. Use `msg.is_system_message()` to check (replaces the deprecated `is_valid_order()` free function).
+`DbnBridge` accepts `ts_event == 0` on the internal structural shape
+(`order_id == 0 || size == 0 || price <= 0`) and emits `timestamp: None` so the
+message remains observable. `InvalidTimestamp(0)` is reserved for a zero
+timestamp on a non-structural/order-shaped row; a value above `i64::MAX` is
+always rejected after the checked signed-domain test.
+
+**Boundary facts**:
+
+- `MboMessage::is_system_message()` implements
+  `order_id == 0 || size == 0 || price <= 0`. That is an internal structural
+  filter, not a DBN heartbeat/status type test. `Action::Clear` is exempted by
+  the reconstructor and extractor.
+- DBN MBO's primary/index timestamp is `ts_recv`; common-header `hd.ts_event`
+  is matching-engine-received time. Current v0.3.0 `DbnBridge` stores
+  `hd.ts_event` and drops `ts_recv`.
+- The fixed-price 1e9 divisor produces an instrument-native price. The current
+  equity consumers interpret it as USD; quantities are shares only under that
+  dataset/instrument context.
 
 ### Action Enum
 
 ```rust
 pub enum Action {
     Add = b'A',      // New order
-    Modify = b'M',   // Change existing order
-    Cancel = b'C',   // Remove order (full or partial)
-    Trade = b'T',    // Execution against order
-    Fill = b'F',     // Alternative trade representation
-    Clear = b'R',    // Reset entire book
-    None = b'N',     // No-op (may carry metadata)
+    Modify = b'M',   // Existing order price and/or size changed
+    Cancel = b'C',   // Existing order fully or partially cancelled
+    Trade = b'T',    // Wire T: aggressor side; DBN says no book effect
+    Fill = b'F',     // Wire F: resting side; DBN says no book effect
+    Clear = b'R',    // Reset all orders for the instrument
+    None = b'N',     // No book effect; may carry other information
 }
 ```
+
+`Action::from_byte()` distinguishes `T` and `F`. The current DBN bridge does
+not: `b'T' | b'F' => Action::Trade` remains live in v0.3.0. Do not copy that
+current limitation into a statement of vendor semantics.
 
 ### Side Enum
 
@@ -313,30 +335,37 @@ impl PriceLevel {
               └─────────────┘
 ```
 
-### System Message Filtering (Step 1)
+### Structural Filtering (Step 1)
+
+Current `process_message_into()` behavior is:
 
 ```rust
-// In process_message()
 if self.config.skip_system_messages
-    && (msg.order_id == 0 || msg.size == 0 || msg.price <= 0)
+    && msg.is_system_message()
+    && msg.action != Action::Clear
 {
     self.stats.system_messages_skipped += 1;
-    return Ok(self.get_lob_state());  // Return current state unchanged
+    // Temporal output is still populated before the early return.
+    return Ok(());
 }
 ```
 
-**Why this matters**: DBN data contains ~10-15% system messages. Without filtering, these would cause validation errors.
+The predicate is a crate-local structural heuristic, not a DBN system-record
+classification. The Clear exemption is load-bearing because a valid wire `R`
+record is zero-shaped. FINDING-122 additionally shows that, on the bounded
+NVDA/XNAS feature path, `order_id == 0` selects true Trades; upstream use of
+this filter therefore changes trade coverage.
 
 ### Action Processing (Step 3)
 
-| Action | Logic |
-|--------|-------|
-| **Add** | Insert order into price level, track in orders map |
-| **Modify** | Remove old order, add new (handles price change) |
-| **Cancel** | Reduce size or remove order; supports partial cancels |
-| **Trade/Fill** | Reduce size or remove order (execution) |
-| **Clear** | Call `reset()`, increment `book_clears` stat |
-| **None** | No-op, increment `noop_messages` stat |
+| Internal action | Current v0.3.0 logic | DBN semantic boundary |
+|---|---|---|
+| **Add** | Insert order into price level and orders map | Book-affecting |
+| **Modify** | Remove old order, add new; handles price change | Book-affecting |
+| **Cancel** | Reduce size or remove order | Book-affecting |
+| **Trade/Fill** | Both route to `process_trade()` and mutate the book | Known implementation limitation: DBN documents wire `T` and `F` as no-book-effect and gives them opposite side conventions |
+| **Clear** | `reset()`, increment `book_clears` | Wire `R`: clear all orders; explicitly exempt from structural filter/validation |
+| **None** | No-op, increment `noop_messages` | No book effect |
 
 ### Soft Error Handling in Cancel/Trade
 
@@ -536,7 +565,7 @@ pub enum TlobError {
     OrderNotFound(u64),        // Operation on missing order
     InvalidPrice(i64),         // price <= 0
     InvalidSize(u32),          // size == 0
-    InvalidTimestamp(i64),     // ts_event <= 0 or u64->i64 overflow (M.A.6 F-023)
+    InvalidTimestamp(i64),     // ts_event > i64::MAX, or ts_event == 0 on a non-structural/order-shaped row
     InvalidAction(u8),         // Unknown action byte
     InvalidSide(u8),           // Unknown side byte
     SymbolNotFound(String),    // Multi-symbol: unknown symbol
@@ -621,10 +650,11 @@ let stats = iter.finalize();  // clean-EOF vs torn-stream check: stats.is_clean_
 // Access: day_stats.mid_price.mean, day_stats.spread_bps.std(), etc.
 ```
 
-> **Ingestion API note**: all examples in this document use `iter_messages_typed()`
-> (yields `Result<MboMessage, BoundaryError>`). The older `iter_messages()` is
-> `#[deprecated]` behind the default-on `legacy-iterator-api` feature — removal scheduled
-> for the next MAJOR (0.3.0; calendar 2026-10-29). Do not write new code against it.
+> **Ingestion API note**: examples use `iter_messages_typed()` (yielding
+> `Result<MboMessage, BoundaryError>`). The older `iter_messages()` is
+> `#[deprecated]` behind the default-on `legacy-iterator-api` feature and is
+> still present in v0.3.0. Its calendar removal trigger is 2026-10-29. Do not
+> write new code against it.
 
 ### Analytics (src/analytics.rs)
 
@@ -746,9 +776,12 @@ fn bench_process_message(b: &mut Bencher) {
 
 ### Memory Efficiency
 
-- `MboMessage`: 32 bytes (packed)
+- `MboMessage`: 40 bytes on the audited target (48 under source-order layout is
+  possible); `repr(Rust)` and no exact-size assertion mean this is not packed or
+  ABI-stable
 - `Order`: 16 bytes
-- `LobState`: ~560 bytes (stack-allocated, 20 levels max)
+- `LobState`: 576 bytes on the audited target (stack-allocated, 20 levels max);
+  the live test only bounds it between 501 and 699 bytes
   - Fixed arrays: 20×(8+4+8+4) = 480 bytes
   - Temporal fields + metadata: ~80 bytes
 
@@ -824,10 +857,11 @@ This library is designed to work with [feature-extractor-MBO-LOB](https://github
 
 ### Recommended: Use Feature Extractor Pipeline
 
-The extractor is a **9-crate Cargo workspace** whose facade crate is `hft-extractor` (it
-depends on this library via git tag `v0.2.1` + a monorepo `.cargo/config.toml` path
-override). Its `Pipeline` handles LOB reconstruction internally; the production entry point
-is the config-driven `export_dataset` CLI (`cargo run --release --features parallel --bin
+The extractor is a **9-crate Cargo workspace** whose facade crate is
+`hft-extractor`; it depends on this library at git tag `v0.3.0` with a
+monorepo `.cargo/config.toml` path override. Its `Pipeline` handles LOB
+reconstruction internally; the production entry point is the config-driven
+`export_dataset` CLI (`cargo run --release --features parallel --bin
 export_dataset -- --config configs/<name>.toml`). Programmatically:
 
 ```rust
@@ -934,13 +968,25 @@ assert!(stats.is_clean_eof(), "torn DBN: mid_record_eof={}", stats.mid_record_eo
 > attributed a residual BBO mismatch to `cancel_order_not_found` "upstream data quality" — that
 > attribution is falsified, since the counter is itself 100% this bug.)
 
+> **FINDING-122 interpretation boundary.** The raw-tape consequence and the
+> current feature-path consequence are different. On raw NVDA/XNAS MBO, merging
+> `T` (aggressor side) and `F` (resting side) annihilates signed direction. In
+> the current feature-extractor path, the separate
+> `is_system_message(order_id == 0)` filter drops exactly true Trades and leaves
+> Fills, whose resting-side convention is the convention the feature code
+> assumes. The two defects therefore cancel for sign on that path; they cost
+> coverage and do **not** reopen the registered direction closures. This claim
+> is limited to the measured current NVDA/XNAS producer path, says nothing about
+> direct raw-tape consumers, and becomes historical when producer behavior
+> changes.
+
 See **`WARNINGS.md`** for the full `WarningCategory` taxonomy and the catalog of real-market data-quality edge cases (e.g. pre-market session start, partial-cancel handling) — the authoritative reference when triaging a preprocessing anomaly.
 
 ---
 
 ## 14. Composable Tracking Modules
 
-These modules are **standalone and composable** - they do NOT modify the core `LobReconstructor`. Each processes `MboMessage` independently and can be used alongside or without LOB reconstruction.
+These modules are **standalone and composable** - they do NOT modify the core `LobReconstructor`. Their APIs and filters are distinct: queue-position and lifecycle trackers consume `MboMessage` and reject the internal structural shape plus `Side::None`; `TradeAggregator` consumes `MboMessage` but has no structural-shape filter; `DayBoundaryDetector` uses `check_boundary(timestamp)` followed by `record_message(...)`, not `process_message`. They can be used alongside or without LOB reconstruction only when those separate contracts are honored.
 
 ### Design Philosophy
 
@@ -1077,7 +1123,14 @@ println!("Boundaries detected so far: {}", detector.boundaries_detected());
 
 ### TradeAggregator
 
-Aggregates fill events into trades with aggressor side detection.
+Aggregates resting-side Fill events into trades by reversing the supplied side to
+derive aggressor side. This helper is currently unused by the pipeline and is
+**unsafe on direct `DbnLoader` / `DbnBridge` output**: v0.3.0 maps both wire `T`
+(whose side is already aggressor side) and wire `F` (resting side) to
+`Action::Trade`, while `TradeAggregator::process_message()` reverses side for
+every `Action::Trade | Action::Fill`. The example below is valid only when the
+caller has independently selected true Fill rows and preserved resting-side
+semantics; it must not be connected to the current bridge stream.
 
 ```rust
 use mbo_lob_reconstructor::{TradeAggregator, TradeAggregatorConfig};
@@ -1110,13 +1163,18 @@ for trade in aggregator.recent_trades() {
 - Trade against **bid** order → aggressor is **seller**
 - Trade against **ask** order → aggressor is **buyer**
 
-### Composing All Trackers
+### Composing Reconstruction, Queue/Lifecycle Tracking, and Day Boundaries
+
+The queue and lifecycle trackers can share a current bridge stream with the
+reconstructor, and the day detector consumes the timestamp/statistics projection.
+`TradeAggregator` is intentionally excluded from this current-bridge example;
+see its Fill-only precondition above.
 
 ```rust
 use mbo_lob_reconstructor::{
-    LobReconstructor, QueuePositionTracker, OrderLifecycleTracker,
-    DayBoundaryDetector, TradeAggregator,
-    QueuePositionConfig, OrderLifecycleConfig, DayBoundaryConfig, TradeAggregatorConfig,
+    Action, LobReconstructor, QueuePositionTracker, OrderLifecycleTracker,
+    DayBoundaryDetector,
+    QueuePositionConfig, OrderLifecycleConfig, DayBoundaryConfig,
 };
 
 // Initialize all trackers
@@ -1124,7 +1182,6 @@ let mut lob = LobReconstructor::new(10);
 let mut queue_tracker = QueuePositionTracker::new(QueuePositionConfig::default());
 let mut lifecycle_tracker = OrderLifecycleTracker::new(OrderLifecycleConfig::default());
 let mut day_detector = DayBoundaryDetector::new(DayBoundaryConfig::us_equity());
-let mut trade_aggregator = TradeAggregator::new(TradeAggregatorConfig::default());
 
 // Process messages through all trackers
 for msg in messages {
@@ -1134,7 +1191,6 @@ for msg in messages {
             lob.full_reset();
             queue_tracker.reset();
             lifecycle_tracker.reset();
-            trade_aggregator.reset();
         }
     }
     
@@ -1142,13 +1198,17 @@ for msg in messages {
     let state = lob.process_message(&msg)?;
     queue_tracker.process_message(&msg);
     lifecycle_tracker.process_message(&msg);
-    trade_aggregator.process_message(&msg);
+    day_detector.record_message(
+        msg.timestamp,
+        matches!(msg.action, Action::Trade | Action::Fill),
+        msg.size,
+    );
     
     // Now you have:
     // - state: LobState with temporal fields
     // - queue_tracker.queue_position(order_id): Queue position info
     // - lifecycle_tracker.get_active(order_id): Order lifecycle
-    // - trade_aggregator.trade_imbalance(): Buy/sell pressure
+    // - day_detector.current_day_stats(): Per-day message/trade statistics
 }
 ```
 
@@ -1189,7 +1249,7 @@ use mbo_lob_reconstructor::{OrderLifecycleTracker, OrderLifecycleConfig, OrderLi
 // Day Boundary Detection
 use mbo_lob_reconstructor::{DayBoundaryDetector, DayBoundaryConfig, DayBoundary};
 
-// Trade Aggregation
+// Fill-only Trade Aggregation (do not feed current T/F-merged DbnBridge output)
 use mbo_lob_reconstructor::{TradeAggregator, TradeAggregatorConfig, Trade, Fill};
 ```
 
@@ -1198,12 +1258,16 @@ use mbo_lob_reconstructor::{TradeAggregator, TradeAggregatorConfig, Trade, Fill}
 ```rust
 use mbo_lob_reconstructor::constants::{NANODOLLARS_PER_DOLLAR, NANODOLLARS_PER_DOLLAR_F64};
 
-// Dollars to fixed-point
-let price_fixed: i64 = (price_dollars * NANODOLLARS_PER_DOLLAR_F64) as i64;
+// Instrument-native price -> DBN-style fixed-point.
+let price_fixed: i64 = (price_native * NANODOLLARS_PER_DOLLAR_F64) as i64;
 
-// Fixed-point to dollars
-let price_dollars: f64 = price_fixed as f64 / NANODOLLARS_PER_DOLLAR_F64;
+// Fixed-point -> instrument-native price, after checking the applicable sentinel.
+let price_native: f64 = price_fixed as f64 / NANODOLLARS_PER_DOLLAR_F64;
 ```
+
+The constant names are historical and equity-oriented. Division by 1e9 is the
+DBN storage scale; it does not by itself establish USD. Current XNAS/ARCX equity
+callers may label `price_native` as dollars after instrument context is known.
 
 ### Checking Book Health
 
@@ -1227,7 +1291,14 @@ lob.stats().total_warnings()
 
 ### Overview
 
-The `export` module provides a feature-gated Parquet export for raw LOB snapshots and MBO events. It writes data that has **not** been transformed by sampling, normalization, or labeling, making it suitable for unbiased statistical analysis in the `MBO-LOB-analyzer` Python repository.
+The `export` module provides feature-gated Parquet output for reconstructed LOB
+snapshots and converted MBO projections. Snapshot rows are accepted, valid
+states and may be downsampled or rejected by ordering checks. MBO rows are not
+downsampled after successful bridge conversion, but are a lossy six-field
+projection: the bridge uses `hd.ts_event`, merges wire `T` and `F`, and omits
+publisher/instrument identity, `ts_recv`, flags, channel ID, and
+`ts_in_delta`. Neither file is vendor-raw DBN or an automatically unbiased
+analysis population; the applicable filters and denominators must be stated.
 
 ### Dependencies
 
@@ -1290,9 +1361,9 @@ Both Parquet files embed key-value metadata in the footer:
 - `schema_version`: "1.0"
 - `source`: "mbo-lob-reconstructor"
 - `reconstructor_version`: from Cargo.toml
-- `price_unit`: "nanodollars"
-- `size_unit`: "shares"
-- `timestamp_unit`: "nanoseconds_since_epoch"
+- `price_unit`: `"nanodollars"` (current equity-oriented crate metadata; the generic DBN rule is fixed raw / 1e9 -> instrument-native price)
+- `size_unit`: `"shares"` (current equity export contract; not a universal DBN quantity unit)
+- `timestamp_unit`: `"nanoseconds_since_epoch"` (current values come from bridge-mapped `hd.ts_event`, not MBO primary `ts_recv`)
 - `lob_levels`: (LOB files only) number of exported levels
 - `date`, `symbol`: when provided via extra metadata
 
@@ -1336,5 +1407,4 @@ precision). Counts are intentionally not hand-maintained here (hft-rules §11) �
 ---
 
 *Last updated: 2026-07-07 (Phase-2 doc-truth pass: typed-iterator ingestion API coverage + live extractor-workspace integration sections; content baseline 2026-04-30, post Phase M REV 3 — Boundary Discipline cycle)*
-*Crate version: 0.2.1*
-
+*Crate version: 0.3.0*
