@@ -33,3 +33,11 @@ RULE.md
 # Stale documentation copies (canonical version in feature-extractor docs/)
 full-data-pipeline.md
 
+
+# Nested git worktrees (candidate branches, v4 custody). These are full
+# checkouts; without this rule a `git add -A` would commit an entire second
+# working tree into this repo.
+.worktrees/
+
+# Machine-local Claude Code settings (never shared).
+.claude/settings.local.json
