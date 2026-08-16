@@ -428,7 +428,24 @@ impl QueuePositionTracker {
             Action::Add => self.handle_add(msg),
             Action::Modify => self.handle_modify(msg),
             Action::Cancel => self.handle_order_reduction(msg, ReductionOp::Cancel),
-            Action::Trade | Action::Fill => self.handle_order_reduction(msg, ReductionOp::Fill),
+            // ⚠⚠ KNOWINGLY TEMPORARY — MECHANICAL RENAME THAT PRESERVES THE MERGE. ⚠⚠
+            //
+            // `Action::TradeAggregate | Action::Fill` compiles, passes every test, and routes both
+            // carriers to one handler exactly as `Action::Trade | Action::Fill` did. It is written
+            // this way ON PURPOSE so this commit changes only the decoded action byte.
+            //
+            // Today the merge is DORMANT here, not live: the `is_system_message()` guard at the
+            // top of this function drops 100% of `TradeAggregate` (all carry `order_id == 0` on
+            // XNAS.ITCH), so only ex-`F` reaches this arm. The fix to that guard is what WAKES the
+            // hazard — which is why the two must land together.
+            //
+            // RESOLVED IN: the L-ROUTE commit, which splits this into
+            // `Action::Fill => self.handle_order_reduction(msg, ReductionOp::Fill)` (unchanged
+            // behaviour — `F` is the resting-order view and is what queue depletion is about) plus
+            // a dedicated `Action::TradeAggregate` arm routed to `messages_skipped`. NO wildcard.
+            Action::TradeAggregate | Action::Fill => {
+                self.handle_order_reduction(msg, ReductionOp::Fill)
+            }
             Action::Clear | Action::None => {
                 self.stats.messages_skipped += 1;
             }
@@ -1575,9 +1592,15 @@ mod tests {
     fn test_fill_unknown_order_stats() {
         let mut tracker = QueuePositionTracker::new(QueuePositionConfig::default());
 
+        // ⚠ THE MESSAGE CHANGED, THE BEHAVIOUR UNDER TEST DID NOT. This fixture used to be
+        // `Action::Trade`. The mechanical repair — renaming it to `Action::TradeAggregate` —
+        // would have made this test assert that a TRADE PRINT reaches `handle_order_reduction`,
+        // i.e. it would LOCK the exact routing the L-ROUTE commit forbids, and it would go GREEN
+        // doing so. `Action::Fill` is what this test always meant: an execution against a
+        // resting order that the tracker does not know about.
         tracker.process_message(&make_msg(
             999,
-            Action::Trade,
+            Action::Fill,
             Side::Ask,
             100_000_000_000,
             50,

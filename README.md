@@ -27,7 +27,7 @@ Additional standalone modules that can be used alongside LOB reconstruction:
 - **Queue Position Tracking**: FIFO queue position, volume ahead (for execution probability)
 - **Order Lifecycle Tracking**: Track orders through Add→Modify→Cancel/Fill lifecycle
 - **Day Boundary Detection**: Automatic trading day detection for train/test splits
-- **Trade Aggregation**: Fill-only helper that reverses resting side to derive aggressor side. It is unused and unsafe on current `DbnLoader` output because v0.3.0 merges wire Trade and Fill actions before this helper.
+- **Trade Aggregation**: Fill-only helper that reverses resting side to derive aggressor side. Unused, and still unsafe on current `DbnLoader` output — no longer because the bridge merges the two wire actions (L-DECODE split them) but because the helper reverses side for BOTH carriers, and a `TradeAggregate`'s side is already the aggressor's. Resolved at L-ROUTE.
 
 ## Feature Flags
 
@@ -110,10 +110,11 @@ norm_params.save_json("normalization.json")?;
 > `VersionUpgradePolicy::AsIs`. Databento MBO uses `ts_recv` as its primary/index
 > timestamp, but the current `DbnBridge` stores `hd.ts_event` in
 > `MboMessage.timestamp`; that field is therefore the matching-engine-received
-> timestamp, not the DBN primary timestamp. The bridge also still maps both wire
-> actions `T` and `F` to internal `Action::Trade`. On the wire, `T` carries the
-> aggressor side and `F` the resting side, and both are documented as book no-ops.
-> This is an active current-behavior limitation, not the DBN contract; see
+> timestamp, not the DBN primary timestamp. **The `T`/`F` decode merge is FIXED as of the
+> L-DECODE commit**: the bridge now decodes `T` to `Action::TradeAggregate` and `F` to
+> `Action::Fill`. On the wire, `T` carries the aggressor side and `F` the resting side, and both
+> are documented as book no-ops. ⚠️ The BOOK does not yet honour that: `LobReconstructor` still
+> routes both carriers to `process_trade`, knowingly and marked in-source, until L-ROUTE. See
 > `WARNINGS.md` and FINDING-122 for the bounded downstream interpretation.
 
 ## Using with Feature Extractor
@@ -273,11 +274,13 @@ for msg in messages {
 ### Trade Aggregation with Aggressor Detection
 
 > **Fill-only precondition.** `TradeAggregator` reverses side for every internal
-> `Action::Trade | Action::Fill`, which is correct only when the input is known
-> to carry resting-side Fill semantics. Current v0.3.0 `DbnBridge` maps both wire
-> `T` (aggressor-side Trade) and wire `F` (resting-side Fill) to
-> `Action::Trade`; therefore direct `DbnLoader` output is not a valid input to
-> this example. The helper is unused by the current pipeline.
+> `Action::TradeAggregate | Action::Fill`, which is correct only when the input is known
+> to carry resting-side Fill semantics. As of L-DECODE `DbnBridge` decodes wire `T` to
+> `Action::TradeAggregate` and wire `F` to `Action::Fill` — but the aggregator still reverses
+> side for BOTH, and a `TradeAggregate`'s side is already the aggressor's, so reversing it
+> INVERTS the flag. Direct `DbnLoader` output is therefore still not a valid input to this
+> example. The helper is unused by the current pipeline; the call site is marked
+> knowingly-temporary and resolved at L-ROUTE.
 
 ```rust
 use mbo_lob_reconstructor::{TradeAggregator, TradeAggregatorConfig};
@@ -340,7 +343,8 @@ The `LobState` struct provides rich analytics:
 | `event_intensity()` | Events per second (1/Δt) |
 | `triggering_action` | Action that caused this state (Add, Cancel, Trade, etc.) |
 | `triggering_side` | Side affected (Bid, Ask) |
-| `is_trade_event()` | Check if triggered by Trade/Fill |
+| `is_aggregate_trade_event()` | Triggered by byte `T` — the aggressor-side trade print, one row per execution |
+| `is_resting_fill_event()` | Triggered by byte `F` — the resting-order fill (opposite side convention) |
 | `is_add_event()` | Check if triggered by Add |
 | `is_cancel_event()` | Check if triggered by Cancel |
 
@@ -392,8 +396,9 @@ Export reconstructed LOB snapshots and converted MBO projections to Apache
 Parquet for downstream analysis (for example, `MBO-LOB-analyzer`). This is not
 vendor-raw DBN. Snapshot rows include only accepted, valid reconstructed states
 and may be downsampled; event rows are unsampled after successful bridge
-conversion but retain only six fields. The bridge uses `hd.ts_event`, merges
-wire `T` and `F` into `Action::Trade`, and drops DBN fields such as publisher,
+conversion but retain only six fields. The bridge uses `hd.ts_event`, decodes wire `T` and `F`
+into the distinct variants `Action::TradeAggregate` and `Action::Fill` (the former merge into a
+single `Action::Trade` was removed at L-DECODE), and drops DBN fields such as publisher,
 instrument ID, `ts_recv`, flags, channel ID, and `ts_in_delta`.
 
 ### CLI

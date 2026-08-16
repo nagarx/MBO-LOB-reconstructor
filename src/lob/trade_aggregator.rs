@@ -249,8 +249,36 @@ impl TradeAggregator {
     /// The fill is treated as a standalone trade and the missing timestamp counter
     /// is incremented. This follows RULE.md §7: never silently handle anomalies.
     pub fn process_message(&mut self, msg: &MboMessage) -> Option<Trade> {
-        // Only process trades/fills
-        if msg.action != Action::Trade && msg.action != Action::Fill {
+        // ⚠⚠ KNOWINGLY TEMPORARY — AND THIS MODULE HAS NO LOUD SIGNAL OF ANY KIND. ⚠⚠
+        //
+        // This is a NEGATED EQUALITY OVER A TWO-ELEMENT SET, so renaming the first term from
+        // `Action::Trade` to `Action::TradeAggregate` leaves the admitted set BIT-IDENTICAL. That
+        // makes it a provable no-op — and it also means neither the compiler, nor this module's
+        // tests, nor any counter will tell a reviewer whether the real fix landed here. This
+        // comment is the only guard.
+        //
+        // WHAT IS STILL WRONG BELOW: the aggressor-side inversion a few lines down
+        // (`Side::Bid => Side::Ask`) is UNCONDITIONAL. It is CORRECT for `Fill` (whose `side` is
+        // the resting order's) and EXACTLY WRONG for `TradeAggregate` (whose `side` is already the
+        // aggressor's). Both populations pass through it today, so the module emits the same
+        // annihilation as the decoder did, one layer down: measured net signed volume
+        // +248 sh on 2025-07-01 and +150 sh on 2025-07-02 where the truth is −319,783 and −85,630;
+        // exactly 0 on 2025-02-03 for a whole session. Its two tests
+        // (`test_single_trade`, `test_aggressor_detection_buyer`) assert the inverted expectation
+        // and stay GREEN under any rename.
+        //
+        // ⛔ This module is therefore STILL WRONG after this commit, by design and in sequence.
+        // Leaving it wrong is safe ONLY because it has zero code consumers: in this repo just the
+        // two `pub use` re-exports, and zero in feature-extractor-MBO-LOB, mbo-statistical-profiler,
+        // xsec_equity_discovery and glbx_discovery. It is a latent trap, not a live wrong number.
+        //
+        // RESOLVED IN: the `trade_aggregator` commit, which makes this
+        // `if msg.action != Action::TradeAggregate` (carrier: aggregate trades only, per the
+        // carrier table), drops the inversion to `let aggressor_side = msg.side;`, counts the
+        // `Side::None` prints instead of silently returning, and INVERTS the locked expectations.
+        //
+        // Only process the execution carriers.
+        if msg.action != Action::TradeAggregate && msg.action != Action::Fill {
             // Check if pending trade should be finalized due to time gap
             return self.check_finalize_pending(msg.timestamp);
         }
@@ -548,7 +576,7 @@ mod tests {
     fn make_trade_msg(order_id: u64, side: Side, price: i64, size: u32, ts: i64) -> MboMessage {
         MboMessage {
             order_id,
-            action: Action::Trade,
+            action: Action::TradeAggregate,
             side,
             price,
             size,
@@ -832,7 +860,7 @@ mod tests {
     fn make_trade_msg_no_ts(order_id: u64, side: Side, price: i64, size: u32) -> MboMessage {
         MboMessage {
             order_id,
-            action: Action::Trade,
+            action: Action::TradeAggregate,
             side,
             price,
             size,

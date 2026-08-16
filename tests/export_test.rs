@@ -576,7 +576,7 @@ fn test_mbo_all_action_variants() {
         Action::Add,
         Action::Modify,
         Action::Cancel,
-        Action::Trade,
+        Action::TradeAggregate,
         Action::Fill,
         Action::Clear,
         Action::None,
@@ -600,7 +600,15 @@ fn test_mbo_all_action_variants() {
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 7);
 
-    // Verify action bytes
+    // Verify action bytes.
+    //
+    // ⚠ NOTE FOR ANY READER TREATING THIS AS A WIRE-FORMAT GUARD: IT IS NOT ONE. The assertion
+    // below compares the written value against `action.to_byte()` — the very function that wrote
+    // it — so it passes under ANY discriminant assignment, including the `0..6` an enum emits with
+    // `#[repr(u8)]` dropped. The real locks are
+    // `types.rs::test_action_discriminants_are_ascii_wire_format` (literal integers) and
+    // `test_mbo_action_column_separates_trade_and_fill_bytes` below (literal bytes read back out
+    // of a real Parquet file).
     let batch = &batches[0];
     let action_col = batch.column_by_name("action").unwrap();
     let action_arr = action_col.as_any().downcast_ref::<UInt8Array>().unwrap();
@@ -609,6 +617,109 @@ fn test_mbo_all_action_variants() {
             assert_eq!(action_arr.value(i), action.to_byte());
         }
     }
+}
+
+/// ⭐ ARTIFACT-LEVEL LOCK ON THE T/F DECODE SPLIT — the pre-registered acceptance signal.
+///
+/// The acceptance criterion for the decode fix is a property of the **shipped artifact**, not of
+/// the enum: `{day}_mbo_events.parquet`'s `action` histogram must split byte **84** into
+/// **{84, 70}**. Byte 70 had never appeared on disk in 468 shipped Parquet files — the histogram
+/// read `{65, 67, 82, 84}` with 84 carrying BOTH carriers — because the decoder mapped
+/// `b'T' | b'F'` onto one variant.
+///
+/// # This test starts at the RAW VENDOR BYTE, deliberately
+///
+/// The defect lived in `DbnBridge::convert_action`, NOT in the writer: the `Fill` variant already
+/// existed and already encoded as 70. So a test that constructs `Action::Fill` directly and writes
+/// it would emit byte 70 **on the defective build too** — it would be green on the bug. This test
+/// therefore feeds `dbn::MboMsg { action: b'F' }` through the real decoder, the real
+/// `MboEventWriter` and a real Parquet round-trip, and asserts the **literal** bytes 84 and 70
+/// with exact counts. On the pre-split decoder every one of these five records lands on 84 and the
+/// `n_70 == 2` assertion fails.
+///
+/// It is deliberately NOT expressed via `to_byte()`: a test that writes and checks with the same
+/// function cannot detect a discriminant change, and a `count > 0` check cannot distinguish an
+/// absent key from a zero count.
+#[cfg(feature = "databento")]
+#[test]
+fn test_mbo_action_column_separates_trade_and_fill_bytes() {
+    use mbo_lob_reconstructor::DbnBridge;
+
+    let tmp = TempDir::new("mbo_tf_split");
+    let path = tmp.file("mbo.parquet");
+    let config = small_config(2, false);
+
+    // Raw vendor action bytes: 3 aggressor-side trade prints, 2 resting-order fills.
+    let vendor_bytes = [b'T', b'F', b'T', b'F', b'T'];
+
+    let make_dbn = |action: u8, order_id: u64| dbn::MboMsg {
+        hd: dbn::RecordHeader::new::<dbn::MboMsg>(0, 0, 0, 1_000_000_000_000_000_000),
+        order_id,
+        price: 100_000_000_000,
+        size: 100,
+        flags: dbn::FlagSet::empty(),
+        channel_id: 0,
+        action: action as i8,
+        side: b'B' as i8,
+        ts_recv: 1_000_000_000_000_000_000,
+        ts_in_delta: 0,
+        sequence: 0,
+    };
+
+    let mut writer = MboEventWriter::new(&path, &config, HashMap::new()).unwrap();
+    for (i, action) in vendor_bytes.iter().enumerate() {
+        // `T` carries order_id == 0 on the vendor tape; `F` names a resting order.
+        let order_id = if *action == b'T' { 0 } else { 1000 + i as u64 };
+        let msg = DbnBridge::convert(&make_dbn(*action, order_id))
+            .expect("vendor record must decode cleanly");
+        writer.write_event(&msg).unwrap();
+    }
+    let stats = writer.finish().unwrap();
+    assert_eq!(stats.rows_written, 5);
+
+    // Read every batch back (small_config uses batch_size 4, so this spans two).
+    let file = fs::File::open(&path).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut n_84 = 0usize; // ASCII 'T' — analyzer ACTION_TRADE
+    let mut n_70 = 0usize; // ASCII 'F' — analyzer ACTION_FILL
+    let mut n_rows = 0usize;
+    let mut other: Vec<u8> = Vec::new();
+    for batch in reader.into_iter().map(|b| b.unwrap()) {
+        let col = batch.column_by_name("action").unwrap();
+        let arr = col.as_any().downcast_ref::<UInt8Array>().unwrap();
+        for i in 0..batch.num_rows() {
+            n_rows += 1;
+            match arr.value(i) {
+                84 => n_84 += 1,
+                70 => n_70 += 1,
+                b => other.push(b),
+            }
+        }
+    }
+
+    assert_eq!(n_rows, 5, "row count changed");
+    assert!(
+        other.is_empty(),
+        "unexpected action bytes in the column: {other:?}"
+    );
+    assert_eq!(
+        n_84, 3,
+        "expected 3 rows at byte 84 (ASCII 'T', the aggressor-side trade print)"
+    );
+    assert_eq!(
+        n_70, 2,
+        "expected 2 rows at byte 70 (ASCII 'F', the resting-order fill). Byte 70 had NEVER \
+         appeared on disk before the T/F decode split — a zero here means the two carriers have \
+         been re-merged onto one byte and the artifact has lost the distinction irrecoverably."
+    );
+    assert_ne!(
+        n_70, 0,
+        "the Fill carrier must be present as a DISTINCT byte, not folded into 84"
+    );
 }
 
 #[test]
@@ -646,7 +757,7 @@ fn test_mbo_roundtrip_fidelity() {
     let path = tmp.file("mbo.parquet");
     let config = small_config(2, false);
 
-    let msg = MboMessage::new(9999, Action::Trade, Side::Ask, 123_456_789_000, 42)
+    let msg = MboMessage::new(9999, Action::TradeAggregate, Side::Ask, 123_456_789_000, 42)
         .with_timestamp(987_654_321_000_000_000);
 
     let mut writer = MboEventWriter::new(&path, &config, HashMap::new()).unwrap();
@@ -1521,7 +1632,12 @@ fn test_lob_multi_row_varying_states() {
 
     let mut writer = LobSnapshotWriter::new(&path, &config, HashMap::new()).unwrap();
 
-    let actions = [Action::Add, Action::Trade, Action::Cancel, Action::Modify];
+    let actions = [
+        Action::Add,
+        Action::TradeAggregate,
+        Action::Cancel,
+        Action::Modify,
+    ];
 
     for (i, action) in actions.iter().enumerate() {
         let mut state = make_test_state(2);
@@ -1593,4 +1709,108 @@ fn test_writer_rows_written_counter() {
     assert_eq!(writer.rows_written(), 2);
 
     writer.finish().unwrap();
+}
+
+/// ⭐ ARTIFACT-LEVEL LOCK ON `lob_snapshots.triggering_action` — the SECOND column the T/F
+/// split moves, and the one that actually feeds the analyzer's silently-changing statistics.
+///
+/// `test_mbo_action_column_separates_trade_and_fill_bytes` locks `mbo_events.action`. It does
+/// NOT lock this column, and this is the column with the larger blast radius:
+///
+/// * `MBO-LOB-analyzer`'s `_spread_engine.py` (`trade_mask_full = actions == ACTION_TRADE`) and
+///   `depth.py` (`np.where(actions == ACTION_TRADE)`) both read `triggering_action` and have NO
+///   `order_id` guard available — that table carries no `order_id` column. Measured on real
+///   exports of 2025-07-01, byte 84 in this column moves **683,227 → 375,643 (−45.02%)**, and on
+///   2025-07-02 **567,924 → 319,229 (−43.79%)**. Nothing errors.
+/// * The analyzer's `mbo_events`-based sites are unaffected because they are order_id-guarded
+///   (`_flow_engine.py`, `liquidity.py` use `& (mbo_order_id == 0)`), so three numbers stay fixed
+///   while these two move by 45% in the same run. That asymmetry is exactly what makes a
+///   regression here hard to spot by eye.
+///
+/// Prior coverage of this column was tautological or partial: the assertion in
+/// `test_lob_writer_all_columns` checks `ta_arr.value(0) == Action::Add.to_byte()` — comparing the
+/// written byte against the very function that wrote it, and only for `Add`.
+///
+/// Like its `mbo_events` sibling this test starts at the RAW VENDOR BYTE and asserts LITERAL
+/// integers. Constructing `Action::Fill` directly would be green on the defective decoder (the
+/// variant already encoded as 70); the defect was in `DbnBridge::convert_action`, so the decoder
+/// must be in the path for this to be a falsifier.
+#[cfg(feature = "databento")]
+#[test]
+fn test_lob_triggering_action_column_separates_trade_and_fill_bytes() {
+    use mbo_lob_reconstructor::DbnBridge;
+
+    let tmp = TempDir::new("lob_tf_split");
+    let path = tmp.file("lob.parquet");
+    let config = small_config(2, false);
+
+    // 3 aggressor-side trade prints, 2 resting-order fills — same shape as the mbo sibling.
+    let vendor_bytes = [b'T', b'F', b'T', b'F', b'T'];
+
+    let make_dbn = |action: u8, order_id: u64| dbn::MboMsg {
+        hd: dbn::RecordHeader::new::<dbn::MboMsg>(0, 0, 0, 1_000_000_000_000_000_000),
+        order_id,
+        price: 100_000_000_000,
+        size: 100,
+        flags: dbn::FlagSet::empty(),
+        channel_id: 0,
+        action: action as i8,
+        side: b'B' as i8,
+        ts_recv: 1_000_000_000_000_000_000,
+        ts_in_delta: 0,
+        sequence: 0,
+    };
+
+    let mut writer = LobSnapshotWriter::new(&path, &config, HashMap::new()).unwrap();
+    for (i, action) in vendor_bytes.iter().enumerate() {
+        let order_id = if *action == b'T' { 0 } else { 1000 + i as u64 };
+        let msg = DbnBridge::convert(&make_dbn(*action, order_id))
+            .expect("vendor record must decode cleanly");
+        let mut state = make_test_state(2);
+        // This is the field the reconstructor stamps from `msg.action`.
+        state.triggering_action = Some(msg.action);
+        writer.write_snapshot(&state).unwrap();
+    }
+    writer.finish().unwrap();
+
+    let file = fs::File::open(&path).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut n_84 = 0usize; // ASCII 'T' — analyzer ACTION_TRADE
+    let mut n_70 = 0usize; // ASCII 'F' — analyzer ACTION_FILL
+    let mut n_rows = 0usize;
+    let mut other: Vec<u8> = Vec::new();
+    for batch in reader.into_iter().map(|b| b.unwrap()) {
+        let col = batch.column_by_name("triggering_action").unwrap();
+        let arr = col.as_any().downcast_ref::<UInt8Array>().unwrap();
+        for i in 0..batch.num_rows() {
+            n_rows += 1;
+            assert!(!arr.is_null(i), "triggering_action must not be null here");
+            match arr.value(i) {
+                84 => n_84 += 1,
+                70 => n_70 += 1,
+                b => other.push(b),
+            }
+        }
+    }
+
+    assert_eq!(n_rows, 5, "row count changed");
+    assert!(
+        other.is_empty(),
+        "unexpected triggering_action bytes in the column: {other:?}"
+    );
+    assert_eq!(
+        n_84, 3,
+        "expected 3 rows at byte 84 (ASCII 'T', the aggressor-side trade print)"
+    );
+    assert_eq!(
+        n_70, 2,
+        "expected 2 rows at byte 70 (ASCII 'F', the resting-order fill). A zero here means the \
+         two carriers have been re-merged onto one byte in the LOB-snapshot artifact — the exact \
+         state in which `MBO-LOB-analyzer`'s spread and depth statistics silently over-count \
+         trades by ~1.82x."
+    );
 }

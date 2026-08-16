@@ -46,7 +46,7 @@ Converts Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshot
 | Queue Position Tracking | FIFO position, volume ahead (composable module) |
 | Order Lifecycle Tracking | Add→Modify→Cancel/Fill lifecycle (composable module) |
 | Day Boundary Detection | Trading day boundaries for train/test splits |
-| Trade Aggregation | Fill-only helper with aggressor-side inversion. It is not safe on current `DbnLoader` output: the v0.3.0 bridge merges wire `T` (aggressor side) and `F` (resting side), while `TradeAggregator` reverses side for both. Use only with independently supplied, resting-side Fill semantics. |
+| Trade Aggregation | Fill-only helper with aggressor-side inversion. Still not safe on current `DbnLoader` output — the bridge no longer merges the carriers (L-DECODE), but `TradeAggregator` still reverses side for both, and a `TradeAggregate`'s side is already the aggressor's, so reversing INVERTS it. Use only with independently supplied, resting-side Fill semantics. Resolved at L-ROUTE. |
 | DBN Support | Native Databento file loading (feature-gated) |
 
 ### Directory Structure
@@ -192,9 +192,16 @@ pub enum Action {
 }
 ```
 
-`Action::from_byte()` distinguishes `T` and `F`. The current DBN bridge does
-not: `b'T' | b'F' => Action::Trade` remains live in v0.3.0. Do not copy that
-current limitation into a statement of vendor semantics.
+`Action::from_byte()` distinguishes `T` and `F`, and **as of the L-DECODE commit the DBN bridge
+does too**: `DbnBridge::convert_action` now delegates to `Action::from_byte`, so `b'T'` decodes to
+`Action::TradeAggregate` and `b'F'` to `Action::Fill`. The former `b'T' | b'F' => Action::Trade`
+merge is GONE from the decoder.
+
+⚠️ **The decode is split; the ROUTING is not.** `LobReconstructor::process_message` still routes
+`Action::TradeAggregate | Action::Fill` to one handler, and `TradeAggregator` still reverses side
+for both — both knowingly temporary, both marked in-source, both resolved at L-ROUTE. So "the
+carriers are distinct on the wire and in the artifact" is now true; "the book treats them
+differently" is not yet.
 
 ### Side Enum
 
@@ -235,7 +242,11 @@ pub struct LobState {
 - `delta_seconds()` - Time delta in seconds
 - `event_intensity()` - Events per second (1/Δt)
 - `was_triggered_by(action)` - Check triggering action
-- `is_trade_event()`, `is_add_event()`, `is_cancel_event()` - Event type checks
+- `is_aggregate_trade_event()` (byte `T`, aggressor side), `is_resting_fill_event()` (byte `F`,
+  resting side), `is_add_event()`, `is_cancel_event()` - Event type checks.
+  ⚠️ `is_trade_event()` was DELETED at L-DECODE: it returned `true` for BOTH carriers and so
+  counted every physical execution twice, under two opposite side conventions. There is
+  deliberately no union predicate — a caller wanting both must say so and own the double-count.
 
 ### LobReconstructor Internal State (src/lob/reconstructor.rs)
 
@@ -920,7 +931,7 @@ assert!(stats.is_clean_eof(), "torn DBN: mid_record_eof={}", stats.mid_record_eo
 |----------------------|---------------------------|
 | `LobState` with temporal fields | LOB features (prices, sizes, spread) |
 | `delta_ns`, `triggering_action` | Time-sensitive features (FI-2010 u6-u9) |
-| `is_trade_event()`, `is_add_event()` | Event type classification |
+| `is_aggregate_trade_event()`, `is_resting_fill_event()`, `is_add_event()` | Event type classification (⚠️ `is_trade_event()` DELETED at L-DECODE — it double-counted executions) |
 | `microprice()`, `depth_imbalance()` | Derived microstructure features |
 
 ---
@@ -966,7 +977,16 @@ assert!(stats.is_clean_eof(), "torn DBN: mid_record_eof={}", stats.mid_record_eo
 > **These five counters are therefore the free acceptance test for the pending decoder fix: they must
 > read EXACTLY 0 afterwards, not "≈0" or "reduced".** (Corollary: the 2026-04 backbone audit §3.5
 > attributed a residual BBO mismatch to `cancel_order_not_found` "upstream data quality" — that
-> attribution is falsified, since the counter is itself 100% this bug.)
+> attribution is falsified, since the counter is itself 100% this bug.)>
+> ⚠️ **SCOPE ADDED AT L-DECODE — THESE COUNTERS ARE STILL NON-ZERO, AND THAT IS CORRECT.** The
+> L-DECODE commit split the DECODER only (`b'T'` → `Action::TradeAggregate`, `b'F'` →
+> `Action::Fill`); it deliberately did NOT change routing, so `LobReconstructor` still sends both
+> carriers to `process_trade` and `F` still mutates the book. Measured on 2025-07-01, baseline vs
+> the L-DECODE candidate: **all 18 reconstruction-stats fields identical**, `cancel_order_not_found`
+> **261,386 in both arms**. The "EXACTLY 0" threshold is the acceptance test for **L-ROUTE**, not
+> for L-DECODE. Do not read a non-zero counter here as evidence that the decode split failed — its
+> acceptance signal is the `action`-column histogram (byte 84 splitting into {84, 70}), which passes.
+
 
 > **FINDING-122 interpretation boundary.** The raw-tape consequence and the
 > current feature-path consequence are different. On raw NVDA/XNAS MBO, merging
@@ -1124,13 +1144,23 @@ println!("Boundaries detected so far: {}", detector.boundaries_detected());
 ### TradeAggregator
 
 Aggregates resting-side Fill events into trades by reversing the supplied side to
-derive aggressor side. This helper is currently unused by the pipeline and is
-**unsafe on direct `DbnLoader` / `DbnBridge` output**: v0.3.0 maps both wire `T`
-(whose side is already aggressor side) and wire `F` (resting side) to
-`Action::Trade`, while `TradeAggregator::process_message()` reverses side for
-every `Action::Trade | Action::Fill`. The example below is valid only when the
-caller has independently selected true Fill rows and preserved resting-side
-semantics; it must not be connected to the current bridge stream.
+derive aggressor side. This helper is currently unused by the pipeline and remains
+**unsafe on direct `DbnLoader` / `DbnBridge` output**.
+
+⚠️ **The reason CHANGED at L-DECODE, and it is now sharper, not weaker.** Previously the bridge
+merged both wire bytes onto one variant, so the aggregator could not tell them apart. Now it can —
+`b'T'` decodes to `Action::TradeAggregate` and `b'F'` to `Action::Fill` — but
+`TradeAggregator::process_message()` still reverses side for **both**, which is provably wrong for
+`TradeAggregate`: that record's side is ALREADY the aggressor's, so reversing it INVERTS the
+aggressor flag. The merge that used to hide the bug now merely feeds it correctly-labelled input
+it still mishandles. That call site is marked knowingly-temporary in
+`src/lob/trade_aggregator.rs` and is resolved at L-ROUTE.
+
+⚠️ Do not confuse `Action::TradeAggregate` with this module's `Trade`: `TradeAggregate` is ONE
+vendor print per physical execution; `Trade` is an aggregate built from MANY `Fill`s.
+
+The example below is valid only when the caller has independently selected true Fill rows and
+preserved resting-side semantics; it must not be connected to the current bridge stream.
 
 ```rust
 use mbo_lob_reconstructor::{TradeAggregator, TradeAggregatorConfig};
@@ -1200,7 +1230,9 @@ for msg in messages {
     lifecycle_tracker.process_message(&msg);
     day_detector.record_message(
         msg.timestamp,
-        matches!(msg.action, Action::Trade | Action::Fill),
+        // NB: counts BOTH carriers, i.e. every physical execution TWICE. Prefer
+        // `msg.action == Action::TradeAggregate` for a one-row-per-execution count.
+        matches!(msg.action, Action::TradeAggregate | Action::Fill),
         msg.size,
     );
     
@@ -1295,7 +1327,8 @@ The `export` module provides feature-gated Parquet output for reconstructed LOB
 snapshots and converted MBO projections. Snapshot rows are accepted, valid
 states and may be downsampled or rejected by ordering checks. MBO rows are not
 downsampled after successful bridge conversion, but are a lossy six-field
-projection: the bridge uses `hd.ts_event`, merges wire `T` and `F`, and omits
+projection: the bridge uses `hd.ts_event`, decodes wire `T` and `F` to distinct variants
+(post-L-DECODE; it formerly merged them), and omits
 publisher/instrument identity, `ts_recv`, flags, channel ID, and
 `ts_in_delta`. Neither file is vendor-raw DBN or an automatically unbiased
 analysis population; the applicable filters and denominators must be stated.

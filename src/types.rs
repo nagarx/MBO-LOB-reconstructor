@@ -30,8 +30,27 @@ use serde::{Deserialize, Serialize};
 pub const MAX_LOB_LEVELS: usize = 20;
 
 /// MBO action type (what happened to the order)
+///
+/// # ⚠ THE DISCRIMINANTS ARE A LIVE WIRE FORMAT — `#[repr(u8)]` IS LOAD-BEARING
+///
+/// [`Action::to_byte`] is literally `self as u8`, and that byte is written into the Parquet
+/// `action` and `triggering_action` columns (`export/batch.rs`). Downstream consumers key on the
+/// **literal ASCII values** (e.g. `MBO-LOB-analyzer`'s `ACTION_TRADE = 84`, `ACTION_FILL = 70`).
+///
+/// **The silent failure is dropping an explicit `= b'X'` discriminant** — that variant then takes
+/// `previous + 1`, so the encoder writes `0..6` into the corpus and **every downstream mask
+/// silently matches nothing, with no error raised anywhere.** Measured: removing all seven
+/// discriminants makes `TradeAggregate` emit `3` and `Fill` emit `4`, and the export still exits
+/// 0 with a structurally valid Parquet file.
+///
+/// **Dropping `#[repr(u8)]` is NOT the silent mode — it is a compile error.** The `= b'X'` syntax
+/// requires a compatible `repr`; without it rustc rejects every variant with
+/// `error[E0308]: mismatched types ... expected 'isize', found 'u8'`. Keep the attribute (the
+/// discriminants cannot compile without it), but understand that the thing actually worth
+/// guarding is the **discriminants**. `test_action_discriminants_are_ascii_wire_format` pins all
+/// seven as literal integers, which is what makes the real failure mode loud.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[repr(u8)] // Explicit representation for efficiency
+#[repr(u8)] // ⚠ LOAD-BEARING WIRE FORMAT — DO NOT DROP. See the type docs above.
 pub enum Action {
     /// Add new order to book
     Add = b'A',
@@ -39,9 +58,24 @@ pub enum Action {
     Modify = b'M',
     /// Cancel/remove order
     Cancel = b'C',
-    /// Trade execution (full or partial fill)
-    Trade = b'T',
-    /// Fill (alternative trade representation)
+    /// The vendor's aggressing-order **TRADE PRINT**. `side` is the **AGGRESSOR's** side.
+    /// Carries `order_id == 0` on XNAS.ITCH. **DOES NOT AFFECT THE BOOK.**
+    ///
+    /// ⚠ Not interchangeable with [`Action::Fill`]: the two carry **opposite** side conventions
+    /// and are exact side-mirrors of one another, so merging them annihilates signed order flow.
+    ///
+    /// ⚠ **NOT** related to [`crate::TradeAggregator`] or its [`crate::Trade`], which live one
+    /// `pub use` away in `lob::trade_aggregator`. That type builds one `Trade` by *aggregating
+    /// many* [`crate::Fill`]s; this variant is **one vendor print per physical execution**.
+    /// "TradeAggregate" here means *the vendor's aggregate trade print*, not *an aggregate of
+    /// trades*.
+    TradeAggregate = b'T',
+    /// A fill against an **EXISTING RESTING** order. `side` is the **RESTING order's** side —
+    /// the OPPOSITE convention from [`Action::TradeAggregate`]. Carries `order_id != 0`.
+    /// **DOES NOT AFFECT THE BOOK** — a paired `Cancel` performs the removal.
+    ///
+    /// ⚠ This is NOT "an alternative trade representation". `TradeAggregate` and `Fill` are two
+    /// views of the same physical execution from opposite sides; counting both double-counts.
     Fill = b'F',
     /// Clear/Reset the book
     Clear = b'R',
@@ -51,12 +85,17 @@ pub enum Action {
 
 impl Action {
     /// Parse action from a byte (Databento format).
+    ///
+    /// This is the **canonical** vendor-byte → `Action` map for this crate.
+    /// `DbnBridge::convert_action` delegates here rather than keeping a second copy: two maps
+    /// meant the same byte-semantics question could be answered correctly in one and wrongly in
+    /// the other, which is exactly how `b'F'` came to decode as a trade.
     pub fn from_byte(byte: u8) -> Option<Self> {
         match byte {
             b'A' => Some(Action::Add),
             b'M' => Some(Action::Modify),
             b'C' => Some(Action::Cancel),
-            b'T' => Some(Action::Trade),
+            b'T' => Some(Action::TradeAggregate),
             b'F' => Some(Action::Fill),
             b'R' => Some(Action::Clear),
             b'N' => Some(Action::None),
@@ -65,6 +104,8 @@ impl Action {
     }
 
     /// Convert to byte representation.
+    ///
+    /// ⚠ This is the wire-format encoder — see the type-level warning on [`Action`].
     pub fn to_byte(self) -> u8 {
         self as u8
     }
@@ -420,6 +461,13 @@ impl LobState {
     }
 
     /// Check if this state was triggered by a specific action.
+    ///
+    /// ⚠ [`Action::TradeAggregate`] and [`Action::Fill`] are **DISJOINT** populations over
+    /// `triggering_action` — they are the aggressor-side and resting-side views of the same
+    /// physical execution. A caller wanting "any execution" must therefore test **both**, and in
+    /// doing so will **DOUBLE-COUNT every physical execution**. Prefer
+    /// [`Self::is_aggregate_trade_event`] (one row per execution, aggressor side) unless the
+    /// resting side is specifically wanted.
     #[inline]
     pub fn was_triggered_by(&self, action: Action) -> bool {
         self.triggering_action == Some(action)
@@ -437,13 +485,29 @@ impl LobState {
         self.triggering_side == Some(Side::Ask)
     }
 
-    /// Check if this is a trade/fill event.
+    /// Check if this is an **aggregate trade print** event (`T`) — the aggressor-side view.
+    ///
+    /// One row per physical execution, `triggering_side` = the **AGGRESSOR's** side.
+    /// This is the predicate to use for trade counts, trade-conditional statistics and signed
+    /// order flow.
+    ///
+    /// ⚠ Replaces the former `is_trade_event()`, which returned `true` for **both**
+    /// [`Action::TradeAggregate`] and [`Action::Fill`] and therefore counted every physical
+    /// execution twice, under two opposite side conventions. There is deliberately **no union
+    /// predicate**: a caller that wants both must say so explicitly and own the double-count.
     #[inline]
-    pub fn is_trade_event(&self) -> bool {
-        matches!(
-            self.triggering_action,
-            Some(Action::Trade) | Some(Action::Fill)
-        )
+    pub fn is_aggregate_trade_event(&self) -> bool {
+        self.triggering_action == Some(Action::TradeAggregate)
+    }
+
+    /// Check if this is a **resting-order fill** event (`F`) — the resting-side view.
+    ///
+    /// `triggering_side` = the **RESTING order's** side, i.e. the OPPOSITE convention from
+    /// [`Self::is_aggregate_trade_event`]. Use this for order-lifecycle / queue-depletion work,
+    /// where the resting order is the subject.
+    #[inline]
+    pub fn is_resting_fill_event(&self) -> bool {
+        self.triggering_action == Some(Action::Fill)
     }
 
     /// Check if this is an add event (new liquidity).
@@ -768,7 +832,7 @@ mod tests {
         assert_eq!(Action::from_byte(b'A'), Some(Action::Add));
         assert_eq!(Action::from_byte(b'M'), Some(Action::Modify));
         assert_eq!(Action::from_byte(b'C'), Some(Action::Cancel));
-        assert_eq!(Action::from_byte(b'T'), Some(Action::Trade));
+        assert_eq!(Action::from_byte(b'T'), Some(Action::TradeAggregate));
         assert_eq!(Action::from_byte(b'F'), Some(Action::Fill));
         assert_eq!(Action::from_byte(b'R'), Some(Action::Clear));
         assert_eq!(Action::from_byte(b'N'), Some(Action::None));
@@ -780,10 +844,78 @@ mod tests {
         assert_eq!(Action::Add.to_byte(), b'A');
         assert_eq!(Action::Modify.to_byte(), b'M');
         assert_eq!(Action::Cancel.to_byte(), b'C');
-        assert_eq!(Action::Trade.to_byte(), b'T');
+        assert_eq!(Action::TradeAggregate.to_byte(), b'T');
         assert_eq!(Action::Fill.to_byte(), b'F');
         assert_eq!(Action::Clear.to_byte(), b'R');
         assert_eq!(Action::None.to_byte(), b'N');
+    }
+
+    /// ⚠ THE WIRE-FORMAT LOCK. Do not weaken, do not delete.
+    ///
+    /// `Action::to_byte()` is `self as u8`, and that byte is written verbatim into the Parquet
+    /// `action` / `triggering_action` columns of the shipped corpus. Downstream consumers key on
+    /// the **decimal** values (`MBO-LOB-analyzer`: `ACTION_TRADE = 84`, `ACTION_FILL = 70`).
+    ///
+    /// If `#[repr(u8)]` is dropped, or an explicit `= b'X'` discriminant is lost during a rename,
+    /// the enum silently emits `0..6` instead. Nothing errors — the analyzer's masks just match
+    /// nothing, and a `if count > 0` guard makes the absent key indistinguishable from a zero
+    /// count. This test asserts the **literal integers**, not `b'X'` spellings, precisely so a
+    /// discriminant loss cannot hide behind a self-consistent rename.
+    ///
+    /// (`tests/export_test.rs::test_mbo_all_action_variants` CANNOT serve this purpose: it
+    /// asserts `written == action.to_byte()`, i.e. the value against the function that wrote it.)
+    #[test]
+    fn test_action_discriminants_are_ascii_wire_format() {
+        // The two carriers this crate's T/F split exists to keep apart.
+        assert_eq!(
+            Action::TradeAggregate.to_byte(),
+            84u8,
+            "Action::TradeAggregate MUST encode as decimal 84 (ASCII 'T') — the analyzer's \
+             ACTION_TRADE. A different value silently voids every trade mask on 94 GB of Parquet."
+        );
+        assert_eq!(
+            Action::Fill.to_byte(),
+            70u8,
+            "Action::Fill MUST encode as decimal 70 (ASCII 'F') — the analyzer's ACTION_FILL. \
+             This byte has never appeared on disk; the T/F split is what activates it."
+        );
+
+        // The full alphabet, so a partial rename cannot pass by touching only T/F.
+        assert_eq!(Action::Add.to_byte(), 65u8); // 'A'
+        assert_eq!(Action::Modify.to_byte(), 77u8); // 'M'
+        assert_eq!(Action::Cancel.to_byte(), 67u8); // 'C'
+        assert_eq!(Action::Clear.to_byte(), 82u8); // 'R'
+        assert_eq!(Action::None.to_byte(), 78u8); // 'N'
+
+        // Round-trip through the canonical decoder: byte -> Action -> byte is the identity.
+        for byte in [65u8, 77, 67, 84, 70, 82, 78] {
+            let action = Action::from_byte(byte)
+                .unwrap_or_else(|| panic!("canonical decoder rejected wire byte {byte}"));
+            assert_eq!(
+                action.to_byte(),
+                byte,
+                "decode/encode round-trip broken for wire byte {byte}"
+            );
+        }
+
+        // The discriminants must be pairwise distinct (a collision would alias two populations).
+        let all = [
+            Action::Add,
+            Action::Modify,
+            Action::Cancel,
+            Action::TradeAggregate,
+            Action::Fill,
+            Action::Clear,
+            Action::None,
+        ];
+        let mut bytes: Vec<u8> = all.iter().map(|a| a.to_byte()).collect();
+        bytes.sort_unstable();
+        bytes.dedup();
+        assert_eq!(
+            bytes.len(),
+            all.len(),
+            "Action discriminants are not distinct"
+        );
     }
 
     #[test]
@@ -1267,18 +1399,18 @@ mod tests {
 
         // No action set
         assert!(!state.was_triggered_by(Action::Add));
-        assert!(!state.was_triggered_by(Action::Trade));
+        assert!(!state.was_triggered_by(Action::TradeAggregate));
 
         // Set to Add
         state.triggering_action = Some(Action::Add);
         assert!(state.was_triggered_by(Action::Add));
-        assert!(!state.was_triggered_by(Action::Trade));
+        assert!(!state.was_triggered_by(Action::TradeAggregate));
         assert!(!state.was_triggered_by(Action::Cancel));
 
         // Set to Trade
-        state.triggering_action = Some(Action::Trade);
+        state.triggering_action = Some(Action::TradeAggregate);
         assert!(!state.was_triggered_by(Action::Add));
-        assert!(state.was_triggered_by(Action::Trade));
+        assert!(state.was_triggered_by(Action::TradeAggregate));
     }
 
     #[test]
@@ -1305,31 +1437,44 @@ mod tests {
         let mut state = LobState::new(10);
 
         // No action
-        assert!(!state.is_trade_event());
+        assert!(!state.is_aggregate_trade_event());
+        assert!(!state.is_resting_fill_event());
         assert!(!state.is_add_event());
         assert!(!state.is_cancel_event());
 
-        // Trade event
-        state.triggering_action = Some(Action::Trade);
-        assert!(state.is_trade_event());
+        // Aggregate trade print (`T`) — aggressor-side view.
+        state.triggering_action = Some(Action::TradeAggregate);
+        assert!(state.is_aggregate_trade_event());
+        assert!(
+            !state.is_resting_fill_event(),
+            "TradeAggregate must NOT satisfy the resting-fill predicate: the two are DISJOINT \
+             views of one physical execution. A union predicate here re-merges the carriers."
+        );
         assert!(!state.is_add_event());
         assert!(!state.is_cancel_event());
 
-        // Fill event (also a trade)
+        // Resting-order fill (`F`) — resting-side view, the OPPOSITE side convention.
         state.triggering_action = Some(Action::Fill);
-        assert!(state.is_trade_event());
+        assert!(state.is_resting_fill_event());
+        assert!(
+            !state.is_aggregate_trade_event(),
+            "Fill must NOT satisfy the aggregate-trade predicate. This assertion is the lock on \
+             the T/F split: it fails the moment either predicate is widened back to a union."
+        );
         assert!(!state.is_add_event());
         assert!(!state.is_cancel_event());
 
         // Add event
         state.triggering_action = Some(Action::Add);
-        assert!(!state.is_trade_event());
+        assert!(!state.is_aggregate_trade_event());
+        assert!(!state.is_resting_fill_event());
         assert!(state.is_add_event());
         assert!(!state.is_cancel_event());
 
         // Cancel event
         state.triggering_action = Some(Action::Cancel);
-        assert!(!state.is_trade_event());
+        assert!(!state.is_aggregate_trade_event());
+        assert!(!state.is_resting_fill_event());
         assert!(!state.is_add_event());
         assert!(state.is_cancel_event());
     }
@@ -1355,12 +1500,12 @@ mod tests {
         state.previous_timestamp = Some(1_000_000_000);
         state.timestamp = Some(1_001_000_000); // 1ms later
         state.delta_ns = 1_000_000; // 1ms
-        state.triggering_action = Some(Action::Trade);
+        state.triggering_action = Some(Action::TradeAggregate);
         state.triggering_side = Some(Side::Ask);
 
         assert!((state.delta_seconds().unwrap() - 0.001).abs() < 1e-9);
         assert!((state.event_intensity().unwrap() - 1000.0).abs() < 1e-6);
-        assert!(state.is_trade_event());
+        assert!(state.is_aggregate_trade_event());
         assert!(state.was_triggered_on_ask());
     }
 

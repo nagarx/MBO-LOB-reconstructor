@@ -29,7 +29,16 @@ This document catalogs known warnings, issues, and edge cases that may occur dur
 > **These counters are the free acceptance test for the pending decoder fix (DECISION-033 / Phase 1):
 > post-fix they must read EXACTLY 0 — not "≈0", not "reduced".** Until then, treat any non-zero
 > value as an open defect, not as expected feed behaviour. The "Common Causes" list below is
-> retained as the *pre-correction* hypothesis and is NOT supported by the measurement.
+> retained as the *pre-correction* hypothesis and is NOT supported by the measurement.>
+> ⚠️ **SCOPE ADDED AT L-DECODE — THESE COUNTERS ARE STILL NON-ZERO, AND THAT IS CORRECT.** The
+> L-DECODE commit split the DECODER only (`b'T'` → `Action::TradeAggregate`, `b'F'` →
+> `Action::Fill`); it deliberately did NOT change routing, so `LobReconstructor` still sends both
+> carriers to `process_trade` and `F` still mutates the book. Measured on 2025-07-01, baseline vs
+> the L-DECODE candidate: **all 18 reconstruction-stats fields identical**, `cancel_order_not_found`
+> **261,386 in both arms**. The "EXACTLY 0" threshold is the acceptance test for **L-ROUTE**, not
+> for L-DECODE. Do not read a non-zero counter here as evidence that the decode split failed — its
+> acceptance signal is the `action`-column histogram (byte 84 splitting into {84, 70}), which passes.
+
 
 > **FINDING-122 scope boundary (validated 2026-08-01).** The decoder merge has
 > two different observed consequences. A direct raw-tape consumer sees total

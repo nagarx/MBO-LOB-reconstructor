@@ -109,10 +109,11 @@ record. Their filters also differ; see the source-verified API table below.
   DBN's primary timestamp.
 - Wire `T` means Trade with aggressor `side`; wire `F` means Fill with resting
   `side`; both are documented as having no book effect. Wire `R` means clear
-  the instrument book. Current `DbnBridge` still merges `T|F` into
-  `Action::Trade`, and current `LobReconstructor` mutates the book for
-  `Action::Trade | Action::Fill`. Those are current implementation facts and
-  known limitations, not Databento semantics.
+  the instrument book. `DbnBridge` NO LONGER merges `T|F` — as of L-DECODE it decodes them to
+  the distinct `Action::TradeAggregate` / `Action::Fill`. ⚠️ `LobReconstructor` still mutates the
+  book for `Action::TradeAggregate | Action::Fill` (knowingly temporary, marked in-source,
+  resolved at L-ROUTE). That routing is a current implementation fact and a known limitation, not
+  Databento semantics.
 - `MboMessage::is_system_message()` is an internal structural heuristic
   (`order_id == 0 || size == 0 || price <= 0`), not a DBN record taxonomy. On
   the measured NVDA/XNAS path, `order_id == 0` also identifies true Trade rows;
@@ -121,8 +122,9 @@ record. Their filters also differ; see the source-verified API table below.
   decoded value is instrument-native; USD/share terminology is valid only
   after the selected equity dataset and instrument context establish it.
 
-FINDING-122 bounds the downstream consequence: raw-tape signed direction is
-annihilated by the current T/F merge, while the current NVDA/XNAS feature path
+FINDING-122 bounds the downstream consequence (⚠️ stated against the PRE-L-DECODE decoder;
+the decode half is now fixed, the routing half is not): raw-tape signed direction was
+annihilated by the T/F merge, while the current NVDA/XNAS feature path
 filters true Trades and receives Fills, causing exact sign cancellation between
 two defects but losing coverage. This does not generalize to direct raw-tape
 consumers and becomes historical when producer behavior changes.
@@ -239,9 +241,12 @@ pub enum Action {
 }
 ```
 
-`Action::from_byte()` preserves `T` and `F` as distinct internal variants. The
-current DBN-specific bridge does not: it maps both bytes to `Action::Trade`.
-That bridge behavior is the known v0.3.0 limitation described above.
+`Action::from_byte()` preserves `T` and `F` as distinct internal variants
+(`Action::TradeAggregate` / `Action::Fill`), and **as of the L-DECODE commit the DBN-specific
+bridge does too** — `convert_action` delegates to `from_byte` rather than keeping a second map.
+The merge described above is no longer present at the decoder. It survives, knowingly and
+marked in-source, in `LobReconstructor`'s router and in `TradeAggregator`; both are resolved at
+L-ROUTE.
 
 ### Side (`src/types.rs`)
 
@@ -293,7 +298,10 @@ Analytics methods on `LobState`:
 - `depth_imbalance() -> Option<f64>` -- (bid_vol - ask_vol) / (bid_vol + ask_vol)
 - `check_consistency() -> BookConsistency`
 - `delta_seconds() -> Option<f64>`, `event_intensity() -> Option<f64>`
-- `was_triggered_by(Action) -> bool`, `was_triggered_on_bid() -> bool`, `is_trade_event() -> bool`
+- `was_triggered_by(Action) -> bool`, `was_triggered_on_bid() -> bool`,
+  `is_aggregate_trade_event() -> bool`, `is_resting_fill_event() -> bool`
+  (⚠️ the former `is_trade_event()` was DELETED at L-DECODE — it matched both carriers and
+  double-counted every physical execution)
 
 ### BookConsistency (`src/types.rs`)
 
@@ -594,7 +602,7 @@ filters are intentionally different:
 |--------|------------|-------------------------------|
 | `QueuePositionTracker` | `process_message(&mut self, &MboMessage) -> ()` | Rejects `msg.is_system_message()` and `Side::None` before action dispatch. |
 | `OrderLifecycleTracker` | `process_message(&mut self, &MboMessage) -> Option<LifecycleEvent>` | Rejects `msg.is_system_message()` and `Side::None` before action dispatch. |
-| `TradeAggregator` | `process_message(&mut self, &MboMessage) -> Option<Trade>` | Has no structural/system-shape filter. It accepts only internal `Action::Trade | Action::Fill`, skips `Side::None`, and reverses side unconditionally. It is valid only for independently supplied resting-side Fill input; it is unused and unsafe on current `DbnBridge` output because the bridge merges wire `T` and `F`. |
+| `TradeAggregator` | `process_message(&mut self, &MboMessage) -> Option<Trade>` | Has no structural/system-shape filter. It accepts only internal `Action::TradeAggregate | Action::Fill`, skips `Side::None`, and reverses side unconditionally. It is valid only for independently supplied resting-side Fill input; it is unused and remains unsafe on current `DbnBridge` output — no longer because the bridge merges the two bytes (L-DECODE split them), but because reversing side on a `TradeAggregate`, whose side is ALREADY the aggressor's, INVERTS the flag. Resolved at L-ROUTE. |
 | `DayBoundaryDetector` | `check_boundary(timestamp: i64) -> Option<DayBoundary>`, then `record_message(timestamp: Option<i64>, is_trade: bool, size: u32)` | Consumes a timestamp/statistics projection, not `MboMessage`; it therefore applies no message-shape filter itself. |
 
 ### System Message Filtering

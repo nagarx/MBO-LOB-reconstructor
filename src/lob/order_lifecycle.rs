@@ -563,7 +563,25 @@ impl OrderLifecycleTracker {
             Action::Add => self.handle_add(msg),
             Action::Modify => self.handle_modify(msg),
             Action::Cancel => self.handle_cancel(msg),
-            Action::Trade | Action::Fill => self.handle_fill(msg),
+            // ⚠⚠ KNOWINGLY TEMPORARY — MECHANICAL RENAME THAT PRESERVES THE MERGE. ⚠⚠
+            //
+            // Behaviour-identical to the previous `Action::Trade | Action::Fill`. This commit
+            // changes only the decoded action byte; the routing fix is sequenced separately.
+            //
+            // ⚠ THIS IS THE DANGEROUS ONE. A `TradeAggregate` carries `order_id == 0`, which never
+            // matches an active order, and `handle_fill` builds an INFERRED lifecycle on a miss
+            // whenever `infer_pre_existing` is set — which is the default at all three
+            // constructors. So every admitted `TradeAggregate` here would MANUFACTURE a phantom
+            // completed lifecycle. It is harmless today only because the `is_system_message()`
+            // guard at the top of this function drops 100% of them (all `T` carries
+            // `order_id == 0` on XNAS.ITCH). Deleting that guard without splitting this arm
+            // wakes the hazard.
+            //
+            // RESOLVED IN: the L-ROUTE commit, which splits this into
+            // `Action::Fill => self.handle_fill(msg)` (unchanged — `F` is the resting-order view,
+            // which is what a lifecycle is about) plus a dedicated `Action::TradeAggregate` arm
+            // returning `None` and incrementing `messages_skipped`. NO wildcard.
+            Action::TradeAggregate | Action::Fill => self.handle_fill(msg),
             Action::Clear | Action::None => {
                 // Clear and None actions don't affect individual order lifecycles
                 self.stats.messages_skipped += 1;

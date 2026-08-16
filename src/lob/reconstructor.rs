@@ -1214,7 +1214,39 @@ impl LobReconstructor {
             Action::Add => self.add_order(msg)?,
             Action::Modify => self.modify_order(msg)?,
             Action::Cancel => self.cancel_order(msg)?,
-            Action::Trade | Action::Fill => self.process_trade(msg)?,
+            // ⚠⚠ KNOWINGLY TEMPORARY — THIS ARM STILL MERGES THE TWO CARRIERS. ⚠⚠
+            //
+            // The L-DECODE layer has split `b'T'`/`b'F'` into `TradeAggregate`/`Fill`, so the
+            // EMITTED ACTION BYTE is now correct. This arm is a MECHANICAL RENAME of the old
+            // `Action::Trade | Action::Fill` and is deliberately behaviour-preserving: both
+            // carriers still reach `process_trade`, so the reconstructed book is byte-for-byte
+            // identical to the pre-split book and every reconstruction counter is unchanged.
+            //
+            // That is the design of this commit, not an oversight. Do NOT read the presence of
+            // `TradeAggregate` here as evidence the routing fix has landed.
+            //
+            // WHY THE MERGE IS HARMLESS TODAY — AND WHERE THAT STOPS. It is DORMANT, not benign:
+            // on XNAS.ITCH 100% of `TradeAggregate` carries `order_id == 0`, so
+            // `Pipeline::process_messages`'s `is_system_message()` filter drops the entire `T`
+            // population upstream and only ex-`F` ever reaches this arm. Measured 2025-07-01:
+            // `messages_processed` 8,939,187 = 9,314,830 − 375,643, and
+            // `system_messages_skipped` = 375,643 = the whole `T` population.
+            // ⚠ THAT DORMANCY IS VENUE-SPECIFIC. On ARCX 19.8% of `T` carries `order_id != 0`
+            // (88,024 records on 2025-02-03) and is filtered by the `side == Side::None` guard
+            // instead — a different mechanism with the same outcome today. This commit's
+            // acceptance evidence is XNAS.ITCH/NVDA only (2025-07-01, 2025-07-02); ARCX under
+            // COMMIT 1 is UNMEASURED. Waking either guard before L-ROUTE lands makes this arm
+            // live and the merge real.
+            //
+            // RESOLVED IN: the L-ROUTE commit, which replaces this with SEVEN exhaustive arms —
+            // `TradeAggregate` and `Fill` each a BOOK NO-OP incrementing only its own carrier
+            // counter — and deletes `process_trade` (which becomes callerless, and whose
+            // resulting `dead_code` red under `clippy -D warnings` IS the receipt that the split
+            // landed). Both vendor record types are documented book no-ops; the removal is
+            // performed by the paired `Cancel`.
+            //
+            // ⛔ A branch merged between this commit and that one ships the merge under a new name.
+            Action::TradeAggregate | Action::Fill => self.process_trade(msg)?,
             Action::Clear => {
                 self.stats.book_clears += 1;
                 if self.config.log_warnings {
@@ -1420,6 +1452,327 @@ mod tests {
         MboMessage::new(order_id, action, side, (price_dollars * 1e9) as i64, size)
     }
 
+    // ════════════════════════════════════════════════════════════════════════════
+    // NOTE ON THE EXECUTION FIXTURES BELOW: THEY USE `Action::Fill`, NOT
+    // `Action::TradeAggregate`. THAT IS DELIBERATE.
+    // ════════════════════════════════════════════════════════════════════════════
+    //
+    // Every fixture in this module that drives an execution through
+    // `process_trade` asserts that the execution REDUCES A RESTING ORDER LOOKED
+    // UP BY `order_id`. That is `Action::Fill`'s contract, and only `Fill`'s:
+    // `TradeAggregate` is the aggressor-side print, carries `order_id == 0` on
+    // XNAS.ITCH, and is a documented BOOK NO-OP that the L-ROUTE commit will stop
+    // routing here at all.
+    //
+    // Writing `TradeAggregate` in these fixtures would be the mechanical rename,
+    // it would compile, and it would go GREEN while asserting the exact
+    // proposition L-ROUTE exists to falsify — locking the bug in a test. It is
+    // also a record shape that does not occur on the tape (all 375,643 `T`
+    // records on 2025-07-01 carry `order_id == 0`).
+    //
+    // `Fill` is BIT-IDENTICAL here today: the router arm is
+    // `TradeAggregate | Fill => process_trade`, and `reduce_or_remove_order`
+    // reads `msg.action` ZERO times (it branches on an `OrderReductionOp`
+    // instead). So this choice changes no behaviour and no counter — it only
+    // stops the fixtures from asserting something false. Same reasoning, same
+    // conclusion as `queue_position.rs`'s `test_fill_unknown_order_stats`.
+
+    // ════════════════════════════════════════════════════════════════════════════
+    // MODIFY GOLDEN FIXTURE — THE ONLY DEFENCE THE `Modify` PATH HAS
+    // ════════════════════════════════════════════════════════════════════════════
+    //
+    // WHY THIS EXISTS. The venue round proved that the ENTIRE existing gate set is
+    // blind to order PLACEMENT on the `Modify` path. An injected defect that
+    // mis-placed 98.1% of ARCX `Modify` records left:
+    //
+    //   * every reconstruction counter BIT-IDENTICAL, and
+    //   * the END-OF-DAY book BIT-IDENTICAL (SHA 1cde281962548aa4 in both arms),
+    //
+    // diverging only INTRA-DAY, first at record 5,618. An end-of-day hash cannot
+    // see a placement defect because by the close every order involved has been
+    // cancelled or filled out of the book again — the wrong intermediate states
+    // cancel out. Counters cannot see it because the same number of messages is
+    // processed either way.
+    //
+    // THE BLINDNESS IS STRUCTURAL AND PERMANENT:
+    //   * ARCX carries 34,559,212 `M` records; XNAS carries ZERO in 2.87 BILLION,
+    //     so no XNAS-based gate can ever exercise this path.
+    //   * ARCX has NO MBP-10 oracle on the data volume (`*mbp*10*` → 21 XNAS +
+    //     20 GLBX + 0 ARCX), so the path can never be externally validated.
+    //   * Both bytes this commit's acceptance criterion can see are `T`/`F`;
+    //     measured on both pre-registered development days the `action` histogram
+    //     is {65, 67, 70, 82, 84} — byte 77 (`M`) NEVER OCCURS, so the pre-
+    //     registered histogram gate is structurally incapable of covering
+    //     `Modify` at all.
+    //
+    // WHY A TINY HAND-BUILT INPUT CATCHES WHAT 9.3M REAL RECORDS DO NOT. These
+    // assertions are on intra-day STATE — the full level vector, both sides, after
+    // each individual Modify — rather than on a counter or a terminal hash. A
+    // mis-placed order shows up immediately as a wrong price, a wrong side, or a
+    // wrong residual on the level it left. That is true BY CONSTRUCTION, which is
+    // the property the end-of-day comparison provably lacks.
+    //
+    // ⚠ THIS PINS CURRENT BEHAVIOUR; IT DOES NOT ENDORSE IT. In particular
+    // `modify_order` is an unconditional remove-then-add (`reconstructor.rs`:
+    // `remove_order_internal` then `add_order`), so the modified order is
+    // re-inserted at the BACK of its price level even for a pure size DECREASE —
+    // where a real venue (Nasdaq/ARCA) RETAINS time priority. If that is ever
+    // corrected, these tests should still pass (they assert aggregate level state,
+    // which is unchanged by priority) and the queue-priority tests in
+    // `queue_position.rs` are the ones that must move. Queue order is deliberately
+    // NOT asserted here: `PriceLevel` is an unordered `AHashMap`, so priority is
+    // not observable at this layer — `QueuePositionTracker` is where it lives.
+
+    /// Builds a small, fully-specified two-sided book for the Modify fixtures.
+    ///
+    /// ```text
+    ///   ASK  100.06 -> 600            (order 5)
+    ///   ASK  100.05 -> 400            (order 4)
+    ///   ---------------------------
+    ///   BID  100.00 -> 300            (order 1: 100, order 2: 200)
+    ///   BID   99.99 -> 500            (order 3)
+    /// ```
+    ///
+    /// Two orders share the 100.00 bid level ON PURPOSE: it is the only way to
+    /// observe that a Modify removed *its own* order from a level and left the
+    /// other one intact. With a single order per level the level simply vanishes,
+    /// and a defect that removed the wrong order is indistinguishable.
+    fn modify_fixture_book() -> LobReconstructor {
+        let mut lob = LobReconstructor::new(10);
+        for (id, side, px, sz) in [
+            (1u64, Side::Bid, 100.00, 100u32),
+            (2, Side::Bid, 100.00, 200),
+            (3, Side::Bid, 99.99, 500),
+            (4, Side::Ask, 100.05, 400),
+            (5, Side::Ask, 100.06, 600),
+        ] {
+            lob.process_message(&create_test_message(id, Action::Add, side, px, sz))
+                .unwrap();
+        }
+
+        // Precondition: the fixture is what the diagram says it is.
+        let s = lob.get_lob_state();
+        assert_eq!(lob.order_count(), 5, "fixture setup");
+        assert_eq!(&s.bid_prices[..2], &[100_000_000_000, 99_990_000_000]);
+        assert_eq!(&s.bid_sizes[..2], &[300, 500]);
+        assert_eq!(&s.ask_prices[..2], &[100_050_000_000, 100_060_000_000]);
+        assert_eq!(&s.ask_sizes[..2], &[400, 600]);
+        lob
+    }
+
+    /// Asserts the full active level vector on both sides, and that everything
+    /// past the active depth is zeroed. Zero-checking matters: a defect that
+    /// leaves a stale price in an inactive slot is invisible to any assertion
+    /// that only reads `[..n]`.
+    fn assert_book(lob: &LobReconstructor, bids: &[(i64, u32)], asks: &[(i64, u32)], ctx: &str) {
+        let s = lob.get_lob_state();
+        let got_b: Vec<(i64, u32)> = (0..bids.len())
+            .map(|i| (s.bid_prices[i], s.bid_sizes[i]))
+            .collect();
+        let got_a: Vec<(i64, u32)> = (0..asks.len())
+            .map(|i| (s.ask_prices[i], s.ask_sizes[i]))
+            .collect();
+        assert_eq!(got_b, bids, "{ctx}: bid ladder");
+        assert_eq!(got_a, asks, "{ctx}: ask ladder");
+        assert_eq!(lob.bid_levels(), bids.len(), "{ctx}: bid level count");
+        assert_eq!(lob.ask_levels(), asks.len(), "{ctx}: ask level count");
+        assert_eq!(
+            s.best_bid,
+            bids.first().map(|b| b.0),
+            "{ctx}: best_bid must track the ladder"
+        );
+        assert_eq!(
+            s.best_ask,
+            asks.first().map(|a| a.0),
+            "{ctx}: best_ask must track the ladder"
+        );
+        for i in bids.len()..crate::MAX_LOB_LEVELS {
+            assert_eq!(
+                (s.bid_prices[i], s.bid_sizes[i]),
+                (0, 0),
+                "{ctx}: bid[{i}] stale"
+            );
+        }
+        for i in asks.len()..crate::MAX_LOB_LEVELS {
+            assert_eq!(
+                (s.ask_prices[i], s.ask_sizes[i]),
+                (0, 0),
+                "{ctx}: ask[{i}] stale"
+            );
+        }
+    }
+
+    /// A price-changing `Modify` must move the order to the NEW price level and
+    /// leave the old level holding exactly the orders that did not move.
+    ///
+    /// This is the single most important assertion in the file: it is the one an
+    /// end-of-day hash provably cannot make.
+    #[test]
+    fn modify_golden_price_change_relocates_and_leaves_old_level_intact() {
+        let mut lob = modify_fixture_book();
+
+        // Order 1 (bid 100.00, 100) -> bid 100.01, same size.
+        lob.process_message(&create_test_message(
+            1,
+            Action::Modify,
+            Side::Bid,
+            100.01,
+            100,
+        ))
+        .unwrap();
+
+        assert_book(
+            &lob,
+            &[
+                (100_010_000_000, 100), // NEW level, order 1 alone
+                (100_000_000_000, 200), // order 2 REMAINS, order 1 gone
+                (99_990_000_000, 500),  // untouched
+            ],
+            &[(100_050_000_000, 400), (100_060_000_000, 600)], // asks untouched
+            "price-changing modify",
+        );
+        assert_eq!(lob.order_count(), 5, "a Modify must not change order count");
+        assert_eq!(lob.stats().modify_order_not_found, 0);
+    }
+
+    /// A size-DECREASE `Modify` at the same price changes only that level's total.
+    #[test]
+    fn modify_golden_size_decrease_same_price() {
+        let mut lob = modify_fixture_book();
+
+        // Order 2 (bid 100.00, 200) -> 50 at the same price. Level: 100 + 50.
+        lob.process_message(&create_test_message(
+            2,
+            Action::Modify,
+            Side::Bid,
+            100.00,
+            50,
+        ))
+        .unwrap();
+
+        assert_book(
+            &lob,
+            &[(100_000_000_000, 150), (99_990_000_000, 500)],
+            &[(100_050_000_000, 400), (100_060_000_000, 600)],
+            "size-decrease modify",
+        );
+        assert_eq!(lob.order_count(), 5);
+    }
+
+    /// A size-INCREASE `Modify` at the same price likewise changes only the total.
+    #[test]
+    fn modify_golden_size_increase_same_price() {
+        let mut lob = modify_fixture_book();
+
+        // Order 3 (bid 99.99, 500) -> 900, alone on its level.
+        lob.process_message(&create_test_message(
+            3,
+            Action::Modify,
+            Side::Bid,
+            99.99,
+            900,
+        ))
+        .unwrap();
+
+        assert_book(
+            &lob,
+            &[(100_000_000_000, 300), (99_990_000_000, 900)],
+            &[(100_050_000_000, 400), (100_060_000_000, 600)],
+            "size-increase modify",
+        );
+        assert_eq!(lob.order_count(), 5);
+    }
+
+    /// A `Modify` that flips SIDE must remove from the old side and insert on the
+    /// new one. This is the placement defect class in its purest form: a decoder
+    /// or router that ignores the new side leaves the order on the bid, and every
+    /// counter and every end-of-day hash still agrees.
+    #[test]
+    fn modify_golden_side_change_moves_across_the_book() {
+        let mut lob = modify_fixture_book();
+
+        // Order 1 (bid 100.00, 100) -> ask 100.07, 100.
+        lob.process_message(&create_test_message(
+            1,
+            Action::Modify,
+            Side::Ask,
+            100.07,
+            100,
+        ))
+        .unwrap();
+
+        assert_book(
+            &lob,
+            &[(100_000_000_000, 200), (99_990_000_000, 500)], // order 1 gone from the bid
+            &[
+                (100_050_000_000, 400),
+                (100_060_000_000, 600),
+                (100_070_000_000, 100), // arrives on the ask
+            ],
+            "side-changing modify",
+        );
+        assert_eq!(lob.order_count(), 5);
+    }
+
+    /// A `Modify` for an UNKNOWN order recovers as an `Add` at the MODIFY's own
+    /// price/side/size, and counts itself.
+    ///
+    /// `test_modify_order_not_found_increments_counter` already pins the COUNTER
+    /// and the order count. It does not pin WHERE the recovered order lands, which
+    /// is the half a placement defect would corrupt.
+    #[test]
+    fn modify_golden_unknown_order_recovers_as_add_at_the_modify_price() {
+        let mut lob = modify_fixture_book();
+
+        // Order 99 was never added.
+        lob.process_message(&create_test_message(
+            99,
+            Action::Modify,
+            Side::Bid,
+            100.02,
+            700,
+        ))
+        .unwrap();
+
+        assert_book(
+            &lob,
+            &[
+                (100_020_000_000, 700), // recovered order, new best bid
+                (100_000_000_000, 300),
+                (99_990_000_000, 500),
+            ],
+            &[(100_050_000_000, 400), (100_060_000_000, 600)],
+            "unknown-order modify",
+        );
+        assert_eq!(lob.order_count(), 6, "recovery ADDS an order");
+        assert_eq!(lob.stats().modify_order_not_found, 1);
+    }
+
+    /// A `Modify` that empties its old level must DROP that level, not leave a
+    /// zero-size ghost — and the ladder must close up behind it.
+    #[test]
+    fn modify_golden_vacating_a_level_drops_it() {
+        let mut lob = modify_fixture_book();
+
+        // Order 3 is alone at 99.99; move it up to join the 100.00 level.
+        lob.process_message(&create_test_message(
+            3,
+            Action::Modify,
+            Side::Bid,
+            100.00,
+            500,
+        ))
+        .unwrap();
+
+        assert_book(
+            &lob,
+            &[(100_000_000_000, 800)], // 100 + 200 + 500; 99.99 is GONE, not zero-sized
+            &[(100_050_000_000, 400), (100_060_000_000, 600)],
+            "level-vacating modify",
+        );
+        assert_eq!(lob.order_count(), 5);
+    }
+
     #[test]
     fn test_new_lob() {
         let lob = LobReconstructor::new(10);
@@ -1606,7 +1959,7 @@ mod tests {
         lob.process_message(&add).unwrap();
 
         // Partial fill (50 shares)
-        let trade = create_test_message(1, Action::Trade, Side::Bid, 100.0, 50);
+        let trade = create_test_message(1, Action::Fill, Side::Bid, 100.0, 50);
         let state = lob.process_message(&trade).unwrap();
 
         assert_eq!(lob.order_count(), 1); // Order still exists
@@ -1622,7 +1975,7 @@ mod tests {
         lob.process_message(&add).unwrap();
 
         // Full fill
-        let trade = create_test_message(1, Action::Trade, Side::Bid, 100.0, 100);
+        let trade = create_test_message(1, Action::Fill, Side::Bid, 100.0, 100);
         lob.process_message(&trade).unwrap();
 
         assert_eq!(lob.order_count(), 0); // Order removed
@@ -2071,7 +2424,7 @@ mod tests {
             .unwrap();
 
         // Partial fill of 25 shares
-        lob.process_message(&create_test_message(1, Action::Trade, Side::Ask, 100.0, 25))
+        lob.process_message(&create_test_message(1, Action::Fill, Side::Ask, 100.0, 25))
             .unwrap();
 
         // Order should have 75 shares remaining
@@ -2079,7 +2432,7 @@ mod tests {
         assert_eq!(lob.get_lob_state().ask_sizes[0], 75);
 
         // Partial fill of 50 more shares
-        lob.process_message(&create_test_message(1, Action::Trade, Side::Ask, 100.0, 50))
+        lob.process_message(&create_test_message(1, Action::Fill, Side::Ask, 100.0, 50))
             .unwrap();
 
         // Order should have 25 shares remaining
@@ -2098,14 +2451,8 @@ mod tests {
             .unwrap();
 
         // Trade more than exists (100 > 50) - should remove entirely
-        lob.process_message(&create_test_message(
-            1,
-            Action::Trade,
-            Side::Ask,
-            100.0,
-            100,
-        ))
-        .unwrap();
+        lob.process_message(&create_test_message(1, Action::Fill, Side::Ask, 100.0, 100))
+            .unwrap();
 
         assert_eq!(lob.order_count(), 0);
         assert_eq!(lob.ask_levels(), 0);
@@ -2424,7 +2771,7 @@ mod tests {
         // Trade for an order that doesn't exist - should not fail
         let result = lob.process_message(&create_test_message(
             999,
-            Action::Trade,
+            Action::Fill,
             Side::Bid,
             100.0,
             50,
@@ -2456,7 +2803,7 @@ mod tests {
             50,
         ))
         .unwrap();
-        lob.process_message(&create_test_message(3, Action::Trade, Side::Bid, 100.0, 50))
+        lob.process_message(&create_test_message(3, Action::Fill, Side::Bid, 100.0, 50))
             .unwrap();
 
         assert_eq!(lob.stats().cancel_order_not_found, 2);
@@ -2485,7 +2832,7 @@ mod tests {
             create_test_message(1, Action::Modify, Side::Bid, 100.0, 80),
             create_test_message(5, Action::Add, Side::Bid, 100.02, 300),
             create_test_message(2, Action::Cancel, Side::Ask, 100.05, 50),
-            create_test_message(6, Action::Trade, Side::Bid, 100.0, 30),
+            create_test_message(6, Action::Fill, Side::Bid, 100.0, 30),
         ];
 
         // Process with both APIs
@@ -2619,7 +2966,7 @@ mod tests {
         assert_eq!(lob.get_lob_state().bid_sizes[0], 470);
 
         // Trade on order 2: remove 50 (total: 420)
-        lob.process_message(&create_test_message(2, Action::Trade, Side::Bid, 100.0, 50))
+        lob.process_message(&create_test_message(2, Action::Fill, Side::Bid, 100.0, 50))
             .unwrap();
         assert_eq!(lob.get_lob_state().bid_sizes[0], 420);
 
@@ -2640,14 +2987,8 @@ mod tests {
         assert_eq!(lob.get_lob_state().bid_sizes[0], 520);
 
         // Full trade on order 4 (total: 420)
-        lob.process_message(&create_test_message(
-            4,
-            Action::Trade,
-            Side::Bid,
-            100.0,
-            100,
-        ))
-        .unwrap();
+        lob.process_message(&create_test_message(4, Action::Fill, Side::Bid, 100.0, 100))
+            .unwrap();
         assert_eq!(lob.get_lob_state().bid_sizes[0], 420);
 
         // Verify remaining orders: 1 (70), 2 (50), 5 (100), 6 (200) = 420
@@ -2718,7 +3059,7 @@ mod tests {
                 // Trade
                 messages.push(create_test_message(
                     target_order,
-                    Action::Trade,
+                    Action::Fill,
                     Side::Bid,
                     base_bid,
                     25,

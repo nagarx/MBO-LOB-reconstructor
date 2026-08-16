@@ -80,7 +80,7 @@ fn main() {
     // Event 4: Trade (partial fill) on bid1
     let trade = MboMessage::new(
         1001,
-        Action::Trade,
+        Action::TradeAggregate,
         Side::Bid,
         100_000_000_000,
         50, // Partial fill: 50 of 100

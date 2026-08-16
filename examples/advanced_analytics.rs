@@ -373,7 +373,7 @@ fn demo_day_stats() {
         (1001, Action::Add, Side::Bid, 100.00, 500),
         (2001, Action::Add, Side::Ask, 100.01, 400),
         // Trade
-        (1001, Action::Trade, Side::Bid, 100.00, 100),
+        (1001, Action::TradeAggregate, Side::Bid, 100.00, 100),
         // Add more depth
         (1002, Action::Add, Side::Bid, 99.99, 300),
         (2002, Action::Add, Side::Ask, 100.02, 600),

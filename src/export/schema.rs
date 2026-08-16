@@ -163,6 +163,17 @@ fn schema_metadata() -> HashMap<String, String> {
     m.insert("price_unit".into(), "nanodollars".into());
     m.insert("size_unit".into(), "shares".into());
     m.insert("timestamp_unit".into(), "nanoseconds_since_epoch".into());
+    // The `T`/`F` carrier split (L-DECODE). `"true"` means the `action` /
+    // `triggering_action` columns distinguish the vendor's aggressor-side trade
+    // print (`84`, `b'T'`) from the resting-order fill (`70`, `b'F'`); pre-split
+    // files emitted every execution as `84` and carry NO such key.
+    //
+    // ⚠ THIS KEY EXISTS TO BE READ. A consumer masking `action == 84` selects ~45%
+    // fewer rows against a split file than against a pre-split one, with no error
+    // raised. Branch on THIS — never on "does byte 70 appear in the data?", which is
+    // silent on any file that happens to contain zero fills, making absence
+    // indistinguishable from agreement (hft-rules §1).
+    m.insert("action_carrier_split".into(), "true".into());
     m
 }
 

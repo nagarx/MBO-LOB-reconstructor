@@ -38,7 +38,28 @@ use crate::types::MAX_LOB_LEVELS;
 
 /// Schema version embedded in every exported Parquet file.
 /// Bump on any breaking schema change.
-pub const SCHEMA_VERSION: &str = "1.0";
+///
+/// # 2.0 — the `T`/`F` carrier split (L-DECODE)
+///
+/// `1.0` → `2.0` is a **BREAKING** bump because the *admissible value set* of the `action` and
+/// `triggering_action` columns changed: byte `70` (`b'F'`, [`crate::Action::Fill`]) can now occur
+/// where previously every execution was emitted as byte `84` (`b'T'`). Measured on the two
+/// pre-registered development days, NVDA/XNAS:
+///
+/// | day | `84` before | `84` after | `70` after |
+/// |---|---|---|---|
+/// | 2025-07-01 | 683,227 | 375,643 | 307,584 |
+/// | 2025-07-02 | 567,924 | 319,230 | 248,694 |
+///
+/// A consumer masking `action == 84` therefore selects **45% fewer rows** against a `2.0` file
+/// than against a `1.0` file — with no error raised anywhere. That is why this is a version
+/// bump and not a silent additive change: without it a partially re-exported corpus is
+/// **unsortable by its own declared contract**, and the only discriminator left is the
+/// data-dependent heuristic "does byte 70 appear?", which is silent on any file that happens to
+/// contain zero fills. Every exported file additionally carries an `action_carrier_split`
+/// metadata key (see `schema::schema_metadata`) — the explicit, data-independent signal a
+/// consumer should branch on.
+pub const SCHEMA_VERSION: &str = "2.0";
 
 /// Default number of rows buffered before flushing to a Parquet row group.
 pub const DEFAULT_BATCH_SIZE: usize = 65_536;
