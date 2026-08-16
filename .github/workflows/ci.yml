@@ -2,9 +2,18 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    # Candidate/development branches are tested too. Without the `claude/**`,
+    # `codex/**` and `candidate/**` patterns a push to a long-lived candidate
+    # branch fired NOTHING, so work sat untested until it reached main --
+    # measured 2026-08-16 on `claude/backbone-v5-reconstructor`.
+    # NOTE: for `push`, GitHub reads the workflow FROM THE PUSHED REF, so this
+    # list only takes effect on branches that already carry this file.
+    branches: [main, master, 'claude/**', 'codex/**', 'candidate/**']
   pull_request:
+    # `pull_request.branches` filters the BASE branch, so a PR from any
+    # candidate branch into main already fires. Leave as-is.
     branches: [main, master]
+  workflow_dispatch: {}
 
 env:
   CARGO_TERM_COLOR: always
