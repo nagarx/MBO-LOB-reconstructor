@@ -135,10 +135,27 @@ impl DbnBridge {
     ///    473,410/473,410 = 100.000% of cases — finds nothing. That is the entire mass of
     ///    `LobStats.cancel_order_not_found` / `trade_order_not_found` (see `WARNINGS.md` §1).
     ///
-    /// Databento's own MBP-10 contains **zero `F` records**, and treating `F` as a book no-op
-    /// reproduces that vendor book **bit-exactly on 100.000%** of book-affecting records
-    /// (2025-07-01, 4,214,602 RTH comparisons). So the correct decode is
-    /// `b'F' => Action::Fill` **with `Fill` as a book no-op**.
+    /// 🔴 **STRUCK 2026-08-16 — THE "ZERO `F`" PREMISE IS REFUTED. DO NOT CITE IT, HERE OR
+    /// ANYWHERE.** ~~Databento's own MBP-10 contains **zero `F` records**~~ — **FALSE.**
+    /// Measured across the 21 vendor MBP-10 day files: **38 `F` records on 11 of the 21 days**,
+    /// every one at the opening or closing cross. The claim was generalised from one of the 10
+    /// genuinely-zero days. A gate or a reviewer that asserts "the vendor MBP-10 contains no `F`"
+    /// will read a **correct** vendor file as anomalous on 11 days in 21.
+    ///
+    /// ⭐ **THE CONCLUSION SURVIVES ON A STRICTLY STRONGER ARGUMENT — CITE THE PAIRING, NEVER THE
+    /// ZERO.** `F` is a book no-op because **the venue removes the resting order itself, with a
+    /// paired `C`** — not because `F` is absent from the vendor's book view. Measured: **`F`→`C`
+    /// pairing = 1.00000000 over 6 days / 1,808,570 records**, the paired `C` being the **literal
+    /// next record**, with `side` and `size` matching. The identity holds **inside both auction
+    /// crosses**, so **no auction carve-out is required**. An `F` that also decrements the book
+    /// therefore decrements it **twice**. So the correct decode is `b'F' => Action::Fill` **with
+    /// `Fill` as a book no-op**.
+    ///
+    /// The independent corroboration — that a book treating `F` as a no-op reproduces the vendor
+    /// MBP-10 on 100.000% of book-affecting records (2025-07-01, 4,214,602 RTH comparisons) —
+    /// **stands, and is not affected by the struck premise**. Note its scope: that oracle is an
+    /// independent **Python** book port, so it qualifies the *semantics*, not any Rust
+    /// implementation of them.
     ///
     /// **The code is deliberately UNCHANGED here.** The fix is a separate authorised change under
     /// DECISION-033 / Phase 1, and it MUST land in one commit together with the consumer match arms
