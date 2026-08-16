@@ -221,15 +221,31 @@ impl DbnBridge {
     /// independent **Python** book port, so it qualifies the *semantics*, not this Rust
     /// implementation of them.
     ///
-    /// # ⚠ WHAT IS AND IS NOT FIXED AT THIS COMMIT (L-DECODE only)
+    /// # WHAT L-DECODE DID HERE, AND WHAT L-ROUTE THEN DID DOWNSTREAM
     ///
-    /// This function now emits the two carriers as distinct variants, so the emitted **action
-    /// byte** is correct and `Action::Fill` reaches the Parquet `action` column as `70` for the
-    /// first time. **The router still merges them**: `reconstructor.rs`'s dispatch arm is
-    /// `Action::TradeAggregate | Action::Fill => process_trade(...)`, so the **book is byte-for-byte
-    /// unchanged** and `LobStats.cancel_order_not_found` / `trade_order_not_found` still carry
-    /// their full mass (see `WARNINGS.md` §1). That is the L-ROUTE layer and it is a separate,
-    /// sequenced commit — deliberately, so this diff stays reviewable in isolation.
+    /// This function emits the two carriers as distinct variants, so the emitted **action byte**
+    /// is correct and `Action::Fill` reaches the Parquet `action` column as `70`.
+    ///
+    /// ⚠ **UPDATED AT L-ROUTE — the paragraph that stood here is no longer true and has been
+    /// rewritten rather than left to rot.** It said *"the router still merges them … the book is
+    /// byte-for-byte unchanged and `cancel_order_not_found` / `trade_order_not_found` still carry
+    /// their full mass"*. All three clauses are now false. `reconstructor.rs`'s dispatch is seven
+    /// exhaustive arms in which `TradeAggregate` and `Fill` are each a **book no-op**; the book
+    /// therefore CHANGED (it is no longer double-decremented), and both counters are now driven to
+    /// exactly 0. Measured on the two pre-registered development days, full-day replay:
+    ///
+    /// ```text
+    ///                              2025-07-01        2025-07-02
+    ///   cancel_order_not_found     261,386 -> 0      207,959 -> 0
+    ///   trade_order_not_found       18,061 -> 0       16,052 -> 0
+    ///   active_orders                5,909 -> 5,910    5,557 -> 5,559
+    /// ```
+    ///
+    /// The `trade_*` counters are now written by nothing and must stay 0 forever — that is the
+    /// receipt that no carrier enters the reduction path. The `Fill` lookup survives as a
+    /// non-mutating CONFORMANCE CHECK (`LobStats::resting_fills_observed` and the three
+    /// `fill_*` counters), which on those two days reported 556,278 vendor assertions with
+    /// **zero** unknown orders, zero side mismatches and zero size shortfalls.
     ///
     /// Note also that no part of this change recovers the `side == 'N'` prints — 21.27% of trade
     /// count but **50.33% of traded volume** — which die independently at consumer-side

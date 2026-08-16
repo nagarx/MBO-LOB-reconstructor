@@ -54,16 +54,35 @@
 //! `trade_order_not_found` — **without ever touching the book**. Counter-visible,
 //! book-invisible. Under the correct fix they never enter, and the counter is 0.
 //!
-//! CONSEQUENCE: `trade_order_not_found == 0` on any ARCX day is a **live-data W4
-//! falsifier that needs no synthetic record and no new code**. An MBP-10 oracle
-//! still cannot see W4 (the book is identical — see `active_orders` above), so the
-//! oracle is not the second instrument; this counter is.
+//! ⚠️ THE TABLE ABOVE WAS MEASURED ON A PRE-COLLAPSE BUILD, AND THE COUNTER IT
+//! NAMES IS NOW DEAD. Those three arms were built while `OrderReductionOp` still
+//! carried a `Trade` variant, which is where W4's misses landed. COMMIT 2a
+//! collapsed that enum to `Cancel` alone, and **`trade_order_not_found` now has
+//! zero increment sites in `src/`** — it reads 0 under every implementation,
+//! including W4. Do NOT use it as a falsifier; an agent following the old
+//! instruction would certify the impostor as correct.
 //!
-//! ⚠️ The router's own comment claims the ARCX `T` population "is filtered by the
-//! `side == Side::None` guard". That is WRONG: `reduce_or_remove_order` never
-//! reads `msg.side` — Stage 2 branches on the **stored** order's side. What
-//! actually saves the book on ARCX is Stage-1 namespace disjointness, which is
-//! precisely why the counter moves while the book does not.
+//! CONSEQUENCE: the live-data discriminator is **`cancel_order_not_found`**:
+//! 157,493 -> 0 (ARCX NVDA 2025-07-01) and 127,527 -> 0 (2025-07-02). It is the
+//! right instrument for a structural reason, not just an empirical one — it has
+//! exactly ONE producer (the Stage-1 miss branch of `reduce_or_remove_order`)
+//! and `Cancel` is the only `OrderReductionOp` variant, so ANY carrier routed
+//! into the reduction path and missing must increment it. On ARCX the `T`
+//! population that makes W4 observable is precisely a population that misses
+//! (disjoint namespace, above), so a W4 impostor written against the current
+//! enum cannot reach 0 there. An MBP-10 oracle still cannot see W4 (the book is
+//! identical — see `active_orders` above), so the oracle is not the second
+//! instrument; this counter is.
+//!
+//! ⚠️ The router's comment USED TO claim the ARCX `T` population "is filtered by
+//! the `side == Side::None` guard". That was WRONG and has been corrected in the
+//! same commit that discharged this harness: `reduce_or_remove_order` never reads
+//! `msg.side` — Stage 2 branches on the **stored** order's side. What actually
+//! saved the book on ARCX was Stage-1 namespace disjointness (`INTERSECT` of the
+//! `T` order_ids with the `Add` order_ids measured exactly 0), which is precisely
+//! why the counter moved while the book did not. Namespace disjointness is a
+//! STRUCTURAL property, and therefore a stronger guarantee than a guard that a
+//! later commit could "wake".
 //!
 //! # THE LOAD-BEARING DESIGN DECISION: the book is PRE-POPULATED
 //!
@@ -84,55 +103,36 @@
 //! does the work; `active_orders` is asserted alongside only to pin the
 //! full-removal wrong-implementations as well.
 //!
-//! # ⚠️ STATUS: PENDING UNTIL COMMIT 2 LANDS — AND HOW THAT IS ENFORCED
+//! # ✅ STATUS: DISCHARGED — COMMIT 2a (L-ROUTE) HAS LANDED
 //!
-//! The two falsifiers below assert the POST-COMMIT-2 contract, which is not true
-//! yet. They therefore cannot pass today. The question every such test has to
-//! answer is: *what happens if someone forgets it exists?*
+//! These two falsifiers assert the POST-L-ROUTE contract. Until the router was
+//! split they could not pass, so they ran on the default `cargo test` with their
+//! bodies wrapped in an inverted-polarity `pending_until_commit2(...)` harness
+//! that asserted they *still failed* — making "forgetting them" the loudest
+//! failure in the suite rather than a silent `#[ignore]` skip.
 //!
-//! They used to be `#[ignore]`d. Measured, on this branch:
+//! **That harness has served its purpose and is deleted.** All three steps of its
+//! own definition of done were carried out in the same commit that split the
+//! router: the wrappers were removed, the `=== COMMIT 2 ADDS ===` carrier-counter
+//! assertions were uncommented, and `pending_until_commit2` /
+//! `probe_carrier_mutates` were deleted. The falsifiers now run directly and are
+//! ordinary green tests that go red if either carrier ever mutates the book again.
+//!
+//! Each falsifier additionally runs the **paired `Cancel`** after its no-op
+//! assertion. That matters: asserting only "the carrier changed nothing" is
+//! equally satisfied by a router that drops the record on the floor. Running the
+//! real vendor `F`→`C` pair proves the level is reduced **exactly once** — not
+//! twice (the double-decrement) and not zero times.
+//!
+//! MEASURED WHEN DISCHARGED (XNAS NVDA, full-day replay, same binary):
 //!
 //! ```text
-//!   cargo test --test carrier_routing_discriminator
-//!     -> exit 0,   "1 passed; 0 failed; 2 ignored"      <- SILENT SKIP
+//!                              before        after
+//!   cancel_order_not_found     261,386  ->   0        2025-07-01
+//!   cancel_order_not_found     207,959  ->   0        2025-07-02
+//!   trade_order_not_found       18,061  ->   0        (path no longer entered)
+//!   active_orders                5,909  ->   5,910
 //! ```
-//!
-//! and the branch has no CI (`.github/workflows/ci.yml` triggered only on
-//! `push: [main, master]`), so nothing anywhere ran them. Forgetting to delete
-//! two attributes was enough to make the only XNAS-side W4 detector vanish
-//! without a sound.
-//!
-//! **THE MECHANISM NOW USED: INVERTED POLARITY.** Each falsifier runs on the
-//! DEFAULT `cargo test` — no `#[ignore]`, no `--ignored`, no feature flag, no env
-//! var, no CI job — with its assertion body wrapped in
-//! [`pending_until_commit2`]. The wrapper asserts the assertion **still fails**:
-//!
-//! * **TODAY** the body panics with its carrier marker -> recorded PENDING -> green.
-//! * **THE MOMENT COMMIT 2 LANDS** the body stops panicking -> the wrapper itself
-//!   panics with a full instruction block -> **LOUD RED on the default test run.**
-//! * **ANY OTHER CHANGE** (the body panics for a different reason) -> also RED,
-//!   reporting the unexpected panic.
-//!
-//! Forgetting is therefore not a silent skip; it is the loudest failure in the
-//! suite, and it fires at exactly the moment the work is being done. The
-//! detection watches the ROUTER'S BEHAVIOUR, so it cannot drift out of sync with
-//! a version constant somebody forgot to bump.
-//!
-//! **THIS IS NOT BUG-LOCKING.** A bug-locking test asserts the defect *as
-//! correct*, so a fix reds it and the natural reaction is to revert the fix. Here
-//! the permanent artifact is the assertion body — which asserts the CORRECT
-//! post-COMMIT-2 contract — and the temporary artifact is the one-line wrapper.
-//! Discharging costs exactly what deleting `#[ignore]` cost; forgetting costs the
-//! opposite.
-//!
-//! ## COMMIT 2's definition of done, in this file:
-//!   1. In each falsifier, delete the `pending_until_commit2(...)` wrapper and
-//!      run the body directly. (The wrapper's own failure message spells this out.)
-//!   2. UNCOMMENT the `=== COMMIT 2 ADDS ===` carrier-counter assertions.
-//!   3. Delete [`pending_until_commit2`] and [`probe_carrier_mutates`] once both
-//!      falsifiers are discharged — `dead_code` will remind you.
-//! None of these is optional. Until (1) happens the falsifiers are recorded as
-//! PENDING, not as passing.
 
 use mbo_lob_reconstructor::{Action, LobConfig, LobReconstructor, MboMessage, Side};
 
@@ -214,13 +214,58 @@ fn seeded_book() -> LobReconstructor {
 
 /// Assert that no path through `reduce_or_remove_order` was taken.
 ///
-/// Under COMMIT 2 neither carrier reaches that function at all, so every trade
-/// anomaly counter must remain exactly zero. This catches a wrong implementation
-/// that "fixes" the carriers by routing them at the *not-found* path instead of
-/// making them true no-ops — that variant leaves the book unchanged and would
-/// otherwise slip past the fingerprint assertion.
+/// This exists to catch the ONE impostor the fingerprint is structurally blind
+/// to: an implementation that "fixes" the carriers by routing them into the
+/// reduction path where they *miss* at Stage 1. Stage 1 returns `Ok(())`
+/// leaving the book untouched, so `before == after` and the fingerprint passes.
+/// Only a counter can see it.
+///
+/// # Which counter — and the measurement behind the choice
+///
+/// `cancel_order_not_found` is the LIVE assertion. Measured on this tree:
+/// * It has exactly ONE producer, the Stage-1 miss branch of
+///   `reduce_or_remove_order`, and `OrderReductionOp` has exactly ONE variant
+///   (`Cancel`). So *any* carrier routed into that function and missing MUST
+///   land here — there is nowhere else for it to go.
+/// * Directly confirmed: with `Action::Fill` patched to call
+///   `reduce_or_remove_order(msg, OrderReductionOp::Cancel)`, a carrier naming
+///   an order the book does not hold drove it 0 -> 1, while the correct build
+///   leaves it at 0.
+///
+/// ⚠ WHICH CALLER MAKES IT LIVE — measured, because the obvious answer is wrong.
+/// In the two headline falsifiers the seeded order IS resolvable by design, so a
+/// wrongly-routed carrier *finds* it, mutates the book, and the FINGERPRINT
+/// fires first. Confirmed by running that exact impostor: the failure came from
+/// the `before == after` assertion, never from here. Those two calls are
+/// therefore belt-and-braces, not the discriminator.
+/// [`carriers_naming_an_unresting_order_must_not_enter_the_reduction_path`] is
+/// the caller that makes this counter load-bearing: there the book is unchanged
+/// under BOTH the correct implementation and the impostor, so the fingerprint is
+/// structurally blind and only this counter can tell them apart.
+///
+/// ⚠ The three `trade_*` counters below are asserted as a FORWARD tripwire, and
+/// deliberately not as today's discriminator. Measured: post-L-ROUTE they have
+/// **zero increment sites in `src/`**, because the `Trade` variant they were
+/// written for no longer exists — so on this tree they cannot fail under any
+/// implementation. They re-arm the moment someone re-introduces a reducing
+/// variant, which is exactly when this guard is needed again. Keeping them is
+/// cheap; relying on them alone was the defect (they read as protection while
+/// asserting nothing).
+///
+/// Every caller invokes this BEFORE processing any `Cancel` of its own, so a
+/// correct implementation is at 0 on every counter here.
 fn assert_reduction_path_untaken(lob: &LobReconstructor, carrier: &str) {
     let st = lob.stats();
+    assert_eq!(
+        st.cancel_order_not_found, 0,
+        "{carrier} must be a BOOK NO-OP, i.e. `reduce_or_remove_order` must never be \
+         entered. Post-L-ROUTE `Cancel` is the ONLY `OrderReductionOp` variant, so a \
+         carrier wrongly routed into the reduction path and missing at Stage 1 \
+         increments THIS counter — and leaves the book untouched, so the fingerprint \
+         assertion cannot see it. No `Cancel` has been processed at this point, so \
+         anything but 0 means a carrier was routed into the reduction path. Got {}",
+        st.cancel_order_not_found
+    );
     assert_eq!(
         (
             st.trade_order_not_found,
@@ -228,136 +273,13 @@ fn assert_reduction_path_untaken(lob: &LobReconstructor, carrier: &str) {
             st.trade_order_at_level_missing
         ),
         (0, 0, 0),
-        "{carrier} must be a BOOK NO-OP, i.e. `reduce_or_remove_order` must never be \
-         entered. Non-zero trade anomaly counters mean the carrier was still routed \
-         into the reduction path (and merely missed), which is not a no-op. Got \
+        "{carrier}: a `trade_*` anomaly counter moved. These have no increment site \
+         on this tree, so this can only fire if a reducing `OrderReductionOp` variant \
+         was re-introduced and a carrier was routed through it. Got \
          not_found={} price_level_missing={} at_level_missing={}",
         st.trade_order_not_found,
         st.trade_price_level_missing,
         st.trade_order_at_level_missing
-    );
-}
-
-// =============================================================================
-// THE PENDING HARNESS — delete when COMMIT 2 lands.
-// =============================================================================
-
-/// Does `carrier` still mutate the book when handed a resolvable `order_id`?
-///
-/// Used ONLY to enrich [`pending_until_commit2`]'s failure message with the JOINT
-/// state of both carriers, so a partial landing is diagnosed on the spot instead
-/// of being read as "the fix is done".
-fn probe_carrier_mutates(carrier: Action) -> bool {
-    let mut lob = seeded_book();
-    let before = fingerprint(&lob);
-    // Bid side, resolvable id, partial size — same shape both falsifiers use.
-    let _ = lob.process_message(&msg(1001, carrier, Side::Bid, 100.00, 100));
-    fingerprint(&lob) != before
-}
-
-/// Run `body`, and require that it STILL FAILS with `marker` in its panic.
-///
-/// See the module header (`STATUS: PENDING UNTIL COMMIT 2 LANDS`) for why the
-/// polarity is inverted rather than `#[ignore]`d. Three outcomes:
-///
-/// * body panics with `marker`   -> pre-COMMIT-2, recorded PENDING, test passes.
-/// * body does not panic         -> COMMIT 2 landed -> **panic with instructions**.
-/// * body panics without `marker`-> something else changed -> panic, reporting it.
-///
-/// The inner panic is printed by the default hook and captured by libtest; on a
-/// PENDING pass it is discarded, so it is only visible under `--nocapture` or on
-/// a real failure.
-fn pending_until_commit2<F>(carrier: &str, marker: &str, body: F)
-where
-    F: FnOnce(),
-{
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
-
-    let payload = match outcome {
-        Err(p) => p,
-        Ok(()) => {
-            let t = probe_carrier_mutates(Action::TradeAggregate);
-            let f = probe_carrier_mutates(Action::Fill);
-            let joint = match (t, f) {
-                (false, false) => {
-                    "BOTH carriers are now book no-ops. This is the shape COMMIT 2 is \
-                     supposed to have. DISCHARGE THIS HARNESS."
-                }
-                (true, false) => {
-                    "*** ONLY `Fill` CHANGED — `TradeAggregate` STILL MUTATES THE BOOK. ***\n\
-                     THIS IS THE W4 SIGNATURE, THE EXACT WRONG IMPLEMENTATION THIS FILE \
-                     EXISTS TO CATCH. Do NOT discharge the harness to make this green: fix \
-                     the router so `Action::TradeAggregate` is a book no-op too. \
-                     Cross-check on live data: replay any ARCX day and require \
-                     `trade_order_not_found == 0` (W4 leaves 49,788 on 2025-07-01)."
-                }
-                (false, true) => {
-                    "*** ONLY `TradeAggregate` CHANGED — `Fill` STILL MUTATES THE BOOK. ***\n\
-                     This is W4's mirror. `Fill` is the half that is LIVE on every venue, so \
-                     this variant is also caught by `cancel_order_not_found`, which will not \
-                     reach 0. Fix the router; do not discharge the harness."
-                }
-                (true, true) => {
-                    "Neither carrier changed, yet the assertion body stopped failing. That \
-                     is contradictory — suspect the fingerprint, the seed, or a change to \
-                     `seeded_book()`. Do not discharge until this is explained."
-                }
-            };
-            panic!(
-                "\n\n\
-                 ================================================================\n\
-                 PENDING TEST IS NOW PASSING: {carrier}\n\
-                 ================================================================\n\
-                 The assertion body below `pending_until_commit2(...)` no longer fails.\n\
-                 It asserts the POST-COMMIT-2 (L-ROUTE) contract, so this means the\n\
-                 routing behaviour has CHANGED. This failure is the intended alarm, not\n\
-                 a regression — it is how this file refuses to be forgotten.\n\
-                 \n\
-                 JOINT CARRIER STATE, probed just now:\n\
-                   Action::TradeAggregate mutates the book = {t}\n\
-                   Action::Fill           mutates the book = {f}\n\
-                 {joint}\n\
-                 \n\
-                 TO DISCHARGE (only when BOTH are false):\n\
-                   1. In this test, delete the `pending_until_commit2(...)` wrapper and\n\
-                      run the body directly.\n\
-                   2. Do the same for the sibling falsifier.\n\
-                   3. Uncomment the `=== COMMIT 2 ADDS ===` carrier-counter assertions.\n\
-                   4. Delete `pending_until_commit2` and `probe_carrier_mutates`.\n\
-                 \n\
-                 EXPECT COMPANY: 7 library tests fail identically under W4 AND under a\n\
-                 correct fix, because they assert the OLD book-mutating contract —\n\
-                 test_over_trade_removes_order, test_partial_trade_size_reduction,\n\
-                 test_price_level_cache_consistency_complex, test_trade_full_fill,\n\
-                 test_trade_partial_fill, test_trade_unknown_order_is_ok,\n\
-                 test_warning_stats_accumulate. They CANNOT discriminate W4 and must not\n\
-                 be read as 'the fix broke something'.\n\
-                 ================================================================\n"
-            );
-        }
-    };
-
-    let text = if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "<non-string panic payload>".to_string()
-    };
-
-    assert!(
-        text.contains(marker),
-        "\n\n\
-         ================================================================\n\
-         PENDING TEST FAILED FOR AN UNEXPECTED REASON: {carrier}\n\
-         ================================================================\n\
-         Expected the body to still fail with the marker {marker:?} (the pre-COMMIT-2\n\
-         state). It failed with something else, so the assertion is no longer\n\
-         measuring what this file thinks it measures. Read the panic below before\n\
-         touching anything; do NOT delete the harness to make this green.\n\
-         \n\
-         ACTUAL PANIC:\n{text}\n\
-         ================================================================\n"
     );
 }
 
@@ -411,6 +333,85 @@ fn positive_control_fingerprint_detects_a_real_partial_book_mutation() {
 }
 
 // =============================================================================
+// FALSIFIER 0 — the MISS shape, which the fingerprint cannot see.
+// =============================================================================
+
+/// A carrier naming an order the book does NOT hold must not enter the
+/// reduction path.
+///
+/// # Why this shape needs its own test
+///
+/// The two falsifiers below seed a RESOLVABLE order, so a wrongly-routed carrier
+/// reaches Stage 4 and moves the book — the fingerprint catches it. This test is
+/// the complement: with an unresting `order_id`, `reduce_or_remove_order` misses
+/// at Stage 1 and returns `Ok(())` **leaving the book completely untouched**.
+/// `before == after` holds under the correct implementation AND under the
+/// impostor, so the fingerprint is structurally blind and a counter is the only
+/// possible instrument. Without this test
+/// [`assert_reduction_path_untaken`] is never reached on a shape that can make
+/// it fail, i.e. it reads as protection while asserting nothing.
+///
+/// This is the ARCX mechanism in miniature: there the `T` population carries
+/// `order_id != 0` drawn from a namespace DISJOINT from the `Add` ids
+/// (`INTERSECT` measured exactly 0), so under W4 those records miss at Stage 1
+/// and move a counter **without ever touching the book** — counter-visible,
+/// book-invisible.
+#[test]
+fn carriers_naming_an_unresting_order_must_not_enter_the_reduction_path() {
+    // ---- Action::Fill naming an order that is not resting. ----
+    let mut lob = seeded_book();
+    let before = fingerprint(&lob);
+
+    lob.process_message(&msg(9999, Action::Fill, Side::Ask, 100.05, 50))
+        .expect("Fill must not error");
+
+    let after = fingerprint(&lob);
+    assert_eq!(
+        before, after,
+        "the book must be untouched — but note this assertion is WEAK here by \
+         construction: it also holds under a router that sends the carrier into \
+         the reduction path and merely misses. That is exactly why the counter \
+         assertion below is the load-bearing one."
+    );
+    assert_reduction_path_untaken(&lob, "Action::Fill (unresting order_id)");
+
+    // The observation is REPOINTED, not lost. A zero here would mean the record
+    // was silently dropped, which is a different defect wearing the same mask.
+    let st = lob.stats();
+    assert_eq!(
+        st.resting_fills_observed, 1,
+        "the Fill oracle must have RUN on this record"
+    );
+    assert_eq!(
+        st.fill_referenced_unknown_order, 1,
+        "the vendor asserted a resting order the book does not hold; that is the \
+         signal `trade_order_not_found` used to carry, and it must be REPORTED on \
+         the carrier's own counter rather than silently absorbed"
+    );
+
+    // ---- Action::TradeAggregate naming an order that is not resting. ----
+    let mut lob = seeded_book();
+    let before = fingerprint(&lob);
+
+    lob.process_message(&msg(8888, Action::TradeAggregate, Side::Bid, 100.00, 100))
+        .expect("TradeAggregate must not error");
+
+    assert_eq!(before, fingerprint(&lob), "the book must be untouched");
+    assert_reduction_path_untaken(&lob, "Action::TradeAggregate (unresting order_id)");
+
+    let st = lob.stats();
+    assert_eq!(
+        st.aggregate_trades_observed, 1,
+        "the TradeAggregate carrier counter must observe exactly this one record"
+    );
+    assert_eq!(
+        st.resting_fills_observed, 0,
+        "a TradeAggregate must NEVER be counted as a resting fill — the two \
+         populations are DISJOINT"
+    );
+}
+
+// =============================================================================
 // FALSIFIER 1 — kills W4. PENDING (inverted polarity) until COMMIT 2 lands.
 // =============================================================================
 
@@ -423,56 +424,54 @@ fn positive_control_fingerprint_detects_a_real_partial_book_mutation() {
 /// the `trade_order_not_found` counter is a second, live-data falsifier; see the
 /// module header.
 ///
-/// TODAY (`Action::TradeAggregate | Action::Fill => self.process_trade(msg)?`):
-/// order 1001 is found, Stage 4 takes the partial branch, `bid_sizes[0]` moves
-/// 500 -> 400, and the body FAILS. That failure is the proof it is a real
-/// falsifier and not a fixture that locks the bug — and it is what
-/// `pending_until_commit2` records as PENDING.
+/// PRE-L-ROUTE (`Action::TradeAggregate | Action::Fill => self.process_trade(msg)?`)
+/// order 1001 was found, Stage 4 took the partial branch and `bid_sizes[0]` moved
+/// 500 -> 400, so this body FAILED. That it could fail is the proof it is a real
+/// falsifier and not a fixture that locks the bug.
 #[test]
 fn trade_aggregate_with_resolvable_order_id_must_not_mutate_the_book() {
-    // COMMIT 2: delete this wrapper and run the body directly.
-    pending_until_commit2(
-        "Action::TradeAggregate",
-        "THE T ARM STILL MUTATES THE BOOK",
-        || {
-            let mut lob = seeded_book();
-            let before = fingerprint(&lob);
+    let mut lob = seeded_book();
+    let before = fingerprint(&lob);
 
-            // THE DISCRIMINATING RECORD: a TradeAggregate that is NOT a system message.
-            //   order_id = 1001  -> resolvable; forces Stage 1 to succeed
-            //   side     = Bid   -> a real side, not Side::None
-            //   size     = 100   -> PARTIAL (< the resting 500), so `active_orders` cannot
-            //                       detect the mutation and the level state must
-            // This shape does not occur on the XNAS tape; it exists to make the dormant
-            // T arm observable.
-            lob.process_message(&msg(1001, Action::TradeAggregate, Side::Bid, 100.00, 100))
-                .expect("TradeAggregate must not error");
+    // THE DISCRIMINATING RECORD: a TradeAggregate that is NOT a system message.
+    //   order_id = 1001  -> resolvable; forces Stage 1 to succeed
+    //   side     = Bid   -> a real side, not Side::None
+    //   size     = 100   -> PARTIAL (< the resting 500), so `active_orders` cannot
+    //                       detect the mutation and the level state must
+    // This shape does not occur on the XNAS tape; it exists to make the dormant
+    // T arm observable.
+    lob.process_message(&msg(1001, Action::TradeAggregate, Side::Bid, 100.00, 100))
+        .expect("TradeAggregate must not error");
 
-            let after = fingerprint(&lob);
+    let after = fingerprint(&lob);
 
-            assert_eq!(
-                before, after,
-                "\n\n*** THE T ARM STILL MUTATES THE BOOK ***\n\
-                 `Action::TradeAggregate` is a documented vendor BOOK NO-OP, but processing one \
-                 with a resolvable order_id changed the book.\n\
-                 This is the W4 signature: `Fill` fixed, `TradeAggregate` left routed into \
-                 `process_trade`. Every XNAS live-data counter is bit-identical to the correct \
-                 fix because 100% of the real XNAS T population carries order_id == 0 and is \
-                 dropped at L-ADMIT — so on XNAS ONLY this test can see it. (On ARCX, \
-                 `trade_order_not_found` also sees it: 49,788 vs 0 on 2025-07-01.)\n\
-                 before = {before:#?}\n\
-                 after  = {after:#?}\n"
-            );
-            assert_reduction_path_untaken(&lob, "Action::TradeAggregate");
+    assert_eq!(
+        before, after,
+        "\n\n*** THE T ARM STILL MUTATES THE BOOK ***\n\
+         `Action::TradeAggregate` is a documented vendor BOOK NO-OP, but processing one \
+         with a resolvable order_id changed the book.\n\
+         This is the W4 signature: `Fill` fixed, `TradeAggregate` left routed into \
+         the reduction path. Every XNAS live-data counter is bit-identical to the correct \
+         fix because 100% of the real XNAS T population carries order_id == 0 and is \
+         dropped at L-ADMIT — so on XNAS ONLY this test can see it. (On ARCX the \
+         live-data instrument is `cancel_order_not_found`: 157,493 -> 0 on 2025-07-01 \
+         and 127,527 -> 0 on 2025-07-02. NOT `trade_order_not_found` — that counter \
+         has no increment site post-COMMIT-2a and reads 0 under W4 too.)\n\
+         before = {before:#?}\n\
+         after  = {after:#?}\n"
+    );
+    assert_reduction_path_untaken(&lob, "Action::TradeAggregate");
 
-            // === COMMIT 2 ADDS === (fields do not exist yet; uncomment when L-ROUTE lands)
-            // let st = lob.stats();
-            // assert_eq!(st.aggregate_trades_observed, 1,
-            //     "the TradeAggregate carrier counter must observe exactly this one record");
-            // assert_eq!(st.resting_fills_observed, 0,
-            //     "a TradeAggregate must NEVER be counted as a resting fill — the two \
-            //      populations are DISJOINT");
-        },
+    // Discharged from `pending_until_commit2` when L-ROUTE landed.
+    let st = lob.stats();
+    assert_eq!(
+        st.aggregate_trades_observed, 1,
+        "the TradeAggregate carrier counter must observe exactly this one record"
+    );
+    assert_eq!(
+        st.resting_fills_observed, 0,
+        "a TradeAggregate must NEVER be counted as a resting fill — the two \
+         populations are DISJOINT"
     );
 }
 
@@ -489,37 +488,61 @@ fn trade_aggregate_with_resolvable_order_id_must_not_mutate_the_book() {
 ///
 /// Targets the ASK side so the pair of falsifiers covers both sides of the book.
 ///
-/// TODAY the body FAILS: `ask_sizes[0]` moves 300 -> 250.
+/// PRE-L-ROUTE (`Action::TradeAggregate | Action::Fill => self.process_trade(msg)?`)
+/// order 2002 was found, Stage 4 took the partial branch and `ask_sizes[0]` moved
+/// 300 -> 250, so this body FAILED. That it could fail is the proof it is a real
+/// falsifier and not a fixture that locks the bug. It passes today.
 #[test]
 fn fill_with_resolvable_order_id_must_not_mutate_the_book() {
-    // COMMIT 2: delete this wrapper and run the body directly.
-    pending_until_commit2("Action::Fill", "THE F ARM STILL MUTATES THE BOOK", || {
-        let mut lob = seeded_book();
-        let before = fingerprint(&lob);
+    let mut lob = seeded_book();
+    let before = fingerprint(&lob);
 
-        // order_id = 2002 -> the resting ASK; size 50 of 300 -> partial.
-        lob.process_message(&msg(2002, Action::Fill, Side::Ask, 100.05, 50))
-            .expect("Fill must not error");
+    // order_id = 2002 -> the resting ASK; size 50 of 300 -> partial.
+    lob.process_message(&msg(2002, Action::Fill, Side::Ask, 100.05, 50))
+        .expect("Fill must not error");
 
-        let after = fingerprint(&lob);
+    let after = fingerprint(&lob);
 
-        assert_eq!(
-            before, after,
-            "\n\n*** THE F ARM STILL MUTATES THE BOOK ***\n\
-             `Action::Fill` is a documented vendor BOOK NO-OP; the paired `Cancel` performs \
-             the removal. A Fill that also reduces the level is the double-decrement half of \
-             the T/F carrier-merge defect.\n\
-             before = {before:#?}\n\
-             after  = {after:#?}\n"
-        );
-        assert_reduction_path_untaken(&lob, "Action::Fill");
+    assert_eq!(
+        before, after,
+        "\n\n*** THE F ARM STILL MUTATES THE BOOK ***\n\
+         `Action::Fill` is a documented vendor BOOK NO-OP; the paired `Cancel` performs \
+         the removal. A Fill that also reduces the level is the double-decrement half of \
+         the T/F carrier-merge defect.\n\
+         before = {before:#?}\n\
+         after  = {after:#?}\n"
+    );
+    assert_reduction_path_untaken(&lob, "Action::Fill");
 
-        // === COMMIT 2 ADDS === (fields do not exist yet; uncomment when L-ROUTE lands)
-        // let st = lob.stats();
-        // assert_eq!(st.resting_fills_observed, 1,
-        //     "the Fill carrier counter must observe exactly this one record");
-        // assert_eq!(st.aggregate_trades_observed, 0,
-        //     "a Fill must NEVER be counted as an aggregate trade — the two \
-        //      populations are DISJOINT");
-    });
+    // Discharged from `pending_until_commit2` when L-ROUTE landed.
+    let st = lob.stats();
+    assert_eq!(
+        st.resting_fills_observed, 1,
+        "the Fill carrier counter must observe exactly this one record"
+    );
+    assert_eq!(
+        st.aggregate_trades_observed, 0,
+        "a Fill must NEVER be counted as an aggregate trade — the two \
+         populations are DISJOINT"
+    );
+
+    // ...and the PAIRED CANCEL is what performs the removal. Asserting only the
+    // no-op would also pass if `Fill` were dropped on the floor; running the real
+    // F->C pair proves the level is reduced EXACTLY ONCE.
+    lob.process_message(&msg(2002, Action::Cancel, Side::Ask, 100.05, 50))
+        .expect("the paired Cancel must not error");
+
+    assert_eq!(
+        fingerprint(&lob).ask_sizes[0],
+        250,
+        "the F->C pair must take the resting ask 300 -> 250 exactly once. \
+         Pre-L-ROUTE it went to 200 (the double-decrement)."
+    );
+    assert_eq!(
+        lob.stats().cancel_order_not_found,
+        0,
+        "THE HEADLINE FALSIFIER IN MINIATURE: the paired Cancel must FIND its order. \
+         Pre-L-ROUTE the Fill had already consumed it, which is the whole of \
+         261,386 -> 0 on XNAS NVDA 2025-07-01."
+    );
 }

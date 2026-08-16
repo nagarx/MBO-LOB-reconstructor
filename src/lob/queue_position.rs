@@ -344,14 +344,20 @@ impl QueueLevel {
 // Queue Position Tracker
 // ============================================================================
 
-/// The type of order reduction operation (cancel vs fill).
+/// The type of order reduction operation.
 ///
-/// Controls which stat counter is incremented when an order is not found.
-/// Follows the same pattern as `OrderReductionOp` in the reconstructor.
+/// ⚠ ONE VARIANT, DELIBERATELY — the mirror of `OrderReductionOp` in the
+/// reconstructor. It carried a `Fill` variant until L-ROUTE, because `F` used to
+/// deplete the queue. It no longer does: `F` is a vendor book no-op announcing a
+/// depletion that the paired `Cancel` performs, so **`Cancel` is the only
+/// operation that reduces a queue level**. `rustc` reporting `variant Fill is
+/// never constructed` was the receipt that the split had landed here too.
+///
+/// [`QueueStats::fill_not_found`] is still written — by
+/// [`QueuePositionTracker::observe_fill`], with unchanged meaning.
 #[derive(Debug, Clone, Copy)]
 enum ReductionOp {
     Cancel,
-    Fill,
 }
 
 /// Tracks FIFO queue positions for all orders.
@@ -428,24 +434,37 @@ impl QueuePositionTracker {
             Action::Add => self.handle_add(msg),
             Action::Modify => self.handle_modify(msg),
             Action::Cancel => self.handle_order_reduction(msg, ReductionOp::Cancel),
-            // ⚠⚠ KNOWINGLY TEMPORARY — MECHANICAL RENAME THAT PRESERVES THE MERGE. ⚠⚠
+
+            // =================================================================
+            // L-ROUTE: the queue is a MIRROR OF THE BOOK and must move with it.
+            // =================================================================
             //
-            // `Action::TradeAggregate | Action::Fill` compiles, passes every test, and routes both
-            // carriers to one handler exactly as `Action::Trade | Action::Fill` did. It is written
-            // this way ON PURPOSE so this commit changes only the decoded action byte.
+            // ⚠ THE ORIGINAL L-ROUTE PLAN CALLED THIS ARM "unchanged behaviour" AND THAT
+            // WAS DEFECTIVE. `Fill` reducing here is the SAME double-decrement the book
+            // had: `F` reduced the queue level and the venue's paired `C` reduced it
+            // again, so a 50-share execution removed 100 shares of queue.
             //
-            // Today the merge is DORMANT here, not live: the `is_system_message()` guard at the
-            // top of this function drops 100% of `TradeAggregate` (all carry `order_id == 0` on
-            // XNAS.ITCH), so only ex-`F` reaches this arm. The fix to that guard is what WAKES the
-            // hazard — which is why the two must land together.
+            // AND LEAVING IT WOULD HAVE SHIPPED A DIVERGENCE, measured on this branch:
             //
-            // RESOLVED IN: the L-ROUTE commit, which splits this into
-            // `Action::Fill => self.handle_order_reduction(msg, ReductionOp::Fill)` (unchanged
-            // behaviour — `F` is the resting-order view and is what queue depletion is about) plus
-            // a dedicated `Action::TradeAggregate` arm routed to `messages_skipped`. NO wildcard.
-            Action::TradeAggregate | Action::Fill => {
-                self.handle_order_reduction(msg, ReductionOp::Fill)
+            // ```text
+            //   tests/queue_position_nvidia_test::test_queue_position_volume_consistency
+            //     HEAD (both reduce on Fill)      LOB 119   Queue 119   GREEN
+            //     book fixed, queue NOT fixed     LOB 1060  Queue 119   RED
+            //     both fixed                      LOB 1060  Queue 1060  GREEN
+            // ```
+            //
+            // That test exists precisely to assert the two views agree. Fixing the book
+            // alone turns it RED — a real regression, not a stale fixture. The book and
+            // this tracker must therefore change in the SAME commit.
+            //
+            // `TradeAggregate` gets its own arm (never `handle_order_reduction`): it is
+            // the aggressor-side print, carries `order_id == 0` on XNAS.ITCH, and would
+            // otherwise be looked up against resting-order ids it can never match.
+            // NO wildcard — a new `Action` variant must fail to compile here.
+            Action::TradeAggregate => {
+                self.stats.messages_skipped += 1;
             }
+            Action::Fill => self.observe_fill(msg),
             Action::Clear | Action::None => {
                 self.stats.messages_skipped += 1;
             }
@@ -548,22 +567,45 @@ impl QueuePositionTracker {
         }
     }
 
-    /// Unified order reduction: look up order, reduce or remove from queue.
+    /// Observe an `Action::Fill` without mutating the queue.
     ///
-    /// Both cancel and fill follow the same pattern in Databento MBO format:
-    /// `msg.size` is the delta (quantity cancelled/filled). If delta >= current
-    /// size, the order is fully removed. Otherwise, it's a partial reduction.
+    /// `F` is a vendor BOOK NO-OP: it announces an execution, and the paired
+    /// `Cancel` (the literal next record) performs the depletion. Depleting here
+    /// as well is the double-decrement — see the router arm above for the
+    /// measured LOB-vs-Queue divergence that proves it.
     ///
-    /// This unification eliminates the ~90% code duplication between the former
-    /// `handle_cancel` and `handle_fill`, which was the root cause of partial
-    /// cancels being ignored (handle_cancel always did full removal).
+    /// The LOOKUP is retained as a conformance check so
+    /// [`QueueStats::fill_not_found`] keeps its meaning — "a fill referenced an
+    /// order this tracker does not hold" — which is exactly what it counted
+    /// before. Only the mutation is removed.
+    fn observe_fill(&mut self, msg: &MboMessage) {
+        if !self.order_locations.contains_key(&msg.order_id) {
+            self.stats.fill_not_found += 1;
+        }
+    }
+
+    /// Unified order reduction: look up the order, then reduce or remove it.
+    ///
+    /// `msg.size` is the DELTA (the quantity cancelled), not the resulting size.
+    /// If the delta >= the current resting size the order is fully removed;
+    /// otherwise it is a partial reduction and the FIFO position is retained.
+    ///
+    /// ⚠ POST-L-ROUTE, `Cancel` IS THE ONLY CALLER — [`ReductionOp`] has exactly
+    /// one variant. `Fill` used to route here too; it no longer does (see
+    /// [`Self::observe_fill`]), because depleting on the `F` *and* again on its
+    /// paired `C` was the double-decrement.
+    ///
+    /// HISTORY, retained because it is why the unified shape exists at all: this
+    /// function replaced a `handle_cancel` / `handle_fill` pair that was ~90%
+    /// duplicated, and that duplication was the root cause of partial cancels
+    /// being ignored (`handle_cancel` always did a FULL removal). The partial-
+    /// cancel tests further down this file are that bug's regression lock.
     fn handle_order_reduction(&mut self, msg: &MboMessage, op: ReductionOp) {
         let &(side, price) = match self.order_locations.get(&msg.order_id) {
             Some(loc) => loc,
             None => {
                 match op {
                     ReductionOp::Cancel => self.stats.cancel_not_found += 1,
-                    ReductionOp::Fill => self.stats.fill_not_found += 1,
                 }
                 return;
             }
@@ -964,7 +1006,7 @@ mod tests {
             2000,
         ));
 
-        // Partial fill of order 1
+        // Partial fill of order 1 — a vendor BOOK NO-OP, so the queue does not move.
         tracker.process_message(&make_msg(
             1,
             Action::Fill,
@@ -975,7 +1017,28 @@ mod tests {
         ));
 
         let pos1 = tracker.queue_position(1).unwrap();
-        assert_eq!(pos1.order_size, 60); // 100 - 40
+        assert_eq!(
+            pos1.order_size, 100,
+            "Fill is a book no-op; the paired Cancel performs the depletion"
+        );
+        assert_eq!(pos1.position, 0);
+        assert_eq!(tracker.queue_position(2).unwrap().volume_ahead, 100);
+
+        // The PAIRED CANCEL is what depletes the queue — exactly once.
+        tracker.process_message(&make_msg(
+            1,
+            Action::Cancel,
+            Side::Ask,
+            100_000_000_000,
+            40,
+            3001,
+        ));
+
+        let pos1 = tracker.queue_position(1).unwrap();
+        assert_eq!(
+            pos1.order_size, 60,
+            "the F->C pair depletes 100 -> 60 once (pre-L-ROUTE this was 20)"
+        );
         assert_eq!(pos1.position, 0); // Still at front
 
         let pos2 = tracker.queue_position(2).unwrap();
@@ -1003,7 +1066,7 @@ mod tests {
             2000,
         ));
 
-        // Full fill of order 1
+        // Full fill of order 1 — announced by F, performed by the paired C.
         tracker.process_message(&make_msg(
             1,
             Action::Fill,
@@ -1011,6 +1074,21 @@ mod tests {
             100_000_000_000,
             100,
             3000,
+        ));
+
+        assert!(
+            tracker.queue_position(1).is_some(),
+            "a Fill must not remove the order from the queue"
+        );
+        assert_eq!(tracker.queue_position(2).unwrap().volume_ahead, 100);
+
+        tracker.process_message(&make_msg(
+            1,
+            Action::Cancel,
+            Side::Ask,
+            100_000_000_000,
+            100,
+            3001,
         ));
 
         assert!(tracker.queue_position(1).is_none());
@@ -1636,7 +1714,7 @@ mod tests {
             2000,
         ));
 
-        // Full fill via the >= path (100 >= 100)
+        // The Fill announces the execution but does not deplete.
         tracker.process_message(&make_msg(
             1,
             Action::Fill,
@@ -1647,12 +1725,29 @@ mod tests {
         ));
 
         assert!(
+            tracker.queue_position(1).is_some(),
+            "Fill is a book no-op — the paired Cancel does the removal"
+        );
+
+        // Full removal via the paired Cancel's `>=` path (100 >= 100). The
+        // no-ghost invariant this fixture exists for is asserted on the other
+        // side of it: a full depletion must leave no zero-size entry behind.
+        tracker.process_message(&make_msg(
+            1,
+            Action::Cancel,
+            Side::Ask,
+            100_000_000_000,
+            100,
+            3001,
+        ));
+
+        assert!(
             tracker.queue_position(1).is_none(),
-            "fully filled order should be removed"
+            "fully depleted order should be removed"
         );
 
         let pos2 = tracker.queue_position(2).unwrap();
-        assert_eq!(pos2.position, 0, "order 2 moves to front after fill");
+        assert_eq!(pos2.position, 0, "order 2 moves to front after depletion");
         assert_eq!(pos2.volume_ahead, 0);
         assert_eq!(pos2.queue_length, 1, "queue should have 1 order, no ghosts");
     }

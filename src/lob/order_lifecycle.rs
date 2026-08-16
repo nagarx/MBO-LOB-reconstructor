@@ -563,25 +563,70 @@ impl OrderLifecycleTracker {
             Action::Add => self.handle_add(msg),
             Action::Modify => self.handle_modify(msg),
             Action::Cancel => self.handle_cancel(msg),
-            // ⚠⚠ KNOWINGLY TEMPORARY — MECHANICAL RENAME THAT PRESERVES THE MERGE. ⚠⚠
+
+            // =================================================================
+            // L-ROUTE: the carriers are split. NO wildcard.
+            // =================================================================
             //
-            // Behaviour-identical to the previous `Action::Trade | Action::Fill`. This commit
-            // changes only the decoded action byte; the routing fix is sequenced separately.
+            // `TradeAggregate` must NEVER reach `handle_fill`. It carries
+            // `order_id == 0`, which never matches an active order, and
+            // `handle_fill` builds an INFERRED lifecycle on a miss whenever
+            // `infer_pre_existing` is set — the default at all three
+            // constructors. Every admitted `TradeAggregate` would therefore
+            // MANUFACTURE a phantom completed lifecycle. That hazard is dormant
+            // on XNAS.ITCH only because `is_system_message()` above drops 100%
+            // of them; on ARCX, and after any L-ADMIT change, it would wake.
+            // Splitting the arm closes it structurally rather than relying on
+            // an upstream guard that a later commit is expected to modify.
+            Action::TradeAggregate => {
+                self.stats.messages_skipped += 1;
+                None
+            }
+
+            // ⚠ SCOPE, STATED HONESTLY — `Fill` BEHAVIOUR IS DELIBERATELY UNCHANGED HERE,
+            // AND THIS MODULE STILL CARRIES AN F/C DOUBLE-COUNT. IT IS NOT FIXED BY L-ROUTE.
             //
-            // ⚠ THIS IS THE DANGEROUS ONE. A `TradeAggregate` carries `order_id == 0`, which never
-            // matches an active order, and `handle_fill` builds an INFERRED lifecycle on a miss
-            // whenever `infer_pre_existing` is set — which is the default at all three
-            // constructors. So every admitted `TradeAggregate` here would MANUFACTURE a phantom
-            // completed lifecycle. It is harmless today only because the `is_system_message()`
-            // guard at the top of this function drops 100% of them (all `T` carries
-            // `order_id == 0` on XNAS.ITCH). Deleting that guard without splitting this arm
-            // wakes the hazard.
+            // THE DEFECT, traced (not conjectured), for a FULL fill of a tracked order:
+            //   1. `F(id, n)` -> `handle_fill` drives `current_size` to 0, sets
+            //      `terminal_state = Filled`, `filled_orders += 1`, REMOVES the order from
+            //      `active`, and `store_completed(record #1 = Filled)`.
+            //   2. the venue's paired `C(id, n)` -> `handle_cancel` no longer finds it in
+            //      `active`, falls into the `infer_pre_existing` branch (DEFAULT ON), and
+            //      fabricates record #2 with `terminal_state = Cancelled`, plus
+            //      `inferred_orders += 1` and `cancelled_orders += 1`.
+            // => ONE physical order yields TWO completed lifecycles, one Filled and one
+            //    Cancelled, corrupting every completion statistic.
             //
-            // RESOLVED IN: the L-ROUTE commit, which splits this into
-            // `Action::Fill => self.handle_fill(msg)` (unchanged — `F` is the resting-order view,
-            // which is what a lifecycle is about) plus a dedicated `Action::TradeAggregate` arm
-            // returning `None` and incrementing `messages_skipped`. NO wildcard.
-            Action::TradeAggregate | Action::Fill => self.handle_fill(msg),
+            // WHY IT IS NOT FIXED IN THIS COMMIT — and this is a scope judgement, not an
+            // oversight:
+            //   * Unlike `QueuePositionTracker`, this module is NOT a mirror of the book.
+            //     There is no book-vs-lifecycle invariant test, and the measured
+            //     LOB-vs-Queue divergence that FORCED the queue fix into this commit has
+            //     no analogue here.
+            //   * The literal L-ROUTE defect ("F reduces, then C reduces again") does not
+            //     hold arithmetically here: `handle_cancel` SETS `current_size = 0` rather
+            //     than subtracting. The defect is the duplicate RECORD, a related but
+            //     distinct bug.
+            //   * Fixing it properly means moving the terminal transition from `handle_fill`
+            //     to `handle_cancel` and giving the latter a 3-way terminal decision
+            //     (Filled / PartialFillThenCancel / Cancelled). That changes `total_fills`,
+            //     `filled_orders`, `cancelled_orders`, `partial_then_cancelled`,
+            //     `inferred_orders` AND the `LifecycleEvent` stream.
+            //   * `xsec_equity_discovery/extractor` consumes this tracker to build
+            //     `panels_1s/NVDA_1s_granular.csv`, which carries `order_lifetime_dispersion`
+            //     and `queue_depletion_rate` — two of the seven validated forward-variance
+            //     carriers (FINDING-067). Moving those numbers inside a commit whose
+            //     falsifier is `cancel_order_not_found` would make BOTH changes unjudgeable.
+            //
+            // OWED: its own commit, its own pre-registered falsifier (the natural one is
+            // "completed-record count == distinct terminated order_ids"), and a
+            // re-derivation of the two affected carriers.
+            //
+            // ⚠ SEPARATE PRE-EXISTING BUG, found while tracing the above and NOT introduced
+            // here: `handle_cancel` treats EVERY cancel as terminal (`current_size = 0`,
+            // remove from `active`) even when the message is a PARTIAL cancel that leaves
+            // the order resting. That is wrong independently of the carriers.
+            Action::Fill => self.handle_fill(msg),
             Action::Clear | Action::None => {
                 // Clear and None actions don't affect individual order lifecycles
                 self.stats.messages_skipped += 1;

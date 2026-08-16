@@ -33,7 +33,7 @@ use crate::types::{Action, BookConsistency, LobState, MboMessage, Order, Side};
 ///   field, rename a field, change an envelope key).
 /// - MINOR: additive non-breaking changes (e.g., new `LobStats` field).
 /// - PATCH: docs-only changes.
-pub const LOB_STATS_SCHEMA_VERSION: &str = "2.0.0";
+pub const LOB_STATS_SCHEMA_VERSION: &str = "2.1.0";
 
 /// How to handle crossed quotes (bid >= ask) when they occur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -260,6 +260,89 @@ pub struct LobStats {
     /// Number of trades where order was not at expected price level
     pub trade_order_at_level_missing: u64,
 
+    // =========================================================================
+    // CARRIER COUNTERS (L-ROUTE) — the two vendor BOOK NO-OP populations
+    // =========================================================================
+    //
+    // `TradeAggregate` (`b'T'`) and `Fill` (`b'F'`) are DISJOINT vendor
+    // populations and both are documented BOOK NO-OPS. Before L-ROUTE both were
+    // routed into `reduce_or_remove_order`, so a `Fill` reduced the resting
+    // order AND its paired `Cancel` reduced it again — the double-decrement.
+    // They now mutate nothing, and are observed here instead.
+    //
+    // ⚠ The three `trade_*` counters above are consequently WRITTEN BY NOTHING
+    // and must read exactly 0 forever. That is deliberate: they are the
+    // machine-checkable receipt that no carrier enters the reduction path.
+    // `tests/carrier_routing_discriminator.rs::assert_reduction_path_untaken`
+    // asserts precisely that. Do not "revive" them.
+    /// Number of `Action::TradeAggregate` records observed (book no-op).
+    ///
+    /// The vendor's aggregate trade print, whose `side` is the AGGRESSOR's.
+    /// On XNAS.ITCH 100% carry `order_id == 0` and are dropped upstream by
+    /// `is_system_message()`, so this reads 0 there; on ARCX it is non-zero.
+    #[serde(default)]
+    pub aggregate_trades_observed: u64,
+
+    /// Number of `Action::Fill` records observed (book no-op).
+    ///
+    /// A fill against a RESTING order, whose `side` is the resting order's —
+    /// the OPPOSITE convention from [`Self::aggregate_trades_observed`]. The
+    /// book removal is performed by the paired `Cancel`, which follows as the
+    /// literal next record (F→C pairing measured at 1.00000000 over 6 days /
+    /// 1,808,570 records, including inside both auction crosses).
+    #[serde(default)]
+    pub resting_fills_observed: u64,
+
+    /// Number of `Action::Fill` records whose `order_id` was NOT resting.
+    ///
+    /// Every `F` is the vendor ASSERTING that this order was resting at this
+    /// price on this side with at least `size` remaining. L-ROUTE stops the
+    /// `Fill` from mutating the book but keeps the lookup as a CONFORMANCE
+    /// CHECK, so that assertion is still verified ~300,000×/day on every venue
+    /// rather than discarded. This counter is the check FAILING: the vendor
+    /// referenced an order the reconstructed book does not have.
+    ///
+    /// It inherits the signal formerly carried by
+    /// [`Self::trade_order_not_found`] (18,061 on XNAS NVDA 2025-07-01), which
+    /// is why that counter going to 0 is not a loss of information.
+    #[serde(default)]
+    pub fill_referenced_unknown_order: u64,
+
+    /// Number of `Action::Fill` records where the vendor asserted more size
+    /// than the reconstructed book has resting for that order.
+    ///
+    /// A stronger conformance signal than [`Self::fill_referenced_unknown_order`]:
+    /// the order WAS found, so the book and the vendor disagree about its
+    /// remaining quantity. Non-zero means the book is too thin at that order.
+    #[serde(default)]
+    pub fill_size_exceeded_resting: u64,
+
+    /// Number of `Action::Fill` records whose SIDE disagreed with the resting
+    /// order the book holds under that `order_id`.
+    ///
+    /// ⚠ THIS ONE IS AN ALARM. `F`'s `side` is the resting order's, so a
+    /// disagreement means either the book has the order on the wrong side or
+    /// the `T`/`F` side conventions have been re-merged. Expected: exactly 0.
+    /// (Measured 0 on XNAS NVDA 2025-07-01 and 2025-07-02.)
+    #[serde(default)]
+    pub fill_side_mismatch: u64,
+
+    /// Number of `Action::Fill` records whose PRICE differed from the resting
+    /// order's price.
+    ///
+    /// ⚠ THIS ONE IS NOT AN ALARM — it is EXPECTED to be non-zero. A fill's
+    /// price is the EXECUTION price, which legitimately differs from the
+    /// resting order's DISPLAY price (hidden/price-improved executions; on
+    /// ITCH this is the distinct "Order Executed With Price" message). It is
+    /// counted separately from [`Self::fill_side_mismatch`] precisely so a
+    /// benign ~3%/day rate cannot drown out a side disagreement, which is a
+    /// real defect signature.
+    ///
+    /// Measured on XNAS NVDA: 9,119 of 307,584 fills (2.96%) on 2025-07-01;
+    /// 8,636 of 248,694 (3.47%) on 2025-07-02.
+    #[serde(default)]
+    pub fill_price_differs_from_resting: u64,
+
     /// Number of `modify_order` operations where the `order_id` was NOT found
     /// in the active orders map.
     ///
@@ -325,7 +408,7 @@ impl LobStats {
     /// rename to `path`. Eliminates the SIGKILL-mid-write partial-file risk
     /// of the pre-M.A.5 `BufWriter + serde_json::to_writer_pretty` path.
     ///
-    /// **Envelope wrapper**: output JSON is `{ "schema_version": "2.0.0",
+    /// **Envelope wrapper**: output JSON is `{ "schema_version": "2.1.0",
     /// "stats": {...} }`. The `schema_version` field is the
     /// [`LOB_STATS_SCHEMA_VERSION`] constant. **Breaking change** for the
     /// on-disk format; pre-M.A.5 flat-shape files cannot round-trip through
@@ -402,7 +485,7 @@ impl LobStats {
     /// Load stats from a JSON file (dual-format aware).
     ///
     /// Phase M M.A.5 (REV 3 boundary discipline cycle): accepts BOTH:
-    /// - **Envelope shape** (post-M.A.5): `{ "schema_version": "2.0.0",
+    /// - **Envelope shape** (post-M.A.5): `{ "schema_version": "2.1.0",
     ///   "stats": {...} }` — preferred.
     /// - **Legacy flat shape** (pre-M.A.5): `{messages_processed: ..., ...}`
     ///   without an envelope. Emits a `log::warn!` (per call) so operators
@@ -501,7 +584,7 @@ impl LobStats {
 #[derive(Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct LobStatsExportEnvelope {
-    /// Schema version string (e.g., `"2.0.0"`).
+    /// Schema version string (e.g., `"2.1.0"`).
     pub schema_version: String,
 
     /// The wrapped [`LobStats`] payload.
@@ -528,14 +611,22 @@ struct LobStatsExportEnvelopeRef<'a> {
 
 /// The type of order reduction operation being performed.
 ///
-/// Both cancel and trade operations follow the same 3-stage lookup
-/// (order → price level → order at level) with identical partial/full
-/// removal logic. This enum selects the appropriate stat counters
-/// and log prefixes for each operation type.
+/// ⚠ THIS ENUM HAS EXACTLY ONE VARIANT, AND THAT IS THE POINT.
+///
+/// It used to carry a `Trade` variant as well, because `TradeAggregate`/`Fill`
+/// were routed into [`LobReconstructor::reduce_or_remove_order`] alongside
+/// `Cancel`. L-ROUTE removed that: both carriers are vendor BOOK NO-OPS, so
+/// **`Cancel` is now the only action that reduces a resting order**. Deleting
+/// the `Trade` variant is what forced the compiler to name every site that
+/// assumed otherwise.
+///
+/// It is kept as an enum rather than being inlined so the 3-stage lookup keeps
+/// its named operation in log output, and so a future genuinely-reducing action
+/// (an exchange-initiated bust, say) is added as a variant here — which again
+/// makes the compiler enumerate every counter that needs a sibling.
 #[derive(Debug, Clone, Copy)]
 enum OrderReductionOp {
     Cancel,
-    Trade,
 }
 
 impl OrderReductionOp {
@@ -543,7 +634,6 @@ impl OrderReductionOp {
     const fn label(self) -> &'static str {
         match self {
             Self::Cancel => "Cancel",
-            Self::Trade => "Trade",
         }
     }
 }
@@ -791,21 +881,88 @@ impl LobReconstructor {
         self.reduce_or_remove_order(msg, OrderReductionOp::Cancel)
     }
 
-    /// Process a trade (execution).
+    /// Observe an `Action::Fill` — a vendor BOOK NO-OP that is also a free,
+    /// continuous conformance oracle.
     ///
-    /// Trade reduces order size or removes it completely.
-    /// Uses soft error handling - anomalies are tracked in stats but don't fail.
+    /// # Why this is a check and not a deletion
+    ///
+    /// `F` is the vendor ASSERTING a fact about the book: *order `order_id`, on
+    /// side S, at price P, had at least `size` resting at this instant.* L-ROUTE
+    /// stops that assertion from MUTATING the book (the paired `Cancel`, which
+    /// follows as the literal next record, performs the removal). Simply
+    /// deleting the lookup would also throw the assertion away — 18,061 events
+    /// on XNAS NVDA 2025-07-01 alone, ~300,000/day across venues.
+    ///
+    /// So the lookup is RETAINED and REPOINTED: it verifies, counts
+    /// disagreements, and touches nothing. This is the only conformance signal
+    /// in the crate that runs on **every venue and every day**, including ARCX
+    /// where no vendor MBP-10 exists for most dates and where the `Modify` path
+    /// has never been independently graded.
+    ///
+    /// # Counters
+    /// * [`LobStats::fill_referenced_unknown_order`] — order not resting at all
+    /// * [`LobStats::fill_side_mismatch`] — the RESTING side disagrees. A defect
+    ///   signature; must be 0.
+    /// * [`LobStats::fill_price_differs_from_resting`] — the execution price
+    ///   differs from the resting DISPLAY price. Benign at a few percent.
+    /// * [`LobStats::fill_size_exceeded_resting`] — vendor claims more than we hold
+    ///
+    /// ⚠ SIDE and PRICE are two counters, not one. They were briefly written up
+    /// as a single `fill_attribute_mismatch`; merging a must-be-0 defect signal
+    /// with an expected-nonzero benign one would let the benign rate hide the
+    /// defect. See the comment on the two `if`s below.
+    ///
+    /// ⚠ It must NEVER write the `trade_*` counters. Those are required to stay
+    /// exactly 0 as the receipt that no carrier enters
+    /// [`Self::reduce_or_remove_order`]; see
+    /// `tests/carrier_routing_discriminator.rs::assert_reduction_path_untaken`.
     #[inline]
-    fn process_trade(&mut self, msg: &MboMessage) -> Result<()> {
-        self.reduce_or_remove_order(msg, OrderReductionOp::Trade)
+    fn observe_resting_fill(&mut self, msg: &MboMessage) {
+        self.stats.resting_fills_observed += 1;
+
+        let Some(order) = self.orders.get(&msg.order_id) else {
+            // The vendor referenced an order the reconstructed book does not
+            // hold. Inherits the signal formerly carried by
+            // `trade_order_not_found`.
+            self.stats.fill_referenced_unknown_order += 1;
+            return;
+        };
+
+        // `msg.side` on an `F` is the RESTING order's side (the opposite
+        // convention from `TradeAggregate`), so it is directly comparable to
+        // the stored order's side. Some venues publish `Side::None` on fills;
+        // that is an absence of information, not a disagreement.
+        //
+        // ⚠ SIDE and PRICE are counted SEPARATELY and are not the same kind of
+        // event. A side disagreement is a defect signature and must be 0. A
+        // price difference is EXPECTED at a few percent, because a fill's price
+        // is the EXECUTION price and may legitimately differ from the resting
+        // order's DISPLAY price. Merging them would let a benign ~3% rate hide
+        // a real wrong-side bug.
+        if msg.side != Side::None && msg.side != order.side {
+            self.stats.fill_side_mismatch += 1;
+        }
+        if msg.price != order.price {
+            self.stats.fill_price_differs_from_resting += 1;
+        }
+
+        if msg.size > order.size {
+            self.stats.fill_size_exceeded_resting += 1;
+        }
     }
 
     /// Unified order reduction: look up order, reduce or remove from book.
     ///
-    /// Both cancel and trade follow the same 3-stage lookup with identical
-    /// partial/full removal logic. Only stat counters and log prefixes differ,
-    /// selected by `op`. This eliminates the ~90% code duplication that was
-    /// the root cause of bugs #2 and #3 (fix applied to one path but not the other).
+    /// ⚠ POST-L-ROUTE, `Cancel` IS THE ONLY CALLER. `TradeAggregate` and `Fill`
+    /// are vendor book no-ops and no longer reach this function; that is what
+    /// drove `cancel_order_not_found` from 261,386 to 0 on XNAS NVDA
+    /// 2025-07-01 (the paired `Cancel` can now find the order the `Fill` used
+    /// to have already removed).
+    ///
+    /// The 3-stage lookup with identical partial/full removal logic is retained
+    /// as-is; `op` still selects stat counters and log prefixes so that adding
+    /// a future genuinely-reducing action makes the compiler enumerate every
+    /// counter that needs a sibling.
     ///
     /// # Stages
     /// 1. Order lookup in `self.orders` → not found: increment stat, return Ok
@@ -822,7 +979,6 @@ impl LobReconstructor {
                 // late message, aggressor side trades, etc.)
                 match op {
                     OrderReductionOp::Cancel => self.stats.cancel_order_not_found += 1,
-                    OrderReductionOp::Trade => self.stats.trade_order_not_found += 1,
                 }
                 if self.config.log_warnings {
                     log::debug!(
@@ -851,7 +1007,6 @@ impl LobReconstructor {
                 // Clean up the orphaned order tracking and continue
                 match op {
                     OrderReductionOp::Cancel => self.stats.cancel_price_level_missing += 1,
-                    OrderReductionOp::Trade => self.stats.trade_price_level_missing += 1,
                 }
                 self.orders.remove(&msg.order_id);
                 if self.config.log_warnings {
@@ -875,7 +1030,6 @@ impl LobReconstructor {
                 // Clean up the orphaned order tracking and continue
                 match op {
                     OrderReductionOp::Cancel => self.stats.cancel_order_at_level_missing += 1,
-                    OrderReductionOp::Trade => self.stats.trade_order_at_level_missing += 1,
                 }
                 self.orders.remove(&msg.order_id);
                 if self.config.log_warnings {
@@ -1214,39 +1368,46 @@ impl LobReconstructor {
             Action::Add => self.add_order(msg)?,
             Action::Modify => self.modify_order(msg)?,
             Action::Cancel => self.cancel_order(msg)?,
-            // ⚠⚠ KNOWINGLY TEMPORARY — THIS ARM STILL MERGES THE TWO CARRIERS. ⚠⚠
+
+            // =================================================================
+            // L-ROUTE: THE TWO CARRIERS ARE BOOK NO-OPS. NO WILDCARD ARM.
+            // =================================================================
             //
-            // The L-DECODE layer has split `b'T'`/`b'F'` into `TradeAggregate`/`Fill`, so the
-            // EMITTED ACTION BYTE is now correct. This arm is a MECHANICAL RENAME of the old
-            // `Action::Trade | Action::Fill` and is deliberately behaviour-preserving: both
-            // carriers still reach `process_trade`, so the reconstructed book is byte-for-byte
-            // identical to the pre-split book and every reconstruction counter is unchanged.
+            // `TradeAggregate` (`b'T'`) and `Fill` (`b'F'`) are DISJOINT vendor populations
+            // with OPPOSITE `side` conventions (`T`.side = the aggressor's; `F`.side = the
+            // resting order's), and the vendor defines BOTH as book no-ops. They were merged
+            // at the decoder (`b'T' | b'F' => Action::Trade`) and then routed together into
+            // `process_trade`, so a `Fill` reduced the resting order AND the venue's own
+            // paired `Cancel` reduced it again — the double-decrement.
             //
-            // That is the design of this commit, not an oversight. Do NOT read the presence of
-            // `TradeAggregate` here as evidence the routing fix has landed.
+            // VENDOR EVIDENCE (ARCX MBP-10, measured 2026-08-16):
+            //   * F→C pairing 356,515/356,515 on 2025-02-03 — every `F` is immediately
+            //     followed by a `C` with the SAME order_id AND the SAME size. Zero unpaired.
+            //     Holds at 1.00000000 over 6 days / 1,808,570 records, INCLUDING inside both
+            //     auction crosses, so no auction carve-out is required.
+            //   * Publication rate MBO → vendor MBP-10: `A` 75.90%, `C` 75.94%, `T` 100.00%,
+            //     but `F` **0.0199%** (37 of 185,706). A record that reduced a resting order
+            //     the way `C` does would publish at ~76%; `F` publishes ~3,800× less, because
+            //     the vendor carries the book change on the paired `C`.
+            //   * Two independent vendor replays with DIFFERENT join strategies both found
+            //     F-as-no-op strictly dominant with ZERO counterexamples (6,251,118
+            //     comparisons); the shipped book's error is one-sided too-thin, 191,823/191,823.
             //
-            // WHY THE MERGE IS HARMLESS TODAY — AND WHERE THAT STOPS. It is DORMANT, not benign:
-            // on XNAS.ITCH 100% of `TradeAggregate` carries `order_id == 0`, so
-            // `Pipeline::process_messages`'s `is_system_message()` filter drops the entire `T`
-            // population upstream and only ex-`F` ever reaches this arm. Measured 2025-07-01:
-            // `messages_processed` 8,939,187 = 9,314,830 − 375,643, and
-            // `system_messages_skipped` = 375,643 = the whole `T` population.
-            // ⚠ THAT DORMANCY IS VENUE-SPECIFIC. On ARCX 19.8% of `T` carries `order_id != 0`
-            // (88,024 records on 2025-02-03) and is filtered by the `side == Side::None` guard
-            // instead — a different mechanism with the same outcome today. This commit's
-            // acceptance evidence is XNAS.ITCH/NVDA only (2025-07-01, 2025-07-02); ARCX under
-            // COMMIT 1 is UNMEASURED. Waking either guard before L-ROUTE lands makes this arm
-            // live and the merge real.
+            // THE FALSIFIER THIS ARM EXISTS TO SATISFY: `cancel_order_not_found`
+            // 261,386 → 0 (2025-07-01) and 207,959 → 0 (2025-07-02). Its code path SURVIVES
+            // this commit — `Action::Cancel` still calls `reduce_or_remove_order` and its miss
+            // branch is still live — so reaching 0 is a real measurement, not a removal.
             //
-            // RESOLVED IN: the L-ROUTE commit, which replaces this with SEVEN exhaustive arms —
-            // `TradeAggregate` and `Fill` each a BOOK NO-OP incrementing only its own carrier
-            // counter — and deletes `process_trade` (which becomes callerless, and whose
-            // resulting `dead_code` red under `clippy -D warnings` IS the receipt that the split
-            // landed). Both vendor record types are documented book no-ops; the removal is
-            // performed by the paired `Cancel`.
-            //
-            // ⛔ A branch merged between this commit and that one ships the merge under a new name.
-            Action::TradeAggregate | Action::Fill => self.process_trade(msg)?,
+            // ⚠ `Fill` is a CHECK, not a deletion. Deleting the lookup outright would make
+            // the vendor's assertion unobservable and discard ~300,000 conformance events/day.
+            // `observe_resting_fill` verifies it and mutates nothing.
+            Action::TradeAggregate => {
+                // The aggressor-side print. Carries `order_id == 0` on XNAS.ITCH (100%,
+                // 375,643/375,643 on 2025-07-01) so L-ADMIT drops it upstream there; on ARCX
+                // 19.8% carries `order_id != 0` and DOES reach this arm. Either way: no-op.
+                self.stats.aggregate_trades_observed += 1;
+            }
+            Action::Fill => self.observe_resting_fill(msg),
             Action::Clear => {
                 self.stats.book_clears += 1;
                 if self.config.log_warnings {
@@ -1958,12 +2119,35 @@ mod tests {
         let add = create_test_message(1, Action::Add, Side::Bid, 100.0, 100);
         lob.process_message(&add).unwrap();
 
-        // Partial fill (50 shares)
+        // Partial fill (50 shares) — a vendor BOOK NO-OP.
         let trade = create_test_message(1, Action::Fill, Side::Bid, 100.0, 50);
         let state = lob.process_message(&trade).unwrap();
 
-        assert_eq!(lob.order_count(), 1); // Order still exists
-        assert_eq!(state.bid_sizes[0], 50); // Reduced size
+        assert_eq!(lob.order_count(), 1, "a Fill must not remove the resting order");
+        assert_eq!(
+            state.bid_sizes[0], 100,
+            "Action::Fill is a BOOK NO-OP; the paired Cancel performs the reduction"
+        );
+        assert_eq!(lob.stats().resting_fills_observed, 1);
+        assert_eq!(
+            lob.stats().trade_order_not_found,
+            0,
+            "a Fill must never enter reduce_or_remove_order"
+        );
+
+        // ...and now the PAIRED CANCEL, which is what actually reduces the book.
+        // Asserting the no-op alone would also be satisfied by a router that
+        // simply dropped Fill on the floor; running the real vendor F->C pair is
+        // what proves the level is reduced EXACTLY ONCE rather than twice (the
+        // double-decrement) or not at all.
+        let cancel = create_test_message(1, Action::Cancel, Side::Bid, 100.0, 50);
+        let state = lob.process_message(&cancel).unwrap();
+
+        assert_eq!(lob.order_count(), 1);
+        assert_eq!(
+            state.bid_sizes[0], 50,
+            "the F->C pair must reduce 100 -> 50 exactly once (pre-L-ROUTE this was 0)"
+        );
     }
 
     #[test]
@@ -1974,12 +2158,32 @@ mod tests {
         let add = create_test_message(1, Action::Add, Side::Bid, 100.0, 100);
         lob.process_message(&add).unwrap();
 
-        // Full fill
+        // Full fill — still a vendor BOOK NO-OP.
         let trade = create_test_message(1, Action::Fill, Side::Bid, 100.0, 100);
         lob.process_message(&trade).unwrap();
 
-        assert_eq!(lob.order_count(), 0); // Order removed
-        assert_eq!(lob.bid_levels(), 0); // Price level removed
+        assert_eq!(lob.order_count(), 1, "a Fill must not remove the resting order");
+        assert_eq!(
+            lob.bid_levels(),
+            1,
+            "the price level survives until the paired Cancel"
+        );
+        assert_eq!(lob.stats().resting_fills_observed, 1);
+        assert_eq!(lob.stats().trade_order_not_found, 0);
+
+        // The paired Cancel is what removes it.
+        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 100))
+            .unwrap();
+
+        assert_eq!(lob.order_count(), 0, "the paired Cancel removes the order");
+        assert_eq!(lob.bid_levels(), 0, "and collapses the empty price level");
+        assert_eq!(
+            lob.stats().cancel_order_not_found,
+            0,
+            "THE FALSIFIER, in miniature: pre-L-ROUTE the Fill had already removed \
+             the order, so this Cancel missed and incremented this counter. That is \
+             the mechanism behind 261,386 -> 0 on XNAS NVDA 2025-07-01."
+        );
     }
 
     #[test]
@@ -2416,46 +2620,81 @@ mod tests {
 
     #[test]
     fn test_partial_trade_size_reduction() {
-        // Test that partial trade (fill) correctly reduces order size
+        // Successive partial fills are BOOK NO-OPS; only their paired Cancels
+        // move the level. This is the test that most directly encodes the
+        // double-decrement: pre-L-ROUTE, F(25)+C(25) took the level 100 -> 50,
+        // losing 50 for a 25-share execution.
         let mut lob = LobReconstructor::new(10);
 
         // Add order with 100 shares
         lob.process_message(&create_test_message(1, Action::Add, Side::Ask, 100.0, 100))
             .unwrap();
 
-        // Partial fill of 25 shares
+        // Partial fill of 25 shares — no-op.
         lob.process_message(&create_test_message(1, Action::Fill, Side::Ask, 100.0, 25))
             .unwrap();
 
-        // Order should have 75 shares remaining
         assert_eq!(lob.order_count(), 1);
-        assert_eq!(lob.get_lob_state().ask_sizes[0], 75);
+        assert_eq!(
+            lob.get_lob_state().ask_sizes[0],
+            100,
+            "neither Fill reduces the level; both are book no-ops"
+        );
 
-        // Partial fill of 50 more shares
+        // Partial fill of 50 more shares — also a no-op.
         lob.process_message(&create_test_message(1, Action::Fill, Side::Ask, 100.0, 50))
             .unwrap();
 
-        // Order should have 25 shares remaining
         assert_eq!(lob.order_count(), 1);
-        assert_eq!(lob.get_lob_state().ask_sizes[0], 25);
+        assert_eq!(lob.get_lob_state().ask_sizes[0], 100);
+        assert_eq!(lob.stats().resting_fills_observed, 2);
+
+        // Now the two paired Cancels, in vendor order. Each reduces EXACTLY the
+        // size its Fill announced: 100 -> 75 -> 25.
+        lob.process_message(&create_test_message(1, Action::Cancel, Side::Ask, 100.0, 25))
+            .unwrap();
+        assert_eq!(lob.get_lob_state().ask_sizes[0], 75, "first pair: 100 -> 75");
+
+        lob.process_message(&create_test_message(1, Action::Cancel, Side::Ask, 100.0, 50))
+            .unwrap();
+        assert_eq!(lob.get_lob_state().ask_sizes[0], 25, "second pair: 75 -> 25");
+
+        assert_eq!(lob.order_count(), 1);
+        assert_eq!(lob.stats().cancel_order_not_found, 0);
     }
 
     #[test]
     fn test_over_trade_removes_order() {
-        // Test that trading more than order size removes the order cleanly
-        // (analogous to test_over_cancel_removes_order)
+        // An OVER-SIZED fill (vendor claims more than we hold) is still a book
+        // no-op. Post-L-ROUTE the book never has to reason about this shape at
+        // all — but the Fill oracle DOES see it, and that is the point: the
+        // disagreement is now reported instead of silently absorbed by a
+        // saturating removal.
         let mut lob = LobReconstructor::new(10);
 
         // Add order with 50 shares
         lob.process_message(&create_test_message(1, Action::Add, Side::Ask, 100.0, 50))
             .unwrap();
 
-        // Trade more than exists (100 > 50) - should remove entirely
+        // Vendor asserts a 100-share fill against a 50-share resting order.
         lob.process_message(&create_test_message(1, Action::Fill, Side::Ask, 100.0, 100))
             .unwrap();
 
-        assert_eq!(lob.order_count(), 0);
-        assert_eq!(lob.ask_levels(), 0);
+        assert_eq!(lob.order_count(), 1, "an over-sized Fill is still a book no-op");
+        assert_eq!(lob.ask_levels(), 1);
+        assert_eq!(
+            lob.get_lob_state().ask_sizes[0],
+            50,
+            "the resting size is unchanged"
+        );
+        assert_eq!(
+            lob.stats().fill_size_exceeded_resting,
+            1,
+            "the oracle must REPORT that the vendor claimed more size than the book \
+             holds — this is the conformance signal that the old saturating removal \
+             threw away. Measured 0/307,584 on XNAS NVDA 2025-07-01."
+        );
+        assert_eq!(lob.stats().trade_order_not_found, 0);
     }
 
     // =========================================================================
@@ -2778,7 +3017,22 @@ mod tests {
         ));
 
         assert!(result.is_ok());
-        assert_eq!(lob.stats().trade_order_not_found, 1);
+        assert_eq!(
+            lob.stats().trade_order_not_found,
+            0,
+            "a Fill never enters reduce_or_remove_order, so it can never 'miss' there"
+        );
+
+        // The observation is not lost — it is REPOINTED. This is the counter
+        // that inherits the signal, and it is the whole reason L-ROUTE keeps
+        // the lookup as a CHECK instead of deleting it.
+        assert_eq!(lob.stats().resting_fills_observed, 1);
+        assert_eq!(
+            lob.stats().fill_referenced_unknown_order,
+            1,
+            "the vendor asserted a resting order the book does not hold; the Fill \
+             oracle must REPORT that rather than silently doing nothing"
+        );
     }
 
     #[test]
@@ -2806,8 +3060,22 @@ mod tests {
         lob.process_message(&create_test_message(3, Action::Fill, Side::Bid, 100.0, 50))
             .unwrap();
 
-        assert_eq!(lob.stats().cancel_order_not_found, 2);
-        assert_eq!(lob.stats().trade_order_not_found, 1);
+        assert_eq!(
+            lob.stats().cancel_order_not_found,
+            2,
+            "Cancel is untouched by L-ROUTE — this half must NOT move. A red here \
+             would mean the commit was too broad."
+        );
+        assert_eq!(
+            lob.stats().trade_order_not_found,
+            0,
+            "the Fill never reaches the reduction path"
+        );
+        assert_eq!(
+            lob.stats().fill_referenced_unknown_order,
+            1,
+            "...and is accounted for on the carrier's own counter instead"
+        );
     }
 
     // =========================================================================
@@ -2966,11 +3234,16 @@ mod tests {
         assert_eq!(lob.get_lob_state().bid_sizes[0], 470);
 
         // Trade on order 2: remove 50 (total: 420)
+        // Fill on order 2 — a BOOK NO-OP, so the cached total does NOT move.
         lob.process_message(&create_test_message(2, Action::Fill, Side::Bid, 100.0, 50))
             .unwrap();
-        assert_eq!(lob.get_lob_state().bid_sizes[0], 420);
+        assert_eq!(
+            lob.get_lob_state().bid_sizes[0],
+            470,
+            "a Fill does not touch the cached level total"
+        );
 
-        // Full cancel order 3 (total: 320)
+        // Full cancel order 3 (total: 370)
         lob.process_message(&create_test_message(
             3,
             Action::Cancel,
@@ -2979,24 +3252,37 @@ mod tests {
             100,
         ))
         .unwrap();
-        assert_eq!(lob.get_lob_state().bid_sizes[0], 320);
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 370);
 
-        // Add new order at same price (total: 520)
+        // Add new order at same price (total: 570)
         lob.process_message(&create_test_message(6, Action::Add, Side::Bid, 100.0, 200))
             .unwrap();
-        assert_eq!(lob.get_lob_state().bid_sizes[0], 520);
+        assert_eq!(lob.get_lob_state().bid_sizes[0], 570);
 
-        // Full trade on order 4 (total: 420)
+        // Fill on order 4 — also a no-op.
         lob.process_message(&create_test_message(4, Action::Fill, Side::Bid, 100.0, 100))
             .unwrap();
-        assert_eq!(lob.get_lob_state().bid_sizes[0], 420);
+        assert_eq!(
+            lob.get_lob_state().bid_sizes[0],
+            570,
+            "the Fill on order 4 is a no-op"
+        );
 
-        // Verify remaining orders: 1 (70), 2 (50), 5 (100), 6 (200) = 420
-        assert_eq!(lob.order_count(), 4);
+        // Remaining: 1 (70), 2 (100), 4 (100), 5 (100), 6 (200) = 570.
+        // Only the two Cancels moved the total: 500 -> 470 -> 370 -> 570.
+        assert_eq!(lob.order_count(), 5);
         assert_eq!(lob.bid_levels(), 1);
+        assert_eq!(lob.stats().resting_fills_observed, 2);
 
-        // Verify order 1 has 70, order 2 has 50
-        // (This tests that partial operations didn't corrupt individual order sizes)
+        // This fixture's enduring value is the CACHE INVARIANT: after an
+        // interleaved Cancel/Fill/Add sequence the O(1) cached `total_size` must
+        // still equal the sum of the individual order sizes it caches. Assert
+        // that directly rather than trusting the running total above.
+        assert_eq!(
+            lob.get_lob_state().bid_sizes[0],
+            70 + 100 + 100 + 100 + 200,
+            "PriceLevel's cached total must equal the sum of its member orders"
+        );
     }
 
     /// Performance benchmark for LOB reconstruction with PriceLevel caching.
@@ -3130,6 +3416,16 @@ mod tests {
             trade_order_not_found: 20,
             trade_price_level_missing: 5,
             trade_order_at_level_missing: 2,
+            // L-ROUTE carrier + Fill-oracle counters. Deliberately given
+            // DISTINCT non-zero values (not `..default()`) so the round-trip
+            // actually exercises their serde contract instead of proving only
+            // that zero survives zero.
+            aggregate_trades_observed: 31,
+            resting_fills_observed: 32,
+            fill_referenced_unknown_order: 33,
+            fill_size_exceeded_resting: 34,
+            fill_side_mismatch: 35,
+            fill_price_differs_from_resting: 36,
             modify_order_not_found: 8,
             add_order_id_collision: 6,
             book_clears: 1,
@@ -3157,6 +3453,15 @@ mod tests {
         assert_eq!(loaded.trade_order_not_found, 20);
         assert_eq!(loaded.trade_price_level_missing, 5);
         assert_eq!(loaded.trade_order_at_level_missing, 2);
+        // L-ROUTE counters must survive the envelope round-trip with their own
+        // distinct values — a `#[serde(default)]` field that silently
+        // deserialises to 0 would be indistinguishable from "never observed".
+        assert_eq!(loaded.aggregate_trades_observed, 31);
+        assert_eq!(loaded.resting_fills_observed, 32);
+        assert_eq!(loaded.fill_referenced_unknown_order, 33);
+        assert_eq!(loaded.fill_size_exceeded_resting, 34);
+        assert_eq!(loaded.fill_side_mismatch, 35);
+        assert_eq!(loaded.fill_price_differs_from_resting, 36);
         assert_eq!(loaded.modify_order_not_found, 8);
         assert_eq!(loaded.add_order_id_collision, 6);
         assert_eq!(loaded.book_clears, 1);
@@ -3356,7 +3661,7 @@ mod tests {
         // `#[serde(untagged)]` would parse as `Legacy(LobStats)` with
         // schema_version silently dropped via serde-default.
         let malformed_json = r#"{
-            "schema_version": "2.0.0",
+            "schema_version": "2.1.0",
             "messages_processed": 99,
             "system_messages_skipped": 0,
             "active_orders": 0,

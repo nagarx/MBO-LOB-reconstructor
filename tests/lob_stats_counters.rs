@@ -66,6 +66,145 @@ fn test_add_order_id_collision_increments_on_silent_fall_through() {
     );
 }
 
+/// BEHAVIOURAL POSITIVE CONTROL for the Fill oracle's `fill_side_mismatch`
+/// alarm channel.
+///
+/// # Why this test had to exist
+///
+/// `fill_side_mismatch` has exactly ONE producer (`observe_resting_fill` in
+/// `src/lob/reconstructor.rs`). Before this test its ONLY assertions were a
+/// serde round-trip over a hand-written `LobStats` struct literal — which never
+/// calls the producer. So **nothing exercised it**, and an adversary proved the
+/// consequence: prefixing the producer's condition with `if false &&` left the
+/// whole suite GREEN and every live-data counter BIT-IDENTICAL. Compounded with
+/// a consistent bid/ask inversion, the entire acceptance channel matched the
+/// correct fix on all nine counters, both days, **with the book mirrored**.
+///
+/// That is absence indistinguishable from agreement — exactly what hft-rules §1
+/// forbids — sitting inside this commit's own new oracle.
+///
+/// # Why all four arms are load-bearing
+///
+/// * POSITIVE — a genuine side disagreement must increment by EXACTLY 1.
+/// * NEGATIVE — a matching side must NOT increment, so the test cannot be
+///   satisfied by a counter that simply always fires.
+/// * `Side::None` — must NOT increment. Venues publish `N` on fills; that is an
+///   absence of information, not a disagreement. This arm pins the
+///   `msg.side != Side::None &&` half of the predicate, which a "simplifying"
+///   edit would otherwise silently delete.
+/// * `resting_fills_observed` is asserted in every arm. Without it, a `Fill`
+///   that never reached the oracle at all would read as a clean zero — the same
+///   absence-vs-agreement confusion one level up.
+#[test]
+fn test_fill_side_mismatch_increments_only_on_a_real_side_disagreement() {
+    // ---- POSITIVE: resting BID, vendor asserts the fill was on the ASK. ----
+    let mut lob = LobReconstructor::new(10);
+    lob.process_message(&msg(1001, Action::Add, Side::Bid, 100.00, 500))
+        .expect("seed add must succeed");
+    lob.process_message(&msg(1001, Action::Fill, Side::Ask, 100.00, 50))
+        .expect("a Fill must never error");
+
+    let st = lob.stats();
+    assert_eq!(
+        st.resting_fills_observed, 1,
+        "the oracle must have RUN; a zero here would make the mismatch assertion \
+         below vacuous for the wrong reason"
+    );
+    assert_eq!(
+        st.fill_side_mismatch, 1,
+        "order 1001 rests on the BID and the vendor's Fill claims the ASK — that \
+         is a side disagreement and must be counted exactly once"
+    );
+    assert_eq!(
+        st.fill_price_differs_from_resting, 0,
+        "SEPARATION: the price MATCHED here. Side and price are two counters \
+         precisely so a benign price-difference rate (expected at a few percent, \
+         because a fill's EXECUTION price may differ from the resting DISPLAY \
+         price) cannot mask a must-be-zero wrong-side defect. A non-zero here \
+         means the two were merged."
+    );
+    assert_eq!(
+        st.fill_referenced_unknown_order, 0,
+        "the order WAS resting; this is a side disagreement, not a lookup miss"
+    );
+
+    // ---- NEGATIVE: same book, matching side. Must NOT increment. ----
+    let mut lob = LobReconstructor::new(10);
+    lob.process_message(&msg(1001, Action::Add, Side::Bid, 100.00, 500))
+        .expect("seed add must succeed");
+    lob.process_message(&msg(1001, Action::Fill, Side::Bid, 100.00, 50))
+        .expect("a Fill must never error");
+
+    let st = lob.stats();
+    assert_eq!(st.resting_fills_observed, 1, "the oracle must have RUN");
+    assert_eq!(
+        st.fill_side_mismatch, 0,
+        "the sides AGREE, so the alarm must stay silent. If this fires, the \
+         counter is unconditional and the positive arm above proves nothing."
+    );
+
+    // ---- Side::None: an absence of information, NOT a disagreement. ----
+    let mut lob = LobReconstructor::new(10);
+    lob.process_message(&msg(1001, Action::Add, Side::Bid, 100.00, 500))
+        .expect("seed add must succeed");
+    lob.process_message(&msg(1001, Action::Fill, Side::None, 100.00, 50))
+        .expect("a Fill must never error");
+
+    let st = lob.stats();
+    assert_eq!(st.resting_fills_observed, 1, "the oracle must have RUN");
+    assert_eq!(
+        st.fill_side_mismatch, 0,
+        "`Side::None` on a fill is an absence of information, not a \
+         disagreement. Dropping the `msg.side != Side::None` guard would turn \
+         every N-sided venue's fill population into a false alarm."
+    );
+}
+
+/// BEHAVIOURAL POSITIVE CONTROL for `fill_price_differs_from_resting`.
+///
+/// Sibling of the side-mismatch control above, and added for the SAME measured
+/// reason: this counter also had exactly one producer and no assertion that
+/// ever called it — only the serde round-trip. It is the benign half of the
+/// pair, so its failure mode is the mirror image: if it silently stopped
+/// counting, the *expected* few-percent signal would read as a suspiciously
+/// perfect zero and be mistaken for conformance.
+#[test]
+fn test_fill_price_differs_from_resting_increments_only_on_a_real_price_difference() {
+    // POSITIVE: side matches, execution price differs from the resting display price.
+    let mut lob = LobReconstructor::new(10);
+    lob.process_message(&msg(2002, Action::Add, Side::Ask, 100.05, 300))
+        .expect("seed add must succeed");
+    lob.process_message(&msg(2002, Action::Fill, Side::Ask, 100.06, 50))
+        .expect("a Fill must never error");
+
+    let st = lob.stats();
+    assert_eq!(st.resting_fills_observed, 1, "the oracle must have RUN");
+    assert_eq!(
+        st.fill_price_differs_from_resting, 1,
+        "the fill executed at $100.06 against an order resting at $100.05"
+    );
+    assert_eq!(
+        st.fill_side_mismatch, 0,
+        "SEPARATION: the side MATCHED. A non-zero here means a price difference \
+         is leaking into the must-be-zero side-defect channel."
+    );
+
+    // NEGATIVE: identical price must NOT increment.
+    let mut lob = LobReconstructor::new(10);
+    lob.process_message(&msg(2002, Action::Add, Side::Ask, 100.05, 300))
+        .expect("seed add must succeed");
+    lob.process_message(&msg(2002, Action::Fill, Side::Ask, 100.05, 50))
+        .expect("a Fill must never error");
+
+    let st = lob.stats();
+    assert_eq!(st.resting_fills_observed, 1, "the oracle must have RUN");
+    assert_eq!(
+        st.fill_price_differs_from_resting, 0,
+        "the prices AGREE, so the counter must stay silent. If this fires, the \
+         counter is unconditional and the positive arm above proves nothing."
+    );
+}
+
 #[test]
 fn test_lobstats_default_initializes_all_counters_to_zero() {
     // Phase M M.A.4 + M.A.7: locks the field surface against silent
@@ -135,12 +274,29 @@ fn test_lobstats_export_envelope_round_trip() {
 
 #[test]
 fn test_lobstats_schema_version_constant_is_pinned() {
-    // Phase M M.A.5: the public const must remain pinned at "2.0.0" until
-    // the next intentional MAJOR bump. If a future commit silently bumps
-    // this without a coordinated cycle, this test will fail.
+    // Phase M M.A.5: the public const must remain pinned until the next
+    // INTENTIONAL, coordinated bump. If a future commit SILENTLY bumps it,
+    // this test fails. That trip-wire is undiminished by the update below.
+    //
+    // 2.0.0 -> 2.1.0 at L-ROUTE (COMMIT 2a): an intentional MINOR bump under
+    // the policy documented on the constant itself ("MINOR: additive
+    // non-breaking changes (e.g., new `LobStats` field)"). SIX fields were
+    // added: `aggregate_trades_observed`, `resting_fills_observed`,
+    // `fill_referenced_unknown_order`, `fill_size_exceeded_resting`,
+    // `fill_side_mismatch`, `fill_price_differs_from_resting`.
+    //
+    // ⚠ WHY THE BUMP IS LOAD-BEARING AND NOT BOOKKEEPING. All six carry
+    // `#[serde(default)]`, so a PRE-L-ROUTE stats file (where the keys are
+    // absent) deserialises them to 0 — numerically identical to a POST-L-ROUTE
+    // file in which the carrier genuinely observed zero records. Without the
+    // version there is no way to tell "this reconstructor never counted" from
+    // "this reconstructor counted nothing", which is exactly the
+    // absence-indistinguishable-from-agreement failure hft-rules §1 forbids.
+    // The envelope's `schema_version` is the only field that discriminates.
     assert_eq!(
-        LOB_STATS_SCHEMA_VERSION, "2.0.0",
-        "LOB_STATS_SCHEMA_VERSION must remain pinned at 2.0.0 until next intentional MAJOR bump"
+        LOB_STATS_SCHEMA_VERSION, "2.1.0",
+        "LOB_STATS_SCHEMA_VERSION must remain pinned at 2.1.0 until the next \
+         intentional, coordinated bump"
     );
 }
 
