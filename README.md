@@ -537,6 +537,40 @@ cargo test --release
 cargo bench
 ```
 
+### Test data (`tests/integration_test.rs`, `tests/queue_position_nvidia_test.rs`)
+
+These two files assert against the real NVDA MBO archive. They locate the
+pipeline `data/` root in this order:
+
+1. **`$HFT_TEST_DATA_DIR`**, if set — used verbatim and exclusively, so a typo
+   surfaces as a failure naming the variable rather than a silent fallback.
+2. otherwise the relative probes `data/`, `../data/`, … up to five levels up.
+
+A plain checkout resolves on `../data`. **A git worktree under
+`.worktrees/<name>/` sits deeper**, which is why the probe list walks up:
+
+```bash
+# explicit, if your data lives somewhere else
+HFT_TEST_DATA_DIR=/abs/path/to/HFT-pipeline-v2/data cargo test
+```
+
+**Missing test data is a hard failure, by design.** To run on a machine that
+has the repo but not the data volume, acknowledge the reduced coverage:
+
+```bash
+ALLOW_MISSING_TEST_DATA=1 cargo test   # data-dependent tests assert NOTHING
+```
+
+> **Why a hard failure.** These tests used to `return` early when the data was
+> not found, so they reported `ok` without executing. Measured in
+> `.worktrees/backbone-v5` on 2026-08-16: **13 of 21 tests in
+> `integration_test.rs` "passed" in 0.01 s**, against 316.66 s for the same
+> suite where the data resolved — and that green suite was being read as
+> evidence that a decoder change was behaviour-preserving. A test that reports
+> `ok` while asserting nothing is worse than no test: it is an affirmative
+> correctness signal produced by a code path that checked nothing. The
+> resolution logic and this policy live in `tests/common/mod.rs`.
+
 ## Use Cases
 
 - Deep Learning Preprocessing: Prepare LOB data for DeepLOB, TLOB, Transformers

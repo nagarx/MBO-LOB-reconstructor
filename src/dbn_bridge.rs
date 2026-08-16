@@ -196,9 +196,30 @@ impl DbnBridge {
     /// `+325,282` and from `F` alone `−325,282` — **combined exactly 0**. A directional feature
     /// built on the merged stream reads "no signal", indistinguishable from a genuine null.
     ///
-    /// Both are also documented by the vendor as **book no-ops**. Databento's own MBP-10 contains
-    /// **zero `F` records**, and treating `F` as a book no-op reproduces that vendor book
-    /// bit-exactly on 100.000% of book-affecting records (2025-07-01, 4,214,602 RTH comparisons).
+    /// Both are also documented by the vendor as **book no-ops**.
+    ///
+    /// 🔴 **STRUCK 2026-08-16 — THE "ZERO `F`" PREMISE IS REFUTED. THE COMMIT-2 IMPLEMENTER MUST
+    /// NOT BUILD ON IT.** ~~Databento's own MBP-10 contains **zero `F` records**~~ — **FALSE.**
+    /// Measured across the 21 vendor MBP-10 day files: **38 `F` records on 11 of the 21 days**,
+    /// every one at the opening or closing cross. The claim was generalised from one of the 10
+    /// genuinely-zero days. A gate that asserts "the vendor MBP-10 contains no `F`" will read a
+    /// **correct** vendor file as anomalous on 11 days in 21.
+    ///
+    /// ⭐ **THE CONCLUSION SURVIVES ON A STRICTLY STRONGER ARGUMENT — CITE THE PAIRING, NEVER THE
+    /// ZERO. THIS IS THE JUSTIFICATION L-ROUTE (COMMIT 2) RESTS ON.** `F` is a book no-op because
+    /// **the venue removes the resting order itself, with a paired `C`** — not because `F` is
+    /// absent from the vendor's book view. Measured: **`F`→`C` pairing = 1.00000000 over 6 days /
+    /// 1,808,570 records**, the paired `C` being the **literal next record**, with `side` and
+    /// `size` matching. The identity holds **inside both auction crosses**, so **COMMIT 2 needs no
+    /// auction carve-out**. An `F` that also decrements the book decrements it **twice** — which
+    /// is precisely why `cancel_order_not_found` carries its full mass today, and why driving it
+    /// to **exactly 0** is COMMIT 2's primary falsifier.
+    ///
+    /// The independent corroboration — that a book treating `F` as a no-op reproduces the vendor
+    /// MBP-10 on 100.000% of book-affecting records (2025-07-01, 4,214,602 RTH comparisons) —
+    /// **stands, and is not affected by the struck premise**. Note its scope: that oracle is an
+    /// independent **Python** book port, so it qualifies the *semantics*, not this Rust
+    /// implementation of them.
     ///
     /// # ⚠ WHAT IS AND IS NOT FIXED AT THIS COMMIT (L-DECODE only)
     ///

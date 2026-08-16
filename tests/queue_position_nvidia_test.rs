@@ -18,53 +18,61 @@ use mbo_lob_reconstructor::{
 };
 use std::path::Path;
 
-const HOT_STORE_DIR: &str = "../data/hot_store";
-const COMPRESSED_DATA_DIR: &str = "../data/XNAS_ITCH/NVDA/mbo_2025-02-03_to_2026-01-07";
+mod common;
+
+/// Data-root-relative markers — see `tests/common/mod.rs` for how the pipeline
+/// `data/` root is resolved (`$HFT_TEST_DATA_DIR`, else `data/` …
+/// `../../../../../data/`). These were hardcoded to `../data/...` until
+/// 2026-08-16, which resolved from a plain checkout but missed from a git
+/// worktree under `.worktrees/<name>/`, silently disabling all 5 tests here.
+const HOT_STORE_DIR: &str = "hot_store";
+const COMPRESSED_DATA_DIR: &str = "XNAS_ITCH/NVDA/mbo_2025-02-03_to_2026-01-07";
+
+/// First file in `dir` whose name contains `needle`, in sorted order.
+fn first_file_containing(dir: &Path, needle: &str) -> Option<std::path::PathBuf> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().contains(needle))
+        .collect();
+    files.sort();
+    files.into_iter().next()
+}
 
 /// Get a test file path, preferring hot store over compressed.
+///
+/// Returns `None` **only** when the data is absent *and*
+/// `ALLOW_MISSING_TEST_DATA=1` is set.
+///
+/// # Panics
+///
+/// When no usable data file can be found and the opt-out is not set — this
+/// includes the case where the directory resolves but holds no matching file,
+/// which a bare existence check cannot detect.
 fn get_test_file() -> Option<std::path::PathBuf> {
-    let hot_store_path = Path::new(HOT_STORE_DIR);
-    let compressed_path = Path::new(COMPRESSED_DATA_DIR);
-
-    // Try hot store first
-    if hot_store_path.exists() {
-        if let Ok(entries) = std::fs::read_dir(hot_store_path) {
-            let mut files: Vec<_> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.extension().map(|ext| ext == "dbn").unwrap_or(false)
-                        && p.to_string_lossy().contains(".mbo.dbn")
-                })
-                .collect();
-            files.sort();
-            if let Some(f) = files.first() {
-                println!("   📂 Using HOT STORE: {}", f.display());
-                return Some(f.clone());
-            }
+    // Try hot store first (decompressed .dbn — much faster).
+    if let Some(dir) = common::resolve_data_path(HOT_STORE_DIR) {
+        if let Some(f) = first_file_containing(&dir, ".mbo.dbn") {
+            println!("   📂 Using HOT STORE: {}", f.display());
+            return Some(f);
         }
     }
 
-    // Fallback to compressed
-    if compressed_path.exists() {
-        if let Ok(entries) = std::fs::read_dir(compressed_path) {
-            let mut files: Vec<_> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.extension().map(|ext| ext == "zst").unwrap_or(false)
-                        && p.to_string_lossy().contains(".mbo.dbn.zst")
-                })
-                .collect();
-            files.sort();
-            if let Some(f) = files.first() {
-                println!("   📂 Using COMPRESSED: {}", f.display());
-                return Some(f.clone());
-            }
+    // Fallback to compressed.
+    if let Some(dir) = common::resolve_data_path(COMPRESSED_DATA_DIR) {
+        if let Some(f) = first_file_containing(&dir, ".mbo.dbn.zst") {
+            println!("   📂 Using COMPRESSED: {}", f.display());
+            return Some(f);
         }
     }
 
-    None
+    common::fail_or_skip(&format!(
+        "no usable NVDA MBO file found\n  \
+         wanted a `*.mbo.dbn` under the data-root-relative `{HOT_STORE_DIR}`,\n  \
+         or a `*.mbo.dbn.zst` under `{COMPRESSED_DATA_DIR}`\n  \
+         (a directory that exists but holds no matching file lands here too)"
+    ))
 }
 
 #[test]
@@ -72,7 +80,9 @@ fn test_queue_position_with_real_nvidia_data() {
     let test_file = match get_test_file() {
         Some(f) => f,
         None => {
-            println!("⚠️ No NVIDIA test data found, skipping test");
+            println!(
+                "⚠️  Skipping test: ALLOW_MISSING_TEST_DATA opt-out active — ASSERTED NOTHING"
+            );
             return;
         }
     };
@@ -126,7 +136,9 @@ fn test_queue_position_fifo_validation() {
     let test_file = match get_test_file() {
         Some(f) => f,
         None => {
-            println!("⚠️ No NVIDIA test data found, skipping test");
+            println!(
+                "⚠️  Skipping test: ALLOW_MISSING_TEST_DATA opt-out active — ASSERTED NOTHING"
+            );
             return;
         }
     };
@@ -193,7 +205,9 @@ fn test_queue_position_volume_consistency() {
     let test_file = match get_test_file() {
         Some(f) => f,
         None => {
-            println!("⚠️ No NVIDIA test data found, skipping test");
+            println!(
+                "⚠️  Skipping test: ALLOW_MISSING_TEST_DATA opt-out active — ASSERTED NOTHING"
+            );
             return;
         }
     };
@@ -265,7 +279,9 @@ fn test_queue_position_imbalance_predictor() {
     let test_file = match get_test_file() {
         Some(f) => f,
         None => {
-            println!("⚠️ No NVIDIA test data found, skipping test");
+            println!(
+                "⚠️  Skipping test: ALLOW_MISSING_TEST_DATA opt-out active — ASSERTED NOTHING"
+            );
             return;
         }
     };
@@ -339,7 +355,9 @@ fn test_queue_position_multi_level_imbalance() {
     let test_file = match get_test_file() {
         Some(f) => f,
         None => {
-            println!("⚠️ No NVIDIA test data found, skipping test");
+            println!(
+                "⚠️  Skipping test: ALLOW_MISSING_TEST_DATA opt-out active — ASSERTED NOTHING"
+            );
             return;
         }
     };

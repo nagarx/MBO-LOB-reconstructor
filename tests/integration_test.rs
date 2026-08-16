@@ -23,7 +23,6 @@
 
 #![cfg(all(feature = "databento", feature = "legacy-iterator-api"))]
 
-use std::path::Path;
 use std::time::Instant;
 
 use mbo_lob_reconstructor::{
@@ -31,28 +30,44 @@ use mbo_lob_reconstructor::{
     NormalizationParams,
 };
 
-/// Path to the test data file (first day of NVDA data)
-const TEST_DATA_PATH: &str =
-    "data/XNAS_ITCH/NVDA/mbo_2025-02-03_to_2026-01-07/xnas-itch-20250203.mbo.dbn.zst";
+mod common;
 
-/// Check if test data is available
-fn test_data_available() -> bool {
-    // Try relative path first
-    if Path::new(TEST_DATA_PATH).exists() {
-        return true;
-    }
-    // Try from workspace root
-    let workspace_path = format!("../{TEST_DATA_PATH}");
-    Path::new(&workspace_path).exists()
+/// Path to the test data file (first day of NVDA data), relative to the
+/// pipeline `data/` root — see `tests/common/mod.rs` for how that root is
+/// resolved (`$HFT_TEST_DATA_DIR`, else `data/` … `../../../../../data/`).
+const TEST_DATA_PATH: &str =
+    "XNAS_ITCH/NVDA/mbo_2025-02-03_to_2026-01-07/xnas-itch-20250203.mbo.dbn.zst";
+
+/// Require the test data, or fail loudly.
+///
+/// Returns `true` when the data is present and the test must proceed.
+///
+/// Returns `false` **only** when the data is absent *and* the operator set
+/// `ALLOW_MISSING_TEST_DATA=1` — in that case the caller's `return` yields a
+/// test that reports `ok` without asserting anything, which is exactly why the
+/// opt-out has to be explicit.
+///
+/// # Panics
+///
+/// When the data is absent and the opt-out is not set. Before 2026-08-16 this
+/// returned `false` silently, and 13 of the 21 tests in this file reported
+/// `ok` in 0.01 s from a git worktree whose relative probes missed the data.
+fn test_data_available_or_fail() -> bool {
+    common::require_data_path(TEST_DATA_PATH).is_some()
 }
 
-/// Get the actual path to test data
+/// Get the actual path to test data.
+///
+/// # Panics
+///
+/// When the data is absent. Every call site is guarded by
+/// [`test_data_available_or_fail`], so reaching this with data absent means
+/// the guard was skipped.
 fn get_test_data_path() -> String {
-    if Path::new(TEST_DATA_PATH).exists() {
-        TEST_DATA_PATH.to_string()
-    } else {
-        format!("../{TEST_DATA_PATH}")
-    }
+    common::resolve_data_path(TEST_DATA_PATH)
+        .unwrap_or_else(|| panic!("test data vanished between the guard and use: {TEST_DATA_PATH}"))
+        .display()
+        .to_string()
 }
 
 // ============================================================================
@@ -61,8 +76,11 @@ fn get_test_data_path() -> String {
 
 #[test]
 fn test_basic_reconstruction_with_real_data() {
-    if !test_data_available() {
-        eprintln!("⚠️  Skipping test: test data not available at {TEST_DATA_PATH}");
+    if !test_data_available_or_fail() {
+        eprintln!(
+            "⚠️  Skipping test: ALLOW_MISSING_TEST_DATA opt-out active — ASSERTED NOTHING \
+             (wanted {TEST_DATA_PATH})"
+        );
         return;
     }
 
@@ -128,8 +146,8 @@ fn test_basic_reconstruction_with_real_data() {
 
 #[test]
 fn test_enriched_analytics_with_real_data() {
-    if !test_data_available() {
-        eprintln!("⚠️  Skipping test: test data not available");
+    if !test_data_available_or_fail() {
+        eprintln!("⚠️  Skipping test: ALLOW_MISSING_TEST_DATA opt-out active — ASSERTED NOTHING");
         return;
     }
 
@@ -240,8 +258,8 @@ fn test_enriched_analytics_with_real_data() {
 
 #[test]
 fn test_book_consistency_detection() {
-    if !test_data_available() {
-        eprintln!("⚠️  Skipping test: test data not available");
+    if !test_data_available_or_fail() {
+        eprintln!("⚠️  Skipping test: ALLOW_MISSING_TEST_DATA opt-out active — ASSERTED NOTHING");
         return;
     }
 
@@ -341,8 +359,8 @@ fn test_book_consistency_detection() {
 
 #[test]
 fn test_day_stats_tracking() {
-    if !test_data_available() {
-        eprintln!("⚠️  Skipping test: test data not available");
+    if !test_data_available_or_fail() {
+        eprintln!("⚠️  Skipping test: ALLOW_MISSING_TEST_DATA opt-out active — ASSERTED NOTHING");
         return;
     }
 
@@ -445,8 +463,8 @@ fn test_day_stats_tracking() {
 
 #[test]
 fn test_normalization_params_from_real_data() {
-    if !test_data_available() {
-        eprintln!("⚠️  Skipping test: test data not available");
+    if !test_data_available_or_fail() {
+        eprintln!("⚠️  Skipping test: ALLOW_MISSING_TEST_DATA opt-out active — ASSERTED NOTHING");
         return;
     }
 
@@ -529,8 +547,8 @@ fn test_normalization_params_from_real_data() {
 
 #[test]
 fn test_crossed_quote_policy_use_last_valid() {
-    if !test_data_available() {
-        eprintln!("⚠️  Skipping test: test data not available");
+    if !test_data_available_or_fail() {
+        eprintln!("⚠️  Skipping test: ALLOW_MISSING_TEST_DATA opt-out active — ASSERTED NOTHING");
         return;
     }
 
@@ -588,8 +606,8 @@ fn test_crossed_quote_policy_use_last_valid() {
 
 #[test]
 fn test_performance_with_real_data() {
-    if !test_data_available() {
-        eprintln!("⚠️  Skipping test: test data not available");
+    if !test_data_available_or_fail() {
+        eprintln!("⚠️  Skipping test: ALLOW_MISSING_TEST_DATA opt-out active — ASSERTED NOTHING");
         return;
     }
 
@@ -671,8 +689,8 @@ fn test_performance_with_real_data() {
 
 #[test]
 fn test_full_day_processing() {
-    if !test_data_available() {
-        eprintln!("⚠️  Skipping test: test data not available");
+    if !test_data_available_or_fail() {
+        eprintln!("⚠️  Skipping test: ALLOW_MISSING_TEST_DATA opt-out active — ASSERTED NOTHING");
         return;
     }
 
@@ -805,8 +823,8 @@ fn test_full_day_processing() {
 fn test_depth_stats_with_real_data() {
     use mbo_lob_reconstructor::{DepthStats, Side};
 
-    if !test_data_available() {
-        eprintln!("⚠️  Skipping test: test data not available");
+    if !test_data_available_or_fail() {
+        eprintln!("⚠️  Skipping test: ALLOW_MISSING_TEST_DATA opt-out active — ASSERTED NOTHING");
         return;
     }
 
@@ -923,8 +941,8 @@ fn test_depth_stats_with_real_data() {
 fn test_market_impact_with_real_data() {
     use mbo_lob_reconstructor::MarketImpact;
 
-    if !test_data_available() {
-        eprintln!("⚠️  Skipping test: test data not available");
+    if !test_data_available_or_fail() {
+        eprintln!("⚠️  Skipping test: ALLOW_MISSING_TEST_DATA opt-out active — ASSERTED NOTHING");
         return;
     }
 
@@ -1025,8 +1043,8 @@ fn test_market_impact_with_real_data() {
 fn test_liquidity_metrics_with_real_data() {
     use mbo_lob_reconstructor::LiquidityMetrics;
 
-    if !test_data_available() {
-        eprintln!("⚠️  Skipping test: test data not available");
+    if !test_data_available_or_fail() {
+        eprintln!("⚠️  Skipping test: ALLOW_MISSING_TEST_DATA opt-out active — ASSERTED NOTHING");
         return;
     }
 
@@ -1530,8 +1548,11 @@ fn test_edge_case_normalization_roundtrip() {
 
 #[test]
 fn test_temporal_fields_with_real_nvidia_data() {
-    if !test_data_available() {
-        eprintln!("⚠️  Skipping test: test data not available at {TEST_DATA_PATH}");
+    if !test_data_available_or_fail() {
+        eprintln!(
+            "⚠️  Skipping test: ALLOW_MISSING_TEST_DATA opt-out active — ASSERTED NOTHING \
+             (wanted {TEST_DATA_PATH})"
+        );
         return;
     }
 
@@ -1676,8 +1697,11 @@ fn test_temporal_fields_with_real_nvidia_data() {
 
 #[test]
 fn test_temporal_delta_accuracy() {
-    if !test_data_available() {
-        eprintln!("⚠️  Skipping test: test data not available at {TEST_DATA_PATH}");
+    if !test_data_available_or_fail() {
+        eprintln!(
+            "⚠️  Skipping test: ALLOW_MISSING_TEST_DATA opt-out active — ASSERTED NOTHING \
+             (wanted {TEST_DATA_PATH})"
+        );
         return;
     }
 
