@@ -350,3 +350,72 @@ For issues not covered here, please:
    - Data sample (anonymized if needed)
    - Warning counts from `LobStats`
    - Expected vs actual behavior
+
+---
+
+## BBO accuracy and the MBP-10 oracle — what may and may not be cited
+
+> **RELOCATED HERE 2026-08-16 from root `CLAUDE.md` §Pipeline Overview.** It was a module-scoped
+> warning (NVDA/XNAS/July-2025, `T` stratum excluded, zero ARCX MBP-10) being paid for by every
+> agent on every turn, including agents working on the backtester, the wiki, or crypto. The oracle
+> half was already duplicated below; **the D1 material existed ONLY in the root file** — measured
+> 2026-08-16: `grep -c D1_two_day WARNINGS.md` -> 0, `grep -c D1_two_day CLAUDE.md` -> 2. Root now
+> carries a one-line pointer here.
+
+🔴 **SUPERSEDED 2026-08-12 — THE CORRECTION BELOW IS ITSELF PROVENANCE-FREE.** Its source,
+`data/validation_results_july2025.json`, **HAS NO EMITTING CODE.** Measured unscoped over the whole
+tree: **68 files reference it and every one is a `.md`** — not one `.rs`, `.py` or `.sh`. It is
+hand-transcribed, dated `2025-12-01`, and its own `book_clears` is **21** where today's
+reconstructor emits **0**, so it describes a book the current code does not produce. The
+2026-08-01 fix therefore replaced one unsourced number with another. **Quote NEITHER `99.17%` NOR
+`95.56%/95.73%` as a current measurement.**
+**CITE INSTEAD** the ten-level MBP-10 oracle (2026-08-11; script + frozen verdicts git-backed at
+`hft-wiki/audit/2026-08-11-mbo-backbone-second-opinion/evidence/phase8_census_oracle/`):
+the candidate `F`-as-book-no-op arm reaches **100.000%** ten-level conformance with the vendor
+MBP-10 — **465,065,790 level-comparisons, 0 misses, 14 days**, price bit-identical L1 and L10 —
+while the **shipped** book measures **83.632% at L1 rising to 94.935% at L10** (stratum A). The
+rise with depth IS the F-merge signature (a fill hits the resting order at the touch) and shows
+there is **no second, depth-specific book defect**. Scope: 14/21 days, **NVDA/XNAS/July-2025 only**,
+`T` stratum (6.19%) excluded; **there is no ARCX MBP-10 on the data volume at all** (`*mbp*10*` →
+21 XNAS + 20 GLBX + **0 ARCX**). Full detail: `MBO-LOB-reconstructor/WARNINGS.md`.
+
+🔴 **AND ONE MORE SCOPE LINE, ADDED 2026-08-13 — THE ORACLE IS A PYTHON PORT. IT QUALIFIES THE
+SEMANTICS, NOT THE RUST.** Orchestrator-verified: all **3** scripts in that evidence directory
+contain **0** occurrences of `cargo`/`rustc`/`target/`; the only subprocess they launch is
+`dbn.cli_path()` (the Databento CLI); `oracle10.py:23` self-declares *"an independent 10-level
+**Python** book"* and `:169` *"the 10-level independent **Python book port**"*. **Re-running it
+after editing `MBO-LOB-reconstructor/src/dbn_bridge.rs` or `reconstructor.rs` produces
+byte-identical output whether a fix is applied, unapplied, or applied WRONG.** The programme's own
+packet says the same: `contracts/mbo_backbone/d0_evidence_receipt_v1.json` carries
+`authorizes: "nothing"`, `status: "observed_pass_nonadmitting"`, and the limitation *"the oracle
+evaluates a **Python candidate** … **not actual Rust candidate behavior**."*
+✅ **What it DOES establish stands and is valuable**: the candidate `F`-as-book-no-op SEMANTICS
+reproduce the vendor MBP-10 exactly, and the shipped book's rise with depth is the F-merge
+signature. Both survive. **What it does NOT establish is that any Rust implementation of those
+semantics is correct** — that is the packet's next pre-registered gate,
+`D1_two_day_development_replay_with_actual_Rust_subject`.
+⚠️ **SCOPE ADDED 2026-08-14 — "the next pre-registered gate" is TRUE OF THE LIST AND MISLEADING AS
+A PLAN. D1 IS NOT ACTIONABLE.** Measured: `grep -rn --no-ignore-files "D1_two_day"
+contracts/mbo_backbone/` returns **1 line** — a bare string in `required_sequence` — and a
+recursive walk for any D1-keyed entry across all **11** packet artifacts returns **0**. D0 has a
+builder, a receipt, two evidence files and a Makefile target; **D1 has none of the four.** It is
+specified in SCOPE, INPUTS and PROHIBITIONS, with **no METHOD and no ACCEPTANCE CRITERION**.
+Worse, `phase_gates.transition_states` puts **`semantic_change_authorize` BEFORE `d1_candidate`**,
+and Phase-0 closure was **unsatisfiable as coded** until 2026-08-14 (two validators demanded
+contradictory values of one key; proven by experiment, settled fact **S35**). **Do not open the
+parked candidate worktree and "run D1" — it would produce an unjudgeable artifact.** The authorized
+work is specification: see `hft-wiki/audit/2026-08-11-mbo-backbone-second-opinion/06_SETTLED_REGISTER.md`
+**S31–S39** and the continuation contract's KNOWN-WRONG **#26**.
+⇒ **Never write "the oracle validates the reconstructor" or "the gate is open". Write "a Python
+port of the candidate semantics matches the vendor MBP-10".**
+
+⚠️ **BBO-accuracy correction (2026-08-01) — RETAINED AS THE RECORD, SUPERSEDED AS A FIGURE.** OLD: "BBO accuracy **99.17%**" (also quoted in
+`MBO-LOB-reconstructor/{README,CLAUDE,CODEBASE}.md` and its `WARNINGS.md`). NEW: **best-price exact
+match 95.56% bid / 95.73% ask; best-SIZE exact match 83.66% / 83.06%** — read directly out of the
+claim's own source artifact, `data/validation_results_july2025.json` (21 days, 88,062,096 aligned
+MBO-vs-MBP-10 comparisons). The numbers 99.17% / 91.15% / 99.71% / 99.69% do not appear anywhere in
+that artifact. Two further problems recorded in `MBO-LOB-reconstructor/WARNINGS.md`: the artifact's
+acceptance gate was set at **80%**, just under the buggy 83% size figure, so it could never fail;
+and the shortfall is now attributed to the `T`/`F` merge in `dbn_bridge.rs:125` (F-as-no-op is
+bit-exact to Databento's own MBP-10 on 100.000% of book-affecting records), not to the
+"aggregation timing" the artifact's notes claimed.
