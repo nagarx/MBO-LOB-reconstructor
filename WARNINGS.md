@@ -31,6 +31,31 @@ This document catalogs known warnings, issues, and edge cases that may occur dur
 > value as an open defect, not as expected feed behaviour. The "Common Causes" list below is
 > retained as the *pre-correction* hypothesis and is NOT supported by the measurement.
 
+> ✅ **THE FIX LANDED — and ONE OF THE TWO ROWS ABOVE IS NOT A VALID CHANNEL (2026-08-17).**
+> The decoder split (COMMIT 1) and the router fix (COMMIT 2a) are on
+> `claude/backbone-v5-reconstructor` **`c9c6f60`**. ⚠️ **`main` does NOT carry them — the production
+> book is still defective**, so every shipped number in this file still describes what production
+> emits.
+>
+> **`cancel_order_not_found` is the PRIMARY falsifier and it FIRED**, on two venues across seven
+> days: XNAS 261,386 → **0** (07-01) and 207,959 → **0** (07-02); ARCX 157,493 → **0** and
+> 127,527 → **0**. It is the primary channel precisely because **its code path SURVIVES the commit**
+> — `Action::Cancel` still calls `reduce_or_remove_order` and the miss branch is still live — so
+> reaching 0 is a **measurement**, not a removal. A third counter, `modify_order_not_found`
+> (369 → **0**, 324 → **0**), fires on a path **invisible on XNAS**, which emits zero `M` bytes.
+>
+> 🔴 **NEVER quote `trade_order_not_found → 0` as a passing channel (KNOWN-WRONG row N1).** After
+> the commit that counter — and its two `trade_*` siblings — have **ZERO increment sites in
+> production code**, so they read 0 on any data, on any venue, forever. A deliberately-built
+> *impostor* fix scores 0 on it too. It carries **zero discriminating power**. Its historical
+> 33,293 / 18,061 mass above is retained as the record of the defect, not as an acceptance target.
+>
+> ⚠️ **AND THE MASS ITSELF WAS SYMPTOM, NOT SIGNAL (KNOWN-WRONG row N2).** The plan predicted those
+> 18,061 events would reappear in a new `fill_referenced_unknown_order` counter once `Fill` stopped
+> mutating. It reads **0** — because the 18,061 was *itself* an artifact of the double-decrement
+> (`F` and its paired `C` both reducing an already-exhausted order, so later `F` records missed).
+> Fix the bug and nothing misses. Do not describe that counter's mass as signal being discarded.
+
 > **FINDING-122 scope boundary (validated 2026-08-01).** The decoder merge has
 > two different observed consequences. A direct raw-tape consumer sees total
 > signed-direction annihilation because `T` carries aggressor side and `F`
@@ -213,11 +238,34 @@ depth-specific book-construction defect**.
 
 ⚠️ SCOPE, stated because the numbers above are strong: 14 of 21 available days (input set
 deliberately frozen), **NVDA / XNAS / July-2025 only**, and the `T` stratum (6.19%) excluded exactly
-as the shipped gate excludes it. There is **no ARCX MBP-10 anywhere on the data volume** — a
+as the shipped gate excludes it. ~~There is **no ARCX MBP-10 anywhere on the data volume** — a
 full-volume search for `*mbp*10*` returns 21 XNAS + 20 GLBX + **0 ARCX** — so no external-oracle
-conformance claim can be made for ARCX at all, and the two venues are structurally different (XNAS
-carries 0 filter-escaping `T` records on 12/12 sampled days; ARCX carries 25,901–97,956 per day,
-100.0000% `side='N'`).
+conformance claim can be made for ARCX at all~~ **← STALE, STRUCK 2026-08-17: see the ARCX block
+below.** The two venues remain structurally different (XNAS carries 0 filter-escaping `T` records on
+12/12 sampled days; ARCX carries 25,901–97,956 per day, 100.0000% `side='N'`).
+
+> ⚠️ **AND DO NOT READ A FILTERING MECHANISM INTO THAT `side='N'` (KNOWN-WRONG row N5).** Those
+> ARCX oid-bearing `T` records are **not** stopped by any `side == Side::None` guard — there is no
+> `msg.side` guard on that path at all; `reduce_or_remove_order` reads `order.side`, the **resting**
+> order's, and never `msg.side`. They die at the **Stage-1 order lookup**: 0 of 88,024 of their ids
+> ever appear as an `Add` id. That is **namespace disjointness — structural**, not a dormant guard
+> that could be "woken up". The `side='N'` figure is a true measurement of the population; it is not
+> the reason the population is book-invisible.
+
+> ✅ **ARCX MBP-10 NOW EXISTS — acquired 2026-08-16 under ruling R7, and the oracle has been run on
+> it.** Two development days only (`data/ARCX_MBP10_2025-07/arcx-pillar-2025070{1,2}.mbp-10.dbn.zst`,
+> 3,797,338 + 2,799,305 records, cost $0.9043); the other 19 conformance days stay a frozen holdout,
+> and the full 233-day corpus was deliberately **not** bought. Measured on both days: the
+> **candidate** reaches **100.0000%** at A-L1 and C-L1, while **HEAD** measures 91.8865% / 91.0339%
+> (A-L1) and 91.0107% / 90.0705% (C-L1) with **all 20 cells nonconforming**. So an external-oracle
+> conformance claim *can* now be made for ARCX, and it says the same thing XNAS did.
+> ⛔ **The remaining 19 days are still inert** until both oracles become venue-aware — they hardcode
+> XNAS at **ELEVEN** sites, on the **MBO side as well as** the MBP-10 side, and fixing only half
+> returns a confident **cross-venue** number instead of an error. See repo task **#33** and
+> `hft-wiki/audit/2026-08-15-mbo-backbone-redesign/ARCX_MBP10_ACQUISITION_2026_08_16.md`.
+> ⚠️ Never quote the purchase size unqualified: **2.261 GiB** billable-uncompressed vs **177.2 MB**
+> compressed-on-disk vs a **~129 MB** pre-purchase estimate of the compressed quantity are three
+> different numbers (KNOWN-WRONG row N8).
 
 ---
 
@@ -233,6 +281,16 @@ and MBP-10 snapshots". NEW — that attribution is falsified. Databento's own MB
 **exactly** on 100.000% of book-affecting records (2025-07-01, 4,214,602 RTH comparisons:
 `A` 2,071,194 and `C` 1,893,575 rows both go to 100.000% price and 100.000% size, from
 99.700%/86.549% and 99.303%/84.307%). The shortfall is the `F`-merge defect, not aggregation timing.
+
+> ⚠️ **SCOPE THE "zero `F` records" CLAIM TO XNAS — it is a near-zero, not a literal zero, on ARCX
+> (added 2026-08-17).** Measured publication rates from the ARCX MBO tape into the ARCX vendor
+> MBP-10: `A` **75.90%** (2,296,220 → 1,742,798) · `C` **75.94%** (2,303,272 → 1,749,069) ·
+> `T` **100.00%** (235,317 → 235,317) · **`F` 0.0199% — 37 of 185,706.** So the vendor MBP-10 is not
+> categorically `F`-free on every venue; write "the vendor does not publish `F` as book-affecting",
+> not "contains zero `F` records", unless you mean XNAS specifically.
+> **This STRENGTHENS the argument rather than weakening it**: if `F` reduced a resting order the way
+> `C` does, it would publish at ~76% like `C`. It publishes roughly **3,800× less** — the vendor's
+> own book model does not treat `F` as book-mutating, which is exactly what COMMIT 2a implements.
 
 **Impact** *(corrected)*: NOT minor at sequence resolution. The distortion is transient — it lives
 between each `F` and its paired `C` — but feature sampling lands on those positions. Shipped-corpus
@@ -376,8 +434,10 @@ MBP-10 — **465,065,790 level-comparisons, 0 misses, 14 days**, price bit-ident
 while the **shipped** book measures **83.632% at L1 rising to 94.935% at L10** (stratum A). The
 rise with depth IS the F-merge signature (a fill hits the resting order at the touch) and shows
 there is **no second, depth-specific book defect**. Scope: 14/21 days, **NVDA/XNAS/July-2025 only**,
-`T` stratum (6.19%) excluded; **there is no ARCX MBP-10 on the data volume at all** (`*mbp*10*` →
-21 XNAS + 20 GLBX + **0 ARCX**). Full detail: `MBO-LOB-reconstructor/WARNINGS.md`.
+`T` stratum (6.19%) excluded; ~~**there is no ARCX MBP-10 on the data volume at all** (`*mbp*10*` →
+21 XNAS + 20 GLBX + **0 ARCX**)~~ **← STALE, STRUCK 2026-08-17: two ARCX MBP-10 days were acquired
+2026-08-16 under ruling R7 and the oracle has been run on them — see the ARCX block above.**
+Full detail: `MBO-LOB-reconstructor/WARNINGS.md`.
 
 🔴 **AND ONE MORE SCOPE LINE, ADDED 2026-08-13 — THE ORACLE IS A PYTHON PORT. IT QUALIFIES THE
 SEMANTICS, NOT THE RUST.** Orchestrator-verified: all **3** scripts in that evidence directory
@@ -408,6 +468,40 @@ work is specification: see `hft-wiki/audit/2026-08-11-mbo-backbone-second-opinio
 **S31–S39** and the continuation contract's KNOWN-WRONG **#26**.
 ⇒ **Never write "the oracle validates the reconstructor" or "the gate is open". Write "a Python
 port of the candidate semantics matches the vendor MBP-10".**
+
+> ✅ **CLOSED 2026-08-17 — BY A CHANGE OF SUBJECT, NOT BY THE SCAR BEING WRONG. Read both halves.**
+> Everything above stays true **of the 2026-08-11 evidence copy**, which really is a Python
+> re-implementation and really would score identically whether a Rust fix were applied, unapplied,
+> or applied wrong. What changed is the **PROMOTED** copy at `scripts/ci/oracle10.py`:
+>
+> - It has a **`--subjects R`** arm whose subject is the **candidate book export the Rust
+>   reconstructor actually wrote** (`{day}_lob_snapshots.parquet` under a `--raw-lob` root). It is
+>   **refused outright without `--raw-lob`** (`[BLOCKED] … R would silently grade the SHIPPED
+>   default`), so it cannot quietly grade the wrong artifact under a candidate's name.
+>   The Python is now only the **grader and vendor-comparator**; the **subject is Rust**.
+> - It has **`--assert`** (demand `n_minus_exact == 0` on every graded stratum × level) and
+>   **`--self-test`**, so it can return a non-zero exit code. 🔴 **KNOWN-WRONG row N4: "oracle10.py
+>   has no `--assert` and exits 0 on a wrong book" is TRUE of the 2026-08-11 evidence copy and
+>   FALSE of `scripts/ci/oracle10.py`.** State which copy you mean; do not just flip the verdict.
+>
+> **Measured with a Rust subject on 2025-07-01**, three arms paired on identical rows
+> (`ts_row_proof_pct = 100.0`, `n_scored = 4,214,602` identical across all three):
+>
+> | subject | exit | A-L1 | C-L1 | A-L10 | C-L10 |
+> |---|---|---|---|---|---|
+> | P — shipped artifact | 1 | 86.5490% | 84.3066% | 96.4154% | 96.0378% |
+> | R — **HEAD build** | 1 | 86.5490% | 84.3066% | 96.4154% | 96.0378% |
+> | R — **candidate** | **0** | **100.0000%** | **100.0000%** | **100.0000%** | **100.0000%** |
+>
+> The candidate is also exit-0 on 2025-07-02 and on five held-out days (2025-07-03/09/16/23/30).
+> ⭐ **The HEAD-build arm is the load-bearing control**: a freshly-built HEAD scores *bit-identically*
+> to a shipped artifact produced five months earlier by pre-COMMIT-1 code. That is what proves
+> **COMMIT 1 is book-neutral** and **COMMIT 2a is the sole cause** of 86.549% → 100.000%.
+>
+> ⇒ You may now write: **"the promoted ten-level oracle grades the Rust candidate book against the
+> vendor MBP-10 and it conforms exactly, with a HEAD-build control isolating the cause."** You may
+> still NOT write it of the 2026-08-11 evidence copy, and you may still not write "the gate is open"
+> for the packet's `D1_*` entry, which remains unspecified as an artifact.
 
 ⚠️ **BBO-accuracy correction (2026-08-01) — RETAINED AS THE RECORD, SUPERSEDED AS A FIGURE.** OLD: "BBO accuracy **99.17%**" (also quoted in
 `MBO-LOB-reconstructor/{README,CLAUDE,CODEBASE}.md` and its `WARNINGS.md`). NEW: **best-price exact

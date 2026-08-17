@@ -968,6 +968,26 @@ assert!(stats.is_clean_eof(), "torn DBN: mid_record_eof={}", stats.mid_record_eo
 > attributed a residual BBO mismatch to `cancel_order_not_found` "upstream data quality" — that
 > attribution is falsified, since the counter is itself 100% this bug.)
 
+> ✅ **UPDATE 2026-08-17 — THE FIX LANDED, AND THE "five counters" ACCEPTANCE SET WAS WRONG.**
+> COMMIT 1 (decode split) + COMMIT 2a (router: `Fill` is no longer routed through `process_trade`)
+> are on `claude/backbone-v5-reconstructor` **`c9c6f60`**. ⚠️ **`main` does NOT carry them** — the
+> block above still describes what production emits.
+> **What fired, and is a real measurement:** `cancel_order_not_found` XNAS 261,386 → **0** (07-01)
+> and 207,959 → **0** (07-02); ARCX 157,493 → **0** and 127,527 → **0**; plus
+> `modify_order_not_found` 369 → **0** / 324 → **0** on ARCX, a path invisible on XNAS (which emits
+> zero `M` bytes). `cancel_order_not_found` is the **PRIMARY** channel because its code path
+> **survives** the commit, so reaching 0 is a measurement rather than a removal.
+> 🔴 **The three `trade_*` counters are NOT valid channels and must be dropped from any acceptance
+> set (KNOWN-WRONG row N1).** After the commit they have **zero increment sites in production
+> code** — they read 0 on any data, any venue, forever, and a deliberately-built *impostor* fix
+> scores 0 on them too. The `33,293 → 0` / `18,061 → 0` figures above are retained as the historical
+> record of the defect, **never** as a post-fix target.
+> ⚠️ **Nor was that mass "signal" (row N2)**: it was itself an artifact of the double-decrement, so
+> the predicted transfer into a new `fill_referenced_unknown_order` counter reads **0**.
+> `Fill` was **repointed, not deleted** — it now CHECKS without mutating, yielding 556,278 vendor
+> assertions over two days at 100.000% conformance on existence, side and sufficient resting size.
+> Full detail: `WARNINGS.md` § ORDER_NOT_FOUND.
+
 > **FINDING-122 interpretation boundary.** The raw-tape consequence and the
 > current feature-path consequence are different. On raw NVDA/XNAS MBO, merging
 > `T` (aggressor side) and `F` (resting side) annihilates signed direction. In
