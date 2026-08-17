@@ -1669,6 +1669,14 @@ If resolving the BBO puzzle becomes a priority:
 
 1. **Re-derive the metric from raw stats** (`crossed_quotes + locked_quotes / messages_processed`) and confirm whether it actually equals 0.83% or whether the 99.17% number refers to something else (e.g., per-event BBO correctness vs an MBP-10 reference).
 2. **Inspect a sample day's `_reconstruction_stats.json`** for `cancel_order_not_found`, `trade_order_not_found`, and other silent-recovery counters. Their sum is a lower bound on "messages where the reconstructor's view diverges from the ideal".
+   > 🔴 **STALE AS OPERATIONAL ADVICE since L-ROUTE (2026-08-16, `claude/backbone-v5-reconstructor`
+   > `c9c6f60`) — do not follow this step as written on a post-L-ROUTE stats file.**
+   > `trade_order_not_found` (and its two siblings) now have **zero increment sites**, so they read
+   > 0 on any data forever and contribute nothing to that sum; including them makes the "lower
+   > bound" look better than it is. Inspect `cancel_order_not_found` (which must be **0**
+   > post-L-ROUTE) plus the six fill-oracle counters instead, and check the envelope's
+   > `schema_version` first — a pre-bump file has the six keys absent, which `#[serde(default)]`
+   > renders as 0 and is indistinguishable from a genuine zero. `WARNINGS.md` §1/§7.
 3. **Cross-check** Databento's MBP-10 schema for the same NVDA day against the reconstructor's BBO derived from MBO. Per-message divergence is the cleanest measurement.
 
 ### Honest summary

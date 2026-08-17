@@ -10,7 +10,7 @@ Primary technical reference for LLM coders. Baseline: source-verified 2026-04-30
 
 The crate provides:
 
-- **LOB reconstruction**: MBO messages (Add/Modify/Cancel/Trade) to aggregated price-level snapshots (`LobState`, 576 bytes on the audited target; `repr(Rust)` is not ABI-stable).
+- **LOB reconstruction**: MBO messages to aggregated price-level snapshots (`LobState`, 576 bytes on the audited target; `repr(Rust)` is not ABI-stable). **Add / Modify / Cancel / Clear affect the book; `TradeAggregate` and `Fill` are vendor no-ops and, since L-ROUTE, are observed rather than executed.** (This line read "Add/Modify/Cancel/Trade" before L-ROUTE.)
 - **Composable stateful helpers**: Four standalone modules (queue position, order lifecycle, trade aggregation, day boundary detection) with distinct APIs and filters; none depends on `LobReconstructor`. The trade helper has a current-bridge safety restriction documented below.
 - **ML analytics**: Microprice, VWAP, depth imbalance, market impact simulation, running statistics (Welford's algorithm), normalization parameters.
 - **Parquet export**: Accepted reconstructed LOB snapshots and a lossy six-field MBO projection to Apache Parquet with schema versioning.
@@ -110,10 +110,13 @@ record. Their filters also differ; see the source-verified API table below.
 - Wire `T` means Trade with aggressor `side`; wire `F` means Fill with resting
   `side`; both are documented as having no book effect. Wire `R` means clear
   the instrument book. `DbnBridge` NO LONGER merges `T|F` — as of L-DECODE it decodes them to
-  the distinct `Action::TradeAggregate` / `Action::Fill`. ⚠️ `LobReconstructor` still mutates the
-  book for `Action::TradeAggregate | Action::Fill` (knowingly temporary, marked in-source,
-  resolved at L-ROUTE). That routing is a current implementation fact and a known limitation, not
-  Databento semantics.
+  the distinct `Action::TradeAggregate` / `Action::Fill`. ⭐ **And as of L-ROUTE the book honours
+  the no-book-effect semantics**: neither carrier reaches `reduce_or_remove_order`,
+  `process_trade` is deleted, and `OrderReductionOp` has collapsed to one `Cancel` variant, so
+  **`Cancel` is the only action in this crate that reduces a resting order**. `Fill` retains its
+  order lookup as a *non-mutating* conformance check (`observe_resting_fill`). The old sentence
+  here — *"`LobReconstructor` still mutates the book for `TradeAggregate | Fill`"* — described the
+  L-DECODE-only interval and is no longer true on this branch. ⚠️ It IS still true of `main`.
 - `MboMessage::is_system_message()` is an internal structural heuristic
   (`order_id == 0 || size == 0 || price <= 0`), not a DBN record taxonomy. On
   the measured NVDA/XNAS path, `order_id == 0` also identifies true Trade rows;
@@ -234,8 +237,8 @@ pub enum Action {
     Add    = b'A',   // New order
     Modify = b'M',   // Existing order price and/or size changed
     Cancel = b'C',   // Existing order fully or partially cancelled
-    Trade  = b'T',   // Wire T: aggressor side; DBN says no book effect
-    Fill   = b'F',   // Wire F: resting side; DBN says no book effect
+    TradeAggregate = b'T', // Wire T: AGGRESSOR side; book NO-OP (honoured since L-ROUTE)
+    Fill           = b'F', // Wire F: RESTING side;   book NO-OP (honoured since L-ROUTE)
     Clear  = b'R',   // Reset all orders for the instrument
     None   = b'N',   // No book effect; may carry other information
 }
@@ -244,9 +247,18 @@ pub enum Action {
 `Action::from_byte()` preserves `T` and `F` as distinct internal variants
 (`Action::TradeAggregate` / `Action::Fill`), and **as of the L-DECODE commit the DBN-specific
 bridge does too** — `convert_action` delegates to `from_byte` rather than keeping a second map.
-The merge described above is no longer present at the decoder. It survives, knowingly and
-marked in-source, in `LobReconstructor`'s router and in `TradeAggregator`; both are resolved at
-L-ROUTE.
+The merge is no longer present at the decoder.
+
+⭐ **Nor in the book, as of L-ROUTE.** `LobReconstructor`'s router now has seven exhaustive arms and
+**no wildcard**, so a new `Action` variant is a compile error. `TradeAggregate` increments a counter
+and returns; `Fill` calls `observe_resting_fill`, which checks and does not mutate.
+
+⚠️ **One holdout: `TradeAggregator` (`src/lob/trade_aggregator.rs`) was NOT changed by L-ROUTE** and
+still reverses side for both carriers — correct for `Fill`, inverting for `TradeAggregate`. It is
+unused by the production path and stays unsafe on bridge output.
+⚠️ **Do not confuse the two "Trade" names**: the `Action::TradeAggregate` variant is *the vendor's
+aggregate trade print*, one row per physical execution. `TradeAggregator`/`Trade` in
+`lob::trade_aggregator` is *an aggregate of many `Fill`s*. Same word, opposite direction.
 
 ### Side (`src/types.rs`)
 
@@ -420,12 +432,21 @@ pub struct LobStats {
     pub locked_quotes: u64,
     pub last_timestamp: Option<i64>,
     // Warning counters (6 fields):
-    pub cancel_order_not_found: u64,
-    pub cancel_price_level_missing: u64,
-    pub cancel_order_at_level_missing: u64,
+    pub cancel_order_not_found: u64,          // LIVE — must be 0 post-L-ROUTE
+    pub cancel_price_level_missing: u64,      // LIVE
+    pub cancel_order_at_level_missing: u64,   // LIVE
+    // ⚠ L-ROUTE: ZERO increment sites. Read 0 on any data forever. Retained
+    // deliberately as the receipt that no carrier enters the reduction path.
     pub trade_order_not_found: u64,
     pub trade_price_level_missing: u64,
     pub trade_order_at_level_missing: u64,
+    // Carrier / fill-oracle counters (L-ROUTE, all #[serde(default)]):
+    pub aggregate_trades_observed: u64,
+    pub resting_fills_observed: u64,
+    pub fill_referenced_unknown_order: u64,
+    pub fill_size_exceeded_resting: u64,
+    pub fill_side_mismatch: u64,              // must be 0 — ALARM
+    pub fill_price_differs_from_resting: u64, // expected non-zero (~3%/day)
     // Fall-through observability counters (Phase M M.A.4, F-013):
     pub modify_order_not_found: u64,
     pub add_order_id_collision: u64,
@@ -434,6 +455,16 @@ pub struct LobStats {
     pub noop_messages: u64,
 }
 ```
+
+⚠️ **The "18 fields" heading above predates L-ROUTE.** Six fields were added; re-derive rather than
+trusting either number —
+`awk '/^pub struct LobStats \{/,/^\}/' src/lob/reconstructor.rs | grep -c '^    pub '`.
+The additions forced `LOB_STATS_SCHEMA_VERSION` to move: every new field is `#[serde(default)]`, so
+a pre-L-ROUTE stats file (keys absent → 0) is otherwise **numerically indistinguishable** from a
+post-L-ROUTE file whose carrier genuinely observed zero. The bump is a correctness requirement, not
+bookkeeping.
+🔴 `has_warnings()` / `total_warnings()` were **not** extended and are blind to all six — a recorded
+regression, deferred to the counter commit.
 
 **QueueStats** (`src/lob/queue_position.rs`):
 
@@ -563,16 +594,39 @@ pub struct DayBoundary {
 
 ### Unified Reduction Pattern
 
-**File**: `src/lob/reconstructor.rs`, `reduce_or_remove_order()` (line ~544).
+**File**: `src/lob/reconstructor.rs`, `reduce_or_remove_order()` — anchor by symbol
+(`grep -n 'fn reduce_or_remove_order'`); the line number moved at L-ROUTE and will move again.
 
-Cancel and Trade operations follow the same 4-stage lookup with identical partial/full removal logic. An `OrderReductionOp` enum (Cancel | Trade) selects which stat counters to increment:
+⭐ **POST-L-ROUTE, `Cancel` IS THE ONLY CALLER, AND THE TYPE SYSTEM SAYS SO.** `OrderReductionOp`
+used to carry a `Trade` variant because `TradeAggregate`/`Fill` were routed here alongside `Cancel`.
+L-ROUTE deleted that variant; the compiler then named every site that assumed otherwise, and the
+enum collapsed to a **single `Cancel`** — which is what makes *"`Cancel` is the only action that
+reduces a resting order"* a **provable** statement rather than a convention. It is kept as an enum
+(rather than inlined) so the 4-stage lookup keeps one shape and a future second reducer must be
+added deliberately.
 
-1. **Order lookup** in `self.orders` -- not found: increment `{cancel,trade}_order_not_found`, return Ok.
-2. **Price level lookup** in bids/asks -- not found: cleanup orphan order, increment `{cancel,trade}_price_level_missing`, return Ok.
-3. **Order-at-level lookup** -- not found: cleanup orphan, increment `{cancel,trade}_order_at_level_missing`, return Ok.
+The 4-stage lookup, with identical partial/full removal logic:
+
+1. **Order lookup** in `self.orders` -- not found: increment `cancel_order_not_found`, return Ok.
+2. **Price level lookup** in bids/asks -- not found: cleanup orphan order, increment `cancel_price_level_missing`, return Ok.
+3. **Order-at-level lookup** -- not found: cleanup orphan, increment `cancel_order_at_level_missing`, return Ok.
 4. **Size reduction**: If `msg.size >= current_size`, full removal. Otherwise partial reduction via `PriceLevel::reduce_order()`.
 
-The same pattern exists in `QueuePositionTracker` (`src/lob/queue_position.rs`) with `ReductionOp` (Cancel | Fill) and `handle_order_reduction()`. This eliminated ~90% code duplication that was the root cause of audit bugs #2 and #3.
+⚠️ The `{cancel,trade}_*` brace notation this section used to carry is now misleading: the `trade_*`
+half has no writer. Stages 1–3 write the `cancel_*` counters only.
+
+The same pattern exists in `QueuePositionTracker` (`src/lob/queue_position.rs`) with
+`handle_order_reduction()`, and its `ReductionOp` has likewise **collapsed to one `Cancel`
+variant** — the queue is a mirror of the book and had to move with it. `Fill` now goes to
+`observe_fill()`, which **keeps the order lookup** (so `QueueStats::fill_not_found` retains its
+meaning) but **no longer depletes the queue**. That coupling is not optional and was measured:
+fixing the book alone leaves `tests/queue_position_nvidia_test::test_queue_position_volume_consistency`
+RED at LOB 1060 / Queue 119 — a real regression, not a stale fixture. Both fixed: 1060 / 1060.
+⚠️ `fill_not_found`'s semantics **narrowed**: `TradeAggregate` misses are no longer counted, so
+"exactly what it counted before" holds on XNAS only.
+
+The unified shape originally eliminated ~90% code duplication that was the root cause of audit
+bugs #2 and #3.
 
 ### Cached Invariant Pattern
 
@@ -602,7 +656,7 @@ filters are intentionally different:
 |--------|------------|-------------------------------|
 | `QueuePositionTracker` | `process_message(&mut self, &MboMessage) -> ()` | Rejects `msg.is_system_message()` and `Side::None` before action dispatch. |
 | `OrderLifecycleTracker` | `process_message(&mut self, &MboMessage) -> Option<LifecycleEvent>` | Rejects `msg.is_system_message()` and `Side::None` before action dispatch. |
-| `TradeAggregator` | `process_message(&mut self, &MboMessage) -> Option<Trade>` | Has no structural/system-shape filter. It accepts only internal `Action::TradeAggregate | Action::Fill`, skips `Side::None`, and reverses side unconditionally. It is valid only for independently supplied resting-side Fill input; it is unused and remains unsafe on current `DbnBridge` output — no longer because the bridge merges the two bytes (L-DECODE split them), but because reversing side on a `TradeAggregate`, whose side is ALREADY the aggressor's, INVERTS the flag. Resolved at L-ROUTE. |
+| `TradeAggregator` | `process_message(&mut self, &MboMessage) -> Option<Trade>` | Has no structural/system-shape filter. It accepts only internal `Action::TradeAggregate | Action::Fill`, skips `Side::None`, and reverses side unconditionally. It is valid only for independently supplied resting-side Fill input; it is unused and remains unsafe on current `DbnBridge` output — no longer because the bridge merges the two bytes (L-DECODE split them), but because reversing side on a `TradeAggregate`, whose side is ALREADY the aggressor's, INVERTS the flag. ⚠️ **L-ROUTE did NOT touch this file; still open** (the earlier "Resolved at L-ROUTE" was a plan, not a record). |
 | `DayBoundaryDetector` | `check_boundary(timestamp: i64) -> Option<DayBoundary>`, then `record_message(timestamp: Option<i64>, is_trade: bool, size: u32)` | Consumes a timestamp/statistics projection, not `MboMessage`; it therefore applies no message-shape filter itself. |
 
 ### System Message Filtering
@@ -675,10 +729,15 @@ Validation rules include: levels in [1, 20], max_warnings > 0, batch_size > 0, a
 | `Generic(String)` | message | Hard (I/O, misc) |
 
 **Soft errors** (tracked in stats, never return Err):
-- Cancel/Trade for unknown order -> `{cancel,trade}_order_not_found` stat
-- Cancel/Trade with missing price level -> `{cancel,trade}_price_level_missing` stat
-- Cancel/Trade with order not at expected level -> `{cancel,trade}_order_at_level_missing` stat
+- **Cancel** for unknown order -> `cancel_order_not_found` stat (**must be 0 post-L-ROUTE**)
+- **Cancel** with missing price level -> `cancel_price_level_missing` stat
+- **Cancel** with order not at expected level -> `cancel_order_at_level_missing` stat
+- **Fill** referencing an order/side/size the book disagrees with -> the four `fill_*` stats
+  (`observe_resting_fill`; a *check*, never a mutation)
 - Crossed/locked quotes (with `Allow`, `UseLastValid`, or `SkipUpdate` policy) -> `crossed_quotes`/`locked_quotes` stats
+
+⚠️ These three rows read `Cancel/Trade -> {cancel,trade}_*` before L-ROUTE. The `trade_*` counters
+now have no writer; only `Cancel` reaches this path.
 
 **Hard errors** (return Err):
 - Message validation failure (when `validate_messages = true`)

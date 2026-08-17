@@ -164,6 +164,18 @@ There is no repository-owned, versioned completion receipt binding all files, ro
 
 ### MBO-01 — CRITICAL — DBN Trade and Fill are collapsed and then treated as book mutations
 
+> ✅ **REMEDIATED ON A BRANCH, 2026-08-16/17 — the observations below stand as written against the
+> audited commit `c1d1f147` and are NOT edited.** Both halves this finding names are now fixed on
+> `claude/backbone-v5-reconstructor`: the decode merge (L-DECODE) and the book mutation (L-ROUTE,
+> `c9c6f60`). `process_trade` is deleted; `OrderReductionOp` collapsed to a single `Cancel`.
+> ⚠️ **The "Affected states" row remains TRUE of `main`, of `v0.3.0`, and of every export on disk** —
+> the fix is on a candidate branch and has not been merged or tagged. Acceptance: the vendor
+> ten-level MBP-10 oracle at **100.0000%** with a HEAD-build control proving attribution, and
+> `cancel_order_not_found` → 0 on two venues across seven days. Detail in `CHANGELOG.md`
+> `[Unreleased]` and `WARNINGS.md` §1/§7. The "Expected" row's *"separately owned completed-execution
+> semantic layer"* is **NOT** built — `Fill` became a non-mutating conformance oracle, not a
+> completed-execution layer.
+
 - **Locations:** `src/dbn_bridge.rs:119-165`; `src/lob/reconstructor.rs:794-921`; dispatch at `src/lob/reconstructor.rs:1212-1218`; `src/lob/order_lifecycle.rs:566`.
 - **Evidence type:** implementation + vendor decoder semantics + independent raw/export census R-MBO-02 + current wiki correction cluster.
 - **Observed:** `b'T' | b'F' => Action::Trade`; `Trade | Fill` calls `process_trade`, reducing/removing the resting order. True T is a non-book event with aggressor-side semantics; F is a non-book event with resting-side semantics. The downstream extractor subsequently filters true T (`order_id=0`) and retains F, so the actual feature stream is not “all flow annihilated”; it is a narrower, still-invalid F-as-Trade stream.

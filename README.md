@@ -27,7 +27,7 @@ Additional standalone modules that can be used alongside LOB reconstruction:
 - **Queue Position Tracking**: FIFO queue position, volume ahead (for execution probability)
 - **Order Lifecycle Tracking**: Track orders through Add→Modify→Cancel/Fill lifecycle
 - **Day Boundary Detection**: Automatic trading day detection for train/test splits
-- **Trade Aggregation**: Fill-only helper that reverses resting side to derive aggressor side. Unused, and still unsafe on current `DbnLoader` output — no longer because the bridge merges the two wire actions (L-DECODE split them) but because the helper reverses side for BOTH carriers, and a `TradeAggregate`'s side is already the aggressor's. Resolved at L-ROUTE.
+- **Trade Aggregation**: Fill-only helper that reverses resting side to derive aggressor side. Unused, and still unsafe on current `DbnLoader` output — no longer because the bridge merges the two wire actions (L-DECODE split them) but because the helper reverses side for BOTH carriers, and a `TradeAggregate`'s side is already the aggressor's. ⚠️ **L-ROUTE did NOT touch `trade_aggregator.rs`; this is still open.**
 
 ## Feature Flags
 
@@ -113,9 +113,14 @@ norm_params.save_json("normalization.json")?;
 > timestamp, not the DBN primary timestamp. **The `T`/`F` decode merge is FIXED as of the
 > L-DECODE commit**: the bridge now decodes `T` to `Action::TradeAggregate` and `F` to
 > `Action::Fill`. On the wire, `T` carries the aggressor side and `F` the resting side, and both
-> are documented as book no-ops. ⚠️ The BOOK does not yet honour that: `LobReconstructor` still
-> routes both carriers to `process_trade`, knowingly and marked in-source, until L-ROUTE. See
-> `WARNINGS.md` and FINDING-122 for the bounded downstream interpretation.
+> are documented as book no-ops.
+> ⭐ **AND THE BOOK NOW HONOURS THAT, AS OF L-ROUTE.** Neither carrier reaches
+> `reduce_or_remove_order` any more; `process_trade` is deleted and `OrderReductionOp` has collapsed
+> to a single `Cancel` variant, so **`Cancel` is provably the only action that reduces a resting
+> order**. `Fill` keeps its lookup as a non-mutating conformance check (`WARNINGS.md` §7).
+> ⚠️ **BRANCH SCOPE: both fixes live on `claude/backbone-v5-reconstructor`; `main` does NOT carry
+> them,** so anything built from `main` — and every export currently on disk — still has the
+> defective book. See `WARNINGS.md` and FINDING-122 for the bounded downstream interpretation.
 
 ## Using with Feature Extractor
 
@@ -280,7 +285,8 @@ for msg in messages {
 > side for BOTH, and a `TradeAggregate`'s side is already the aggressor's, so reversing it
 > INVERTS the flag. Direct `DbnLoader` output is therefore still not a valid input to this
 > example. The helper is unused by the current pipeline; the call site is marked
-> knowingly-temporary and resolved at L-ROUTE.
+> knowingly-temporary. ⚠️ **L-ROUTE did NOT change this file** — an earlier version of this note
+> said it was "resolved at L-ROUTE", which was a plan, not a record. Still open.
 
 ```rust
 use mbo_lob_reconstructor::{TradeAggregator, TradeAggregatorConfig};
@@ -467,12 +473,15 @@ mbo_lob_reconstructor/
     lob/
         mod.rs              # LOB module hub, re-exports
         reconstructor.rs    # LobReconstructor, process_message_into(), reduce_or_remove_order()
+                            #   (post-L-ROUTE: Cancel is its ONLY caller), observe_resting_fill()
         price_level.rs      # PriceLevel with O(1) size caching
         multi_symbol.rs     # Multi-symbol support
-        queue_position.rs   # QueuePositionTracker (FIFO tracking, handle_order_reduction())
+        queue_position.rs   # QueuePositionTracker (FIFO tracking, handle_order_reduction(),
+                            #   observe_fill() — lookup kept, depletion removed at L-ROUTE)
         order_lifecycle.rs  # OrderLifecycleTracker (Add→Modify→Cancel/Fill)
         day_boundary.rs     # DayBoundaryDetector (trading day detection)
-        trade_aggregator.rs # Fill-only helper; unsafe on current T/F-merged bridge output
+        trade_aggregator.rs # Fill-only helper; STILL unsafe on bridge output (L-ROUTE did not
+                            #   touch it — it inverts side for TradeAggregate too)
     export/               # Parquet export (requires `export` feature)
         mod.rs            # ExportConfig, DownsampleConfig, re-exports
         schema.rs         # Arrow schema definitions (LOB + MBO)

@@ -46,7 +46,7 @@ Converts Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshot
 | Queue Position Tracking | FIFO position, volume ahead (composable module) |
 | Order Lifecycle Tracking | Add→Modify→Cancel/Fill lifecycle (composable module) |
 | Day Boundary Detection | Trading day boundaries for train/test splits |
-| Trade Aggregation | Fill-only helper with aggressor-side inversion. Still not safe on current `DbnLoader` output — the bridge no longer merges the carriers (L-DECODE), but `TradeAggregator` still reverses side for both, and a `TradeAggregate`'s side is already the aggressor's, so reversing INVERTS it. Use only with independently supplied, resting-side Fill semantics. Resolved at L-ROUTE. |
+| Trade Aggregation | Fill-only helper with aggressor-side inversion. Still not safe on current `DbnLoader` output — the bridge no longer merges the carriers (L-DECODE), but `TradeAggregator` still reverses side for both, and a `TradeAggregate`'s side is already the aggressor's, so reversing INVERTS it. Use only with independently supplied, resting-side Fill semantics. ⚠️ **L-ROUTE did NOT touch this file** — the earlier "resolved at L-ROUTE" note was a promise, not a record. Still open. |
 | DBN Support | Native Databento file loading (feature-gated) |
 
 ### Directory Structure
@@ -185,8 +185,8 @@ pub enum Action {
     Add = b'A',      // New order
     Modify = b'M',   // Existing order price and/or size changed
     Cancel = b'C',   // Existing order fully or partially cancelled
-    Trade = b'T',    // Wire T: aggressor side; DBN says no book effect
-    Fill = b'F',     // Wire F: resting side; DBN says no book effect
+    TradeAggregate = b'T', // Wire T: AGGRESSOR side; book NO-OP (honoured since L-ROUTE)
+    Fill = b'F',           // Wire F: RESTING side; book NO-OP (honoured since L-ROUTE)
     Clear = b'R',    // Reset all orders for the instrument
     None = b'N',     // No book effect; may carry other information
 }
@@ -197,11 +197,20 @@ does too**: `DbnBridge::convert_action` now delegates to `Action::from_byte`, so
 `Action::TradeAggregate` and `b'F'` to `Action::Fill`. The former `b'T' | b'F' => Action::Trade`
 merge is GONE from the decoder.
 
-⚠️ **The decode is split; the ROUTING is not.** `LobReconstructor::process_message` still routes
-`Action::TradeAggregate | Action::Fill` to one handler, and `TradeAggregator` still reverses side
-for both — both knowingly temporary, both marked in-source, both resolved at L-ROUTE. So "the
-carriers are distinct on the wire and in the artifact" is now true; "the book treats them
-differently" is not yet.
+⭐ **AND THE ROUTING IS SPLIT TOO, AS OF L-ROUTE (`c9c6f60`).** `LobReconstructor::process_message`
+now has **seven exhaustive arms and no wildcard**, so adding an `Action` variant is a compile error
+rather than a silent fall-through. `TradeAggregate` increments a counter and returns; `Fill` goes to
+`observe_resting_fill`, which **checks and does not mutate**. `process_trade` is **DELETED**, and
+`OrderReductionOp` lost its `Trade` variant — the compiler then named all four remaining sites, and
+the enum collapsed to a single `Cancel`, so **`Cancel` is now provably the only action in this crate
+that reduces a resting order**. Both "the carriers are distinct on the wire and in the artifact" and
+"the book treats them differently" are now true.
+
+⚠️ **ONE CONSUMER IS STILL UNFIXED AND IS NOT SAFE:** `TradeAggregator` (`src/lob/trade_aggregator.rs`)
+still reverses side for **both** carriers. That inversion is correct for `Fill` (whose `side` is the
+resting order's) and **exactly wrong** for `TradeAggregate` (whose `side` is already the
+aggressor's). L-ROUTE did not touch that file. The module is unused in the production path; do not
+adopt it without fixing the carrier predicate first.
 
 ### Side Enum
 
@@ -373,12 +382,18 @@ this filter therefore changes trade coverage.
 |---|---|---|
 | **Add** | Insert order into price level and orders map | Book-affecting |
 | **Modify** | Remove old order, add new; handles price change | Book-affecting |
-| **Cancel** | Reduce size or remove order | Book-affecting |
-| **Trade/Fill** | Both route to `process_trade()` and mutate the book | Known implementation limitation: DBN documents wire `T` and `F` as no-book-effect and gives them opposite side conventions |
+| **Cancel** | Reduce size or remove order — **the ONLY action that reduces a resting order** | Book-affecting |
+| **TradeAggregate** | Book **NO-OP**; increments `aggregate_trades_observed` and returns | Wire `T`: `side` is the **AGGRESSOR's**; DBN documents no book effect |
+| **Fill** | Book **NO-OP**; `observe_resting_fill()` **checks and does not mutate** (§7 of `WARNINGS.md`) | Wire `F`: `side` is the **RESTING order's** — the opposite convention; DBN documents no book effect |
 | **Clear** | `reset()`, increment `book_clears` | Wire `R`: clear all orders; explicitly exempt from structural filter/validation |
 | **None** | No-op, increment `noop_messages` | No book effect |
 
-### Soft Error Handling in Cancel/Trade
+⭐ **The match has no wildcard arm.** A new `Action` variant is a compile error here, by design.
+⚠️ Pre-L-ROUTE this table read *"**Trade/Fill** — both route to `process_trade()` and mutate the
+book"*, annotated as a known limitation. `process_trade` no longer exists; that row is gone, not
+renamed. Every claim elsewhere that a trade or fill *reduces* a resting order is stale.
+
+### Soft Error Handling in Cancel
 
 Anomalies don't fail - they're tracked in stats:
 
@@ -391,6 +406,13 @@ if order not found {
 ```
 
 This is intentional: market data often has late cancels, already-filled orders, etc.
+
+⚠️ **Post-L-ROUTE the correct steady-state value of `cancel_order_not_found` is EXACTLY 0, not
+"low".** It was 261,386/day on XNAS NVDA 2025-07-01 purely because a `Fill` had already removed or
+exhausted the order that its paired `Cancel` then went looking for. The counter is now the primary
+acceptance channel for this fix (`WARNINGS.md` §1); treat any non-zero value as an open defect.
+The sibling `trade_*` counters are **structurally dead** — zero increment sites — and read 0 on any
+data forever; never quote them as a passing check.
 
 ---
 
@@ -601,9 +623,21 @@ let stats = lob.stats();
 if stats.has_warnings() {
     println!("Warnings: {}", stats.total_warnings());
     println!("  Cancel order not found: {}", stats.cancel_order_not_found);
-    println!("  Trade order not found: {}", stats.trade_order_not_found);
 }
+
+// NOT covered by has_warnings() — check the fill oracle explicitly.
+println!("  Fill side mismatch:  {}", stats.fill_side_mismatch);          // must be 0
+println!("  Fill unknown order:  {}", stats.fill_referenced_unknown_order); // must be 0
+println!("  Fill size exceeded:  {}", stats.fill_size_exceeded_resting);  // must be 0
+println!("  Fill price differs:  {}", stats.fill_price_differs_from_resting); // ~3%/day, benign
 ```
+
+> 🔴 **`has_warnings()` and `total_warnings()` are BLIND to all six fill-oracle counters** — a known,
+> recorded regression left for the counter commit, not an oversight. A non-zero `fill_side_mismatch`
+> (the crate's newest defect signature) leaves `has_warnings()` **false**. Three of the eight terms
+> they *do* sum are the structurally-dead `trade_*` counters. Do not gate on them alone.
+> ⚠️ This sample previously printed `stats.trade_order_not_found`; that field still compiles and now
+> reads 0 unconditionally, which is exactly why printing it is misleading.
 
 ---
 
@@ -632,9 +666,24 @@ pub struct LobStats {
     pub cancel_order_not_found: u64,
     pub cancel_price_level_missing: u64,
     pub cancel_order_at_level_missing: u64,
+    // ⚠ L-ROUTE: these three now have ZERO increment sites and read 0
+    // forever. Retained DELIBERATELY as the machine-checkable receipt that
+    // no carrier enters reduce_or_remove_order (asserted by
+    // tests/carrier_routing_discriminator.rs::assert_reduction_path_untaken).
+    // Do not revive them; do not read their 0 as a health signal.
     pub trade_order_not_found: u64,
     pub trade_price_level_missing: u64,
     pub trade_order_at_level_missing: u64,
+    // L-ROUTE NEW — the two vendor BOOK NO-OP carriers, observed not executed.
+    // All six are #[serde(default)], which is exactly why the envelope
+    // version had to move: absent keys deserialize to 0 and would be
+    // indistinguishable from a genuine zero observation.
+    pub aggregate_trades_observed: u64,        // b'T' seen (0 on XNAS until L-ADMIT)
+    pub resting_fills_observed: u64,           // b'F' seen
+    pub fill_referenced_unknown_order: u64,    // must be 0
+    pub fill_size_exceeded_resting: u64,       // must be 0
+    pub fill_side_mismatch: u64,               // must be 0 — ALARM
+    pub fill_price_differs_from_resting: u64,  // EXPECTED non-zero (~3%/day)
     // Phase M M.A.4 NEW (F-013 closure): observability counters for
     // silent fall-through paths. Increment BEFORE the recovery semantic
     // (modify_order falls through to add_order on missing id; add_order
@@ -645,6 +694,10 @@ pub struct LobStats {
     pub noop_messages: u64,
 }
 ```
+
+For the field count, read the struct — `awk '/^pub struct LobStats \{/,/^\}/' src/lob/reconstructor.rs | grep -c '^    pub '`.
+The envelope's `LOB_STATS_SCHEMA_VERSION` was bumped at L-ROUTE; its current value lives in
+`src/lob/reconstructor.rs` and in `CHANGELOG.md` — do not hand-copy it here.
 
 ### DayStats (src/statistics.rs)
 
@@ -961,7 +1014,7 @@ assert!(stats.is_clean_eof(), "torn DBN: mid_record_eof={}", stats.mid_record_eo
 // Typical stats from one day of NVDA data:
 // messages_processed: 10,000,000
 // system_messages_skipped: 1,393,000 (~14%)
-// cancel_order_not_found: 50,000 (~0.5%) - NOT normal. See correction below.
+// cancel_order_not_found: 50,000 (~0.5%) - NOT normal, and post-L-ROUTE it is 0.
 // crossed_quotes: 100 (~0.001%) - Normal!
 ```
 
@@ -975,17 +1028,32 @@ assert!(stats.is_clean_eof(), "torn DBN: mid_record_eof={}", stats.mid_record_eo
 > `cancel_order_not_found` 393,790 → **0** and `trade_order_not_found` 33,293 → **0** (2025-02-03);
 > 261,386 → **0** and 18,061 → **0** (2025-07-01).
 > **These five counters are therefore the free acceptance test for the pending decoder fix: they must
-> read EXACTLY 0 afterwards, not "≈0" or "reduced".** (Corollary: the 2026-04 backbone audit §3.5
+> read EXACTLY 0 afterwards, not "≈0" or "reduced".** ⚠️ **That sentence is now true only of the
+> `cancel_*` half** — see the L-ROUTE block two paragraphs down before quoting the `trade_*` figures. (Corollary: the 2026-04 backbone audit §3.5
 > attributed a residual BBO mismatch to `cancel_order_not_found` "upstream data quality" — that
 > attribution is falsified, since the counter is itself 100% this bug.)>
-> ⚠️ **SCOPE ADDED AT L-DECODE — THESE COUNTERS ARE STILL NON-ZERO, AND THAT IS CORRECT.** The
+> ⚠️ **SCOPE ADDED AT L-DECODE — THESE COUNTERS WERE STILL NON-ZERO, AND THAT WAS CORRECT.** The
 > L-DECODE commit split the DECODER only (`b'T'` → `Action::TradeAggregate`, `b'F'` →
-> `Action::Fill`); it deliberately did NOT change routing, so `LobReconstructor` still sends both
-> carriers to `process_trade` and `F` still mutates the book. Measured on 2025-07-01, baseline vs
+> `Action::Fill`); it deliberately did NOT change routing, so `LobReconstructor` still sent both
+> carriers to `process_trade` and `F` still mutated the book. Measured on 2025-07-01, baseline vs
 > the L-DECODE candidate: **all 18 reconstruction-stats fields identical**, `cancel_order_not_found`
 > **261,386 in both arms**. The "EXACTLY 0" threshold is the acceptance test for **L-ROUTE**, not
-> for L-DECODE. Do not read a non-zero counter here as evidence that the decode split failed — its
-> acceptance signal is the `action`-column histogram (byte 84 splitting into {84, 70}), which passes.
+> for L-DECODE. Do not read a non-zero counter *at L-DECODE* as evidence that the decode split
+> failed — its acceptance signal is the `action`-column histogram (byte 84 splitting into
+> {84, 70}), which passes.
+>
+> ⭐ **L-ROUTE HAS LANDED AND THIS ACCEPTANCE TEST FIRED (`c9c6f60`, this branch).**
+> `cancel_order_not_found`: XNAS 261,386 → **0** (07-01) and 207,959 → **0** (07-02); ARCX
+> 157,493 → **0** and 127,527 → **0**. A third counter on a path invisible on XNAS —
+> `modify_order_not_found`, ARCX only — went 369 → **0** and 324 → **0**. Five held-out days are
+> clean on every channel. It is the **primary** falsifier precisely because its code path *survives*
+> the commit, so 0 is a measurement rather than a removal.
+> 🔴 **BUT THE `trade_order_not_found` HALF OF THE SENTENCE ABOVE IS NOW A TRAP AND MUST NOT BE
+> QUOTED AS A PASSING CHANNEL.** After L-ROUTE those three `trade_*` counters have **zero increment
+> sites**, so they read 0 on **any** data forever — a deliberately-wrong impostor build scores 0 on
+> them too. The claim *"these five counters are the free acceptance test"* is therefore correct for
+> the two `cancel_*`/`modify_*` channels and **vacuous** for the three `trade_*` ones. What
+> discriminates a correct fix from an impostor is the test suite: seven reds vs five.
 
 
 > **FINDING-122 interpretation boundary.** The raw-tape consequence and the
@@ -1154,7 +1222,14 @@ merged both wire bytes onto one variant, so the aggregator could not tell them a
 `TradeAggregate`: that record's side is ALREADY the aggressor's, so reversing it INVERTS the
 aggressor flag. The merge that used to hide the bug now merely feeds it correctly-labelled input
 it still mishandles. That call site is marked knowingly-temporary in
-`src/lob/trade_aggregator.rs` and is resolved at L-ROUTE.
+`src/lob/trade_aggregator.rs`.
+
+🔴 **AND L-ROUTE DID NOT FIX IT — this paragraph used to end "and is resolved at L-ROUTE", which is
+now a false promise.** L-ROUTE (`c9c6f60`) touched `dbn_bridge.rs`, `reconstructor.rs`,
+`queue_position.rs` and `order_lifecycle.rs`; **`trade_aggregator.rs` is not in that commit.** The
+carrier predicate there still admits both variants and still inverts side for both. It stays unsafe
+on bridge output until a commit that changes *this* file lands. Verify before believing either way:
+`grep -n 'Action::TradeAggregate\|Action::Fill' src/lob/trade_aggregator.rs`.
 
 ⚠️ Do not confuse `Action::TradeAggregate` with this module's `Trade`: `TradeAggregate` is ONE
 vendor print per physical execution; `Trade` is an aggregate built from MANY `Fill`s.
@@ -1312,9 +1387,16 @@ state.is_consistent() // bid < ask
 state.is_crossed()    // bid > ask (invalid)
 state.is_locked()     // bid == ask (unusual)
 
-// Stats checks
+// Stats checks — NECESSARY, NOT SUFFICIENT post-L-ROUTE: both are blind to the
+// six fill-oracle counters, so a non-zero fill_side_mismatch leaves this false.
 lob.stats().has_warnings()
 lob.stats().total_warnings()
+
+// The acceptance channel and the fill oracle, checked directly.
+lob.stats().cancel_order_not_found        // must be 0 post-L-ROUTE
+lob.stats().fill_side_mismatch            // must be 0 — the alarm
+lob.stats().fill_referenced_unknown_order // must be 0
+lob.stats().fill_size_exceeded_resting    // must be 0
 ```
 
 ---

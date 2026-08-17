@@ -7,6 +7,135 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> ⚠️ **BRANCH SCOPE.** Everything in this section is on `claude/backbone-v5-reconstructor` and is
+> **NOT on `main`**. No version has been cut for it. `main` still produces the defective book, and
+> so does every export currently on disk.
+
+### The `T`/`F` carrier split — L-DECODE then L-ROUTE
+
+The decoder used to map `b'T' | b'F' => Ok(Action::Trade)`, merging two vendor populations whose
+`side` field means **opposite things**: on `T` (an aggregate trade print) `side` is the
+**aggressor's**; on `F` (a fill against a resting order) `side` is the **resting order's**. Per the
+vendor, **both are book no-ops**. The merge therefore had two independent halves, and stating only
+the first makes the second's acceptance criterion a non-sequitur:
+
+* **the SIGN half** — the merge *inverts* sign on the `F` population and the halves cancel;
+* **the BOOK half** — the router executed a vendor book no-op as a book **mutation**, so on a venue
+  that emits every fill twice (`F` then a paired `C`) each fill decremented the resting order
+  **twice**.
+
+- **Fixed (L-DECODE)**: `DbnBridge::convert_action` delegates to `Action::from_byte`; `b'T'` decodes
+  to `Action::TradeAggregate`, `b'F'` to `Action::Fill`. The decoder merge is gone. Routing was
+  deliberately left unchanged in that commit, so it is **book-neutral** — independently confirmed
+  afterwards by an oracle arm in which a HEAD build scores *bit-identically* to a shipped artifact
+  produced five months earlier by pre-split code.
+- **Fixed (L-ROUTE)**: `LobReconstructor::process_message_into` gained **seven exhaustive router
+  arms and no wildcard** (a new `Action` variant is now a compile error). `TradeAggregate` counts
+  and returns; `Fill` goes to the new `observe_resting_fill`.
+- **Removed (L-ROUTE)**: `process_trade`. Also `OrderReductionOp::Trade` and
+  `queue_position::ReductionOp::Fill` — deleting them made the compiler name every site that
+  assumed a trade reduces the book, and both enums collapsed to a single `Cancel` variant. **Cancel
+  is now *provably* the only action in this crate that reduces a resting order.**
+- **Changed (L-ROUTE)**: `QueuePositionTracker` moved with the book — mandatory, not cosmetic.
+  Fixing the book alone was measured to leave
+  `tests/queue_position_nvidia_test::test_queue_position_volume_consistency` RED at LOB 1060 /
+  Queue 119. `observe_fill` keeps the order lookup (so `QueueStats::fill_not_found` retains its
+  meaning) but no longer depletes the queue. ⚠️ Its semantics **narrowed**: `TradeAggregate` misses
+  are no longer counted, so "exactly what it counted before" is true on XNAS only.
+- **Changed (L-ROUTE)**: `OrderLifecycleTracker`'s arm was split so a `TradeAggregate` can never
+  reach `handle_fill` (which manufactures an inferred lifecycle on a miss, default-on, and a `T`
+  carries `order_id == 0`). Its own `F`/`C` double-count is **deferred and documented in-code** —
+  it moves counters feeding a live research consumer.
+
+### Added — the fill oracle (`Fill` repointed, not deleted)
+
+Every `F` is the vendor **asserting** that order `id`, on side S, at price P, had ≥ `size` resting.
+`observe_resting_fill` now verifies that assertion and **mutates nothing**, turning a discarded
+event into a conformance oracle that runs on every venue and every day — including venues with no
+vendor MBP-10 coverage. Six new `LobStats` fields: `aggregate_trades_observed`,
+`resting_fills_observed`, `fill_referenced_unknown_order`, `fill_size_exceeded_resting`,
+`fill_side_mismatch`, `fill_price_differs_from_resting`.
+Measured on XNAS NVDA: **556,278 vendor assertions across 2025-07-01/02 at 100.000% conformance**
+on existence, side and sufficient resting size; `fill_price_differs_from_resting` 9,119 (2.965%) and
+8,636 (3.47%) — **expected non-zero**, since a fill's price is the EXECUTION price and legitimately
+differs from the resting order's DISPLAY price. Side and price are two counters on purpose: merging
+them would let a benign ~3% rate hide a wrong-side defect.
+
+### Changed — `LOB_STATS_SCHEMA_VERSION` bumped (MANDATORY, not cosmetic)
+
+All six new fields carry `#[serde(default)]`, so a pre-L-ROUTE stats file (keys absent → 0) would be
+numerically **indistinguishable** from a post-L-ROUTE file whose carrier genuinely observed zero.
+The version is the only thing that separates them. Current value: `src/lob/reconstructor.rs`.
+
+### Deprecated in effect — three counters with no writer
+
+`trade_order_not_found`, `trade_price_level_missing` and `trade_order_at_level_missing` now have
+**zero increment sites**. They are retained deliberately as the machine-checkable receipt that no
+carrier enters the reduction path (`tests/carrier_routing_discriminator.rs::assert_reduction_path_untaken`).
+🔴 **They read 0 on any data, any venue, forever — never quote one as a passing check.** A
+deliberately-built "route-to-not-found" impostor scores 0 on them too.
+
+### Acceptance
+
+`cancel_order_not_found` is the **primary** falsifier because its code path *survives* the commit
+(`Action::Cancel` still calls `reduce_or_remove_order`; the miss branch is still live), so reaching
+0 is a measurement rather than a removal:
+
+| counter | XNAS 07-01 | XNAS 07-02 | ARCX 07-01 | ARCX 07-02 |
+|---|---|---|---|---|
+| `cancel_order_not_found` | 261,386 → **0** | 207,959 → **0** | 157,493 → **0** | 127,527 → **0** |
+| `modify_order_not_found` | — | — | 369 → **0** | 324 → **0** |
+| `active_orders` | 5,909 → 5,910 | 5,557 → 5,559 | — | — |
+
+`modify_order_not_found` is a third independent counter on a path **invisible on XNAS** (XNAS.ITCH
+emits zero `M` bytes). `active_orders` is a weak channel (+1 on 5,909 = 0.017%). Five held-out days
+(2025-07-03/09/16/23/30) are clean on every channel.
+
+Against the vendor ten-level MBP-10, paired on identical rows (`ts_row_proof_pct = 100.0`,
+`n_scored = 4,214,602` in all three arms) on 2025-07-01: the shipped artifact and a **HEAD Rust
+build** both score A-L1 86.5490% / C-L1 84.3066% / A-L10 96.4154% / C-L10 96.0378% and exit 1; the
+**candidate build** scores **100.0000%** on all four and exits 0, and likewise on 2025-07-02 and the
+five held-out days. Because the HEAD arm reproduces the shipped artifact bit-identically, this is an
+**attribution**: L-DECODE is book-neutral and L-ROUTE is the sole cause of the change.
+
+Discrimination against a plausible wrong fix was pre-registered: a correct fix reds exactly **seven**
+lib tests, a "route-to-not-found" impostor reds only **five**, leaving both counter-asserting
+canaries green. Measured **293 passed / 7 failed**, with `test_trade_unknown_order_is_ok` and
+`test_warning_stats_accumulate` both red at `left: 0 / right: 1`, reproduced from two
+separately-constructed trees. Full suite after the fix: **422 passed / 0 failed / 41 ignored**
+(`cargo test --all-features`, `HFT_TEST_DATA_DIR` set).
+
+### Corrected — two claims this work refuted
+
+- 🔴 ~~"Databento's own MBP-10 contains **zero `F` records**"~~ — **FALSE**, and struck from
+  `src/dbn_bridge.rs` and `WARNINGS.md`. There are **38 `F` records on 11 of the 21 day files**, all
+  at the opening or closing cross; the claim was generalised from one of the 10 genuinely-zero days.
+  **The conclusion survives on a strictly stronger argument — cite the PAIRING, never the zero**:
+  `F`→`C` pairing is **1.00000000 over 6 days / 1,808,570 records**, the paired `C` being the literal
+  next record with matching `side` and `size`, and it holds **inside both auction crosses**, so **no
+  auction carve-out is required**. On ARCX 2025-02-03, **356,515 of 356,515** `F` records pair, zero
+  unpaired — **18,220,516 shares** double-decremented that day alone. Vendor publication rates
+  corroborate: `A` 75.90%, `C` 75.94%, `T` 100.00%, **`F` 0.0199%** (37 of 185,706).
+- 🔴 ~~"deleting the `Fill` lookup would discard 18,061 events/day of signal"~~ — **wrong, and the
+  finding is inside it.** The plan expected those `trade_order_not_found` events to transfer into
+  `fill_referenced_unknown_order`; it reads **0**, because the 18,061 was **itself an artifact of
+  the double-decrement** (`F` and its paired `C` both reducing exhausted orders early, so later `F`
+  records missed). It was **symptom**, not signal. Keeping the lookup still stands, on the stronger
+  ground stated above.
+
+### Known, recorded, not hidden
+
+- `has_warnings()` / `total_warnings()` are **blind to all six new counters**, so a non-zero
+  `fill_side_mismatch` — the newest defect signature in the crate — leaves `has_warnings()` false.
+  Three of the eight terms they do sum now have no writer. A net regression in health signalling,
+  deferred to the counter commit.
+- `TradeAggregator` (`src/lob/trade_aggregator.rs`) was **not** changed and still inverts side for
+  `TradeAggregate`. Unused by the production path; still unsafe on bridge output.
+- `OrderLifecycleTracker`'s `F`/`C` double-count is deferred (see above).
+- Downstream: the sibling extractor sums the three now-dead `trade_*` counters into one canonical
+  diagnostic aggregator, which will therefore publish a **permanent 0** — indistinguishable from
+  "perfectly conformant" — on its next rebuild. Tracked in that repo.
+
 ## [0.3.0] — 2026-08-01
 
 **MINOR under `VERSIONING.md` R7 — outputs proven byte-identical, not asserted.**
