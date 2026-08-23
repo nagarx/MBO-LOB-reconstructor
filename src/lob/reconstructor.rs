@@ -20,8 +20,13 @@ use crate::types::{Action, BookConsistency, LobState, MboMessage, Order, Side};
 ///
 /// Phase M M.A.5 (REV 3 boundary discipline cycle): introduced
 /// [`LobStatsExportEnvelope`] wrapping the raw stats with a `schema_version`
-/// field. Bumped to `2.0.0` to signal the conceptual break from the legacy
-/// flat shape (no envelope existed before — pre-M.A.5 was implicit-1.0).
+/// field.
+///
+/// History — keep this in step with the constant, which it drifted out of once:
+/// - `2.0.0` M.A.5: the conceptual break from the legacy flat shape (no
+///   envelope existed before — pre-M.A.5 was implicit-1.0).
+/// - `2.1.0` COMMIT 2a (L-ROUTE): +6 carrier/Fill-oracle fields.
+/// - `2.2.0` COMMIT 2b (carrier census): +12 per-side rows.
 ///
 /// **Independent of** [`crate::export::SCHEMA_VERSION`] (`"1.0"`), which
 /// versions the Parquet export schema — a different artifact. When either
@@ -33,7 +38,7 @@ use crate::types::{Action, BookConsistency, LobState, MboMessage, Order, Side};
 ///   field, rename a field, change an envelope key).
 /// - MINOR: additive non-breaking changes (e.g., new `LobStats` field).
 /// - PATCH: docs-only changes.
-pub const LOB_STATS_SCHEMA_VERSION: &str = "2.1.0";
+pub const LOB_STATS_SCHEMA_VERSION: &str = "2.2.0";
 
 /// How to handle crossed quotes (bid >= ask) when they occur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -293,6 +298,133 @@ pub struct LobStats {
     #[serde(default)]
     pub resting_fills_observed: u64,
 
+    // =========================================================================
+    // THE PER-SIDE CARRIER CENSUS (COMMIT 2b)
+    // =========================================================================
+    //
+    // The two totals above answer "how many of each carrier". These answer
+    // "on which side, and for how much size" — and that second question is the
+    // one that can detect a RE-MERGE of the two populations.
+    //
+    // A merged implementation reproduces both TOTALS exactly: 375,643 T +
+    // 307,584 F == 683,227, which is precisely what the shipped defective
+    // artifact reports under one carrier with the other absent. The scalar sum
+    // is INVARIANT UNDER RECLASSIFICATION, which is why
+    // `contracts/mbo_backbone/execution_lane_spec_v1.json` records it as
+    // `rejected_weaker_form`. The side rows are not invariant: the two carriers
+    // use OPPOSITE `side` conventions (on a `T`, `side` is the AGGRESSOR's; on
+    // an `F` it is the RESTING order's), so transposing them moves counts
+    // between `_ask` and `_bid` while leaving every total untouched.
+    //
+    // ⚠ THESE NAMES ARE THE WIRE CONTRACT, NOT AN IMPLEMENTATION DETAIL.
+    // `scripts/ci/check_carrier_sign.py::canonical_subject_schema` reads them
+    // as flat keys inside the stats envelope, exactly as
+    // `{carrier}_{observed|volume}_{ask|bid|none}`.
+    //
+    // ⚠ A RENAME IS LOUD FOR THE TWELVE PER-SIDE ROWS AND CATASTROPHICALLY
+    // QUIET FOR THE TWO TOTALS. (Corrected 2026-08-23; an earlier version of
+    // this comment said "a rename never fails the gate", which is wrong in both
+    // directions — measured on the gate itself.)
+    //
+    //   * PER-SIDE rename -> LOUD. `check_tier3` iterates
+    //     `sorted(ref_sides | sub_sides)` (check_carrier_sign.py:909), so the
+    //     row is generated from the VENDOR census even when the subject lacks
+    //     the key; `observed=None` against an integer `expected` fails.
+    //     EXCEPTION: a side the vendor census does not carry at all (F|N here)
+    //     generates no row, so renaming those two IS silent.
+    //   * TOTAL rename -> WORSE THAN SILENT. `present` is computed from the two
+    //     TOTALS ALONE (:746-747) and tiers 2 AND 3 are gated on it (:988), so
+    //     renaming a total UN-GRADES ALL TWELVE correct per-side rows and the
+    //     verdict reports `SUBJECT_ABSENT` — which the gate itself classifies
+    //     as "(ii) absence — NOT a discriminating failure", and which
+    //     `--assert` does NOT upgrade.
+    //
+    // The two totals are therefore a chokepoint, and the only thing guarding
+    // them is `carrier_census_wire_names_match_the_gate_contract` below.
+    // Rename nothing here without changing the gate in the same commit.
+    //
+    // ⚠ `_none` IS A FIRST-CLASS ROW, NOT AN "OTHER" BUCKET. A side key present
+    // in the vendor census but absent here is a Tier-3 FAILURE, not an absent
+    // subject: dropping `T|N` (68,063 records on 2025-07-01) is one of the
+    // traps the gate exists to catch.
+    //
+    // ⚠ EVERY `aggregate_trades_*` ROW READS 0 ON XNAS UNTIL RUNG 4, AND THAT
+    // IS THE PASSING VALUE THERE. 100% of the XNAS.ITCH `TradeAggregate`
+    // population carries `order_id == 0`, so `is_system_message()` drops it
+    // ahead of the router (L-ADMIT, rung 4). The zero is STRUCTURAL and carries
+    // no correctness information — the class `FINDING-155` describes — so these
+    // six rows are validated by the behavioural tests below, never by live
+    // XNAS data.
+    //
+    // ⚠ "0 IS PASSING" DOES NOT MEAN "THE GATE IS GREEN". G-SIGN still exits 1
+    // at this rung, with `C-aggregate_trades-total` and the six
+    // `S-aggregate_trades-*` red. Those reds ARE the acceptance criterion
+    // (LADDER rung 2b: grade the exact failed-ID set in REPORT mode). A reader
+    // who "fixes" them here has smuggled L-ADMIT into 2b, which the ladder
+    // enumerates as its own distinct failure — a MISSING id.
+    //
+    // ⚠ THE ARCX SHAPE IS NOT PROPORTIONAL, AND AN EARLIER VERSION OF THIS
+    // COMMENT IMPLIED IT WAS. Measured directly off the ARCX tape
+    // (arcx-pillar-20250701, dbn-cli 0.20.1, 2026-08-23):
+    //
+    //     T|A 104,268  order_id==0 104,268 (100%)  -> dropped by L-ADMIT
+    //     T|B  81,261  order_id==0  81,261 (100%)  -> dropped by L-ADMIT
+    //     T|N  49,788  order_id!=0  49,788 (100%)  -> REACHES this arm
+    //
+    // So the 21.16% of ARCX `T` carrying `order_id != 0` is ENTIRELY `T|N`, and
+    // the ARCX outcome is `_ask = 0, _bid = 0, _none = 49,788` — not ~20%
+    // spread across three rows. A reader expecting a proportional split would
+    // diagnose a CORRECT subject as broken. (Those `order_id`s reference no
+    // order the book ever held, so they are trade identifiers and must never be
+    // routed by `order_id`.)
+    /// Count of vendor `T` records with `side == Ask` (aggressor sold).
+    #[serde(default)]
+    pub aggregate_trades_observed_ask: u64,
+
+    /// Count of vendor `T` records with `side == Bid` (aggressor bought).
+    #[serde(default)]
+    pub aggregate_trades_observed_bid: u64,
+
+    /// Count of vendor `T` records with `side == None` (no aggressor disclosed).
+    #[serde(default)]
+    pub aggregate_trades_observed_none: u64,
+
+    /// Summed `size` of vendor `T` records with `side == Ask`, in shares.
+    #[serde(default)]
+    pub aggregate_trades_volume_ask: u64,
+
+    /// Summed `size` of vendor `T` records with `side == Bid`, in shares.
+    #[serde(default)]
+    pub aggregate_trades_volume_bid: u64,
+
+    /// Summed `size` of vendor `T` records with `side == None`, in shares.
+    #[serde(default)]
+    pub aggregate_trades_volume_none: u64,
+
+    /// Count of vendor `F` records whose RESTING order was on the ask.
+    #[serde(default)]
+    pub resting_fills_observed_ask: u64,
+
+    /// Count of vendor `F` records whose RESTING order was on the bid.
+    #[serde(default)]
+    pub resting_fills_observed_bid: u64,
+
+    /// Count of vendor `F` records published with `side == None`.
+    #[serde(default)]
+    pub resting_fills_observed_none: u64,
+
+    /// Summed `size` of vendor `F` records resting on the ask, in shares.
+    #[serde(default)]
+    pub resting_fills_volume_ask: u64,
+
+    /// Summed `size` of vendor `F` records resting on the bid, in shares.
+    #[serde(default)]
+    pub resting_fills_volume_bid: u64,
+
+    /// Summed `size` of vendor `F` records with `side == None`, in shares.
+    #[serde(default)]
+    pub resting_fills_volume_none: u64,
+
     /// Number of `Action::Fill` records whose `order_id` was NOT resting.
     ///
     /// Every `F` is the vendor ASSERTING that this order was resting at this
@@ -375,6 +507,152 @@ pub struct LobStats {
 }
 
 impl LobStats {
+    /// Record one `Action::TradeAggregate` (vendor `T`) into the carrier census.
+    ///
+    /// `side` here is the **AGGRESSOR's** — the OPPOSITE convention from
+    /// [`Self::count_resting_fill`]. That opposition is the whole reason the
+    /// per-side rows exist, and it is why admitting this carrier (rung 4) must
+    /// re-derive the signed-flow expression at `MboComputer::extract_flow` in
+    /// the SAME commit.
+    ///
+    /// ⚠ CORRECTED 2026-08-23 — ADMITTING `T` ALONGSIDE `F` DOES NOT INVERT
+    /// THE SIGN. IT ANNIHILATES THE FEATURE. The ladder, the execution-lane
+    /// spec and an earlier version of this comment all predicted an inversion.
+    /// They are wrong, and the correct statement follows in one line from the
+    /// ANTI-DIAGONAL identity these very counters expose: one execution has one
+    /// aggressor and one resting counterparty on opposite sides, so
+    /// `T|A ≡ F|B` and `T|B ≡ F|A`. Admit both and
+    ///
+    /// ```text
+    /// ask = T|A + F|A = T|A + T|B      bid = T|B + F|B = T|B + T|A
+    /// ```
+    ///
+    /// are IDENTICAL, so `net_trade_flow -> 0`. Measured on the vendor census
+    /// for both development days: `T|A == F|B` EXACTLY (160,209 on 2025-07-01;
+    /// 125,651 on 07-02), and the day-level `net_trade_flow` with both carriers
+    /// admitted is `6.50e-06` / `4.02e-06` against a genuine F-only signal of
+    /// `-0.0417` / `-0.0105`. On 60-second bars an independent decode measured
+    /// `corr(F-only, T-only) = -1.00000000` and `net_trade_flow` EXACTLY 0.0 in
+    /// 925 of 926 bars — the one survivor being the bar holding the auction
+    /// cross.
+    ///
+    /// WHY THIS MATTERS MORE THAN AN INVERSION WOULD. An inverted feature keeps
+    /// all of its information: a model learns a negative coefficient and every
+    /// evaluation gate still sees signal at unchanged magnitude. An annihilated
+    /// one carries ZERO bits and is silently constant — the `FINDING-155` /
+    /// `FINDING-122` class. And a reviewer watching for a SIGN FLIP sees none,
+    /// concludes the admission was safe, and ships a dead column. ⇒ The rung-4
+    /// acceptance must be a NON-DEGENERACY lock (`sd(net_trade_flow) > 0` per
+    /// day), never a sign check.
+    ///
+    /// The total and its side row advance in ONE expression under ONE `?`, so
+    /// `observed == observed_ask + observed_bid + observed_none` holds for
+    /// everything THIS FUNCTION writes. ⚠ It is a property of this helper, NOT
+    /// an invariant of the type: all 14 fields are `pub`, `LobStats` is
+    /// `Deserialize` with no load-time validation, and the round-trip test in
+    /// this file deliberately violates it. Locked for the producer path by
+    /// `carrier_census_total_equals_sum_of_side_rows`.
+    ///
+    /// # Errors
+    /// [`TlobError::CounterOverflow`] if any of the three slots would exceed
+    /// `u64::MAX`. See that variant for why this is an error and not a panic.
+    pub fn count_aggregate_trade(&mut self, side: Side, size: u32) -> Result<()> {
+        let (total, count, volume) = match side {
+            Side::Ask => (
+                &mut self.aggregate_trades_observed,
+                &mut self.aggregate_trades_observed_ask,
+                &mut self.aggregate_trades_volume_ask,
+            ),
+            Side::Bid => (
+                &mut self.aggregate_trades_observed,
+                &mut self.aggregate_trades_observed_bid,
+                &mut self.aggregate_trades_volume_bid,
+            ),
+            Side::None => (
+                &mut self.aggregate_trades_observed,
+                &mut self.aggregate_trades_observed_none,
+                &mut self.aggregate_trades_volume_none,
+            ),
+        };
+        Self::accumulate(total, count, volume, size, "aggregate_trades")
+    }
+
+    /// Record one `Action::Fill` (vendor `F`) into the carrier census.
+    ///
+    /// `side` here is the **RESTING order's** — the opposite convention from
+    /// [`Self::count_aggregate_trade`]. This is the census only; the vendor's
+    /// conformance assertion (does the book actually hold that order, on that
+    /// side, at that price, with that size?) is verified separately by
+    /// `LobReconstructor::observe_resting_fill` (private), which mutates no
+    /// book state. ⚠ NOT an intra-doc link: rustdoc's
+    /// `private-intra-doc-links` lint is DENIED by CI (`RUSTDOCFLAGS=-D
+    /// warnings`, ci.yml docs job) and a bracketed link from this PUBLIC item
+    /// to that private fn fails the build with rc=101. Measured 2026-08-23.
+    ///
+    /// ⚠ THE CENSUS AND THE CONFORMANCE CHECK MUST NOT BE MERGED. The census
+    /// must count EVERY `F` the router sees, because it is graded against the
+    /// vendor's own record count. `observe_resting_fill` returns early when the
+    /// order is unknown, so counting there would silently undercount by exactly
+    /// the anomaly population — a subject that disagrees with the census for a
+    /// reason that has nothing to do with decoding.
+    ///
+    /// # Errors
+    /// [`TlobError::CounterOverflow`] if any of the three slots would exceed
+    /// `u64::MAX`.
+    pub fn count_resting_fill(&mut self, side: Side, size: u32) -> Result<()> {
+        let (total, count, volume) = match side {
+            Side::Ask => (
+                &mut self.resting_fills_observed,
+                &mut self.resting_fills_observed_ask,
+                &mut self.resting_fills_volume_ask,
+            ),
+            Side::Bid => (
+                &mut self.resting_fills_observed,
+                &mut self.resting_fills_observed_bid,
+                &mut self.resting_fills_volume_bid,
+            ),
+            Side::None => (
+                &mut self.resting_fills_observed,
+                &mut self.resting_fills_observed_none,
+                &mut self.resting_fills_volume_none,
+            ),
+        };
+        Self::accumulate(total, count, volume, size, "resting_fills")
+    }
+
+    /// Advance one carrier total, its side count and its side volume together.
+    ///
+    /// **Compute-then-commit.** All three successors are computed before any is
+    /// stored, so an overflow leaves the census EXACTLY as it was rather than
+    /// half-applied. A partially-applied census would be graded by
+    /// `check_carrier_sign.py` as a per-side disagreement — i.e. it would be
+    /// reported as a decode defect, when the real cause was an arithmetic
+    /// abort. Three extra lines buy the difference between a wrong diagnosis
+    /// and a correct one.
+    #[inline]
+    fn accumulate(
+        total: &mut u64,
+        count: &mut u64,
+        volume: &mut u64,
+        size: u32,
+        carrier: &'static str,
+    ) -> Result<()> {
+        let next_total = total
+            .checked_add(1)
+            .ok_or(TlobError::CounterOverflow(carrier))?;
+        let next_count = count
+            .checked_add(1)
+            .ok_or(TlobError::CounterOverflow(carrier))?;
+        let next_volume = volume
+            .checked_add(u64::from(size))
+            .ok_or(TlobError::CounterOverflow(carrier))?;
+
+        *total = next_total;
+        *count = next_count;
+        *volume = next_volume;
+        Ok(())
+    }
+
     /// Check if there were any warnings during processing.
     pub fn has_warnings(&self) -> bool {
         self.cancel_order_not_found > 0
@@ -408,7 +686,7 @@ impl LobStats {
     /// rename to `path`. Eliminates the SIGKILL-mid-write partial-file risk
     /// of the pre-M.A.5 `BufWriter + serde_json::to_writer_pretty` path.
     ///
-    /// **Envelope wrapper**: output JSON is `{ "schema_version": "2.1.0",
+    /// **Envelope wrapper**: output JSON is `{ "schema_version": "2.2.0",
     /// "stats": {...} }`. The `schema_version` field is the
     /// [`LOB_STATS_SCHEMA_VERSION`] constant. **Breaking change** for the
     /// on-disk format; pre-M.A.5 flat-shape files cannot round-trip through
@@ -485,7 +763,7 @@ impl LobStats {
     /// Load stats from a JSON file (dual-format aware).
     ///
     /// Phase M M.A.5 (REV 3 boundary discipline cycle): accepts BOTH:
-    /// - **Envelope shape** (post-M.A.5): `{ "schema_version": "2.1.0",
+    /// - **Envelope shape** (post-M.A.5): `{ "schema_version": "2.2.0",
     ///   "stats": {...} }` — preferred.
     /// - **Legacy flat shape** (pre-M.A.5): `{messages_processed: ..., ...}`
     ///   without an envelope. Emits a `log::warn!` (per call) so operators
@@ -584,7 +862,7 @@ impl LobStats {
 #[derive(Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct LobStatsExportEnvelope {
-    /// Schema version string (e.g., `"2.1.0"`).
+    /// Schema version string (e.g., `"2.2.0"`).
     pub schema_version: String,
 
     /// The wrapped [`LobStats`] payload.
@@ -918,8 +1196,11 @@ impl LobReconstructor {
     /// `tests/carrier_routing_discriminator.rs::assert_reduction_path_untaken`.
     #[inline]
     fn observe_resting_fill(&mut self, msg: &MboMessage) {
-        self.stats.resting_fills_observed += 1;
-
+        // ⚠ `resting_fills_observed` is NOT incremented here. COMMIT 2b moved the
+        // census to `LobStats::count_resting_fill`, called from the `Action::Fill`
+        // arm of `process_message_into`, so that the carrier total and its per-side
+        // row can never diverge. Re-adding an increment here DOUBLE-COUNTS the
+        // total against its own side rows and reds the per-carrier conjunction.
         let Some(order) = self.orders.get(&msg.order_id) else {
             // The vendor referenced an order the reconstructed book does not
             // hold. Inherits the signal formerly carried by
@@ -1403,11 +1684,39 @@ impl LobReconstructor {
             // `observe_resting_fill` verifies it and mutates nothing.
             Action::TradeAggregate => {
                 // The aggressor-side print. Carries `order_id == 0` on XNAS.ITCH (100%,
-                // 375,643/375,643 on 2025-07-01) so L-ADMIT drops it upstream there; on ARCX
-                // 19.8% carries `order_id != 0` and DOES reach this arm. Either way: no-op.
-                self.stats.aggregate_trades_observed += 1;
+                // 375,643/375,643 on 2025-07-01) so L-ADMIT drops it upstream there.
+                //
+                // ⚠ ON ARCX IT IS THE `T|N` CELL — AND ONLY THAT CELL — THAT REACHES HERE.
+                // Measured 2026-08-23 on arcx-pillar-20250701: T|A and T|B carry
+                // `order_id == 0` at 100% (104,268 / 81,261) and are dropped; T|N carries
+                // `order_id != 0` at 100% (49,788) and arrives. The often-quoted "~19.8% of
+                // ARCX T reaches the arm" is that one cell, not a proportional share.
+                // Either way: no-op.
+                //
+                // COMMIT 2b: the census lives HERE, in the arm, and not inside a helper
+                // returning `()`. `process_message_into` returns `Result<()>`, which is what
+                // lets the counters be advanced with `checked_add` and fail LOUD rather than
+                // wrap silently — see `TlobError::CounterOverflow`.
+                //
+                // `msg.side` on a `T` is the AGGRESSOR's side.
+                self.stats.count_aggregate_trade(msg.side, msg.size)?;
             }
-            Action::Fill => self.observe_resting_fill(msg),
+            Action::Fill => {
+                // COMMIT 2b: census FIRST, then the conformance check.
+                //
+                // ⚠ THE ORDER IS LOAD-BEARING, AND SO IS THE SEPARATION.
+                // `observe_resting_fill` returns early when the vendor references an order
+                // the book does not hold (`fill_referenced_unknown_order`). The census must
+                // count that record anyway — it is graded against the VENDOR's own count of
+                // `F` records, not against the subset our book happens to recognise. Counting
+                // inside `observe_resting_fill` would undercount by exactly the anomaly
+                // population and read as a decode defect.
+                //
+                // `msg.side` on an `F` is the RESTING order's side — the opposite convention
+                // from the arm above.
+                self.stats.count_resting_fill(msg.side, msg.size)?;
+                self.observe_resting_fill(msg);
+            }
             Action::Clear => {
                 self.stats.book_clears += 1;
                 if self.config.log_warnings {
@@ -2123,7 +2432,11 @@ mod tests {
         let trade = create_test_message(1, Action::Fill, Side::Bid, 100.0, 50);
         let state = lob.process_message(&trade).unwrap();
 
-        assert_eq!(lob.order_count(), 1, "a Fill must not remove the resting order");
+        assert_eq!(
+            lob.order_count(),
+            1,
+            "a Fill must not remove the resting order"
+        );
         assert_eq!(
             state.bid_sizes[0], 100,
             "Action::Fill is a BOOK NO-OP; the paired Cancel performs the reduction"
@@ -2162,7 +2475,11 @@ mod tests {
         let trade = create_test_message(1, Action::Fill, Side::Bid, 100.0, 100);
         lob.process_message(&trade).unwrap();
 
-        assert_eq!(lob.order_count(), 1, "a Fill must not remove the resting order");
+        assert_eq!(
+            lob.order_count(),
+            1,
+            "a Fill must not remove the resting order"
+        );
         assert_eq!(
             lob.bid_levels(),
             1,
@@ -2172,8 +2489,14 @@ mod tests {
         assert_eq!(lob.stats().trade_order_not_found, 0);
 
         // The paired Cancel is what removes it.
-        lob.process_message(&create_test_message(1, Action::Cancel, Side::Bid, 100.0, 100))
-            .unwrap();
+        lob.process_message(&create_test_message(
+            1,
+            Action::Cancel,
+            Side::Bid,
+            100.0,
+            100,
+        ))
+        .unwrap();
 
         assert_eq!(lob.order_count(), 0, "the paired Cancel removes the order");
         assert_eq!(lob.bid_levels(), 0, "and collapses the empty price level");
@@ -2651,13 +2974,33 @@ mod tests {
 
         // Now the two paired Cancels, in vendor order. Each reduces EXACTLY the
         // size its Fill announced: 100 -> 75 -> 25.
-        lob.process_message(&create_test_message(1, Action::Cancel, Side::Ask, 100.0, 25))
-            .unwrap();
-        assert_eq!(lob.get_lob_state().ask_sizes[0], 75, "first pair: 100 -> 75");
+        lob.process_message(&create_test_message(
+            1,
+            Action::Cancel,
+            Side::Ask,
+            100.0,
+            25,
+        ))
+        .unwrap();
+        assert_eq!(
+            lob.get_lob_state().ask_sizes[0],
+            75,
+            "first pair: 100 -> 75"
+        );
 
-        lob.process_message(&create_test_message(1, Action::Cancel, Side::Ask, 100.0, 50))
-            .unwrap();
-        assert_eq!(lob.get_lob_state().ask_sizes[0], 25, "second pair: 75 -> 25");
+        lob.process_message(&create_test_message(
+            1,
+            Action::Cancel,
+            Side::Ask,
+            100.0,
+            50,
+        ))
+        .unwrap();
+        assert_eq!(
+            lob.get_lob_state().ask_sizes[0],
+            25,
+            "second pair: 75 -> 25"
+        );
 
         assert_eq!(lob.order_count(), 1);
         assert_eq!(lob.stats().cancel_order_not_found, 0);
@@ -2680,7 +3023,11 @@ mod tests {
         lob.process_message(&create_test_message(1, Action::Fill, Side::Ask, 100.0, 100))
             .unwrap();
 
-        assert_eq!(lob.order_count(), 1, "an over-sized Fill is still a book no-op");
+        assert_eq!(
+            lob.order_count(),
+            1,
+            "an over-sized Fill is still a book no-op"
+        );
         assert_eq!(lob.ask_levels(), 1);
         assert_eq!(
             lob.get_lob_state().ask_sizes[0],
@@ -3399,8 +3746,14 @@ mod tests {
         // Phase M M.A.4: `errors` field REMOVED per Decision 10b
         // (F-007 closure — dead field). Two new fields added in its place:
         // `modify_order_not_found` + `add_order_id_collision` (F-013 closure).
-        // Use struct-update syntax `..LobStats::default()` to be resilient
-        // against future additive fields.
+        // ⚠ THIS LITERAL IS DELIBERATELY EXHAUSTIVE — do NOT "fix" it to
+        // `..LobStats::default()`. (An earlier version of this comment said to;
+        // the code never did, and the code is right.) Exhaustiveness is what
+        // makes rustc name this site whenever a counter is added, which is how
+        // COMMIT 2b's twelve per-side rows were forced into the round-trip
+        // instead of silently defaulting to 0 here forever. Every field carries
+        // a DISTINCT non-zero value so the round-trip proves the serde contract
+        // rather than proving that zero survives zero.
         let stats = LobStats {
             messages_processed: 1_000_000,
             system_messages_skipped: 42,
@@ -3422,6 +3775,23 @@ mod tests {
             // that zero survives zero.
             aggregate_trades_observed: 31,
             resting_fills_observed: 32,
+            // COMMIT 2b per-side census. Distinct values, and deliberately
+            // INCONSISTENT with their own totals (31 != 41+42+43): this test
+            // grades the SERDE contract, not the census invariant. The
+            // total-equals-sum invariant is graded behaviourally by
+            // `carrier_census_total_equals_sum_of_side_rows`, where it belongs.
+            aggregate_trades_observed_ask: 41,
+            aggregate_trades_observed_bid: 42,
+            aggregate_trades_observed_none: 43,
+            aggregate_trades_volume_ask: 44,
+            aggregate_trades_volume_bid: 45,
+            aggregate_trades_volume_none: 46,
+            resting_fills_observed_ask: 47,
+            resting_fills_observed_bid: 48,
+            resting_fills_observed_none: 49,
+            resting_fills_volume_ask: 50,
+            resting_fills_volume_bid: 51,
+            resting_fills_volume_none: 52,
             fill_referenced_unknown_order: 33,
             fill_size_exceeded_resting: 34,
             fill_side_mismatch: 35,
@@ -3458,6 +3828,18 @@ mod tests {
         // deserialises to 0 would be indistinguishable from "never observed".
         assert_eq!(loaded.aggregate_trades_observed, 31);
         assert_eq!(loaded.resting_fills_observed, 32);
+        assert_eq!(loaded.aggregate_trades_observed_ask, 41);
+        assert_eq!(loaded.aggregate_trades_observed_bid, 42);
+        assert_eq!(loaded.aggregate_trades_observed_none, 43);
+        assert_eq!(loaded.aggregate_trades_volume_ask, 44);
+        assert_eq!(loaded.aggregate_trades_volume_bid, 45);
+        assert_eq!(loaded.aggregate_trades_volume_none, 46);
+        assert_eq!(loaded.resting_fills_observed_ask, 47);
+        assert_eq!(loaded.resting_fills_observed_bid, 48);
+        assert_eq!(loaded.resting_fills_observed_none, 49);
+        assert_eq!(loaded.resting_fills_volume_ask, 50);
+        assert_eq!(loaded.resting_fills_volume_bid, 51);
+        assert_eq!(loaded.resting_fills_volume_none, 52);
         assert_eq!(loaded.fill_referenced_unknown_order, 33);
         assert_eq!(loaded.fill_size_exceeded_resting, 34);
         assert_eq!(loaded.fill_side_mismatch, 35);
@@ -3937,5 +4319,331 @@ mod tests {
         );
         assert_eq!(state.triggering_action, Some(Action::Add));
         assert_eq!(state.triggering_side, Some(Side::Bid));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // COMMIT 2b — THE PER-SIDE CARRIER CENSUS
+    // ════════════════════════════════════════════════════════════════════════
+    //
+    // ⚠ THESE TESTS ARE NOT OPTIONAL COVERAGE. THEY ARE THE ONLY VALIDATION
+    // THE `aggregate_trades_*` ROWS CAN EVER RECEIVE ON XNAS.
+    //
+    // 100% of the XNAS.ITCH `TradeAggregate` population carries `order_id == 0`
+    // and is dropped by `is_system_message()` ahead of the router, so all six
+    // `aggregate_trades_*` rows read 0 on live XNAS data until rung 4 admits
+    // the carrier. A correct implementation and a completely absent one are
+    // INDISTINGUISHABLE on that data — the class `FINDING-155` describes. The
+    // fixtures below defeat that by constructing `TradeAggregate` records with
+    // `order_id != 0`, which is the ARCX shape (~19.8% of its `T` population),
+    // and are therefore also the pre-validation of rung 4.
+    //
+    // Every fixture drives the FULL `process_message` path, not the helper, so
+    // it proves the ARM increments — not merely that the helper can.
+
+    /// Build a carrier record that clears `is_system_message()` and `validate()`.
+    ///
+    /// `order_id != 0`, `price > 0`, `size > 0` — the ARCX `T` shape. A record
+    /// built with `order_id == 0` is dropped ahead of the router and would make
+    /// every assertion below vacuously pass against a broken implementation.
+    fn carrier_msg(order_id: u64, action: Action, side: Side, size: u32) -> MboMessage {
+        MboMessage::new(order_id, action, side, 100_000_000_000, size)
+    }
+
+    #[test]
+    fn carrier_census_aggregate_trade_records_side_and_volume() {
+        let mut lob = LobReconstructor::new(10);
+        lob.process_message(&carrier_msg(9_001, Action::TradeAggregate, Side::Ask, 100))
+            .unwrap();
+        lob.process_message(&carrier_msg(9_002, Action::TradeAggregate, Side::Bid, 250))
+            .unwrap();
+        lob.process_message(&carrier_msg(9_003, Action::TradeAggregate, Side::None, 7))
+            .unwrap();
+
+        let s = lob.stats();
+        assert_eq!(s.aggregate_trades_observed, 3, "carrier total");
+        assert_eq!(s.aggregate_trades_observed_ask, 1, "T|A count");
+        assert_eq!(s.aggregate_trades_observed_bid, 1, "T|B count");
+        assert_eq!(s.aggregate_trades_observed_none, 1, "T|N count");
+        assert_eq!(s.aggregate_trades_volume_ask, 100, "T|A volume");
+        assert_eq!(s.aggregate_trades_volume_bid, 250, "T|B volume");
+        assert_eq!(s.aggregate_trades_volume_none, 7, "T|N volume");
+
+        // NO CROSS-CARRIER LEAK. A re-merge of the two populations is exactly
+        // what this commit exists to make visible; the merged implementation
+        // reproduced every TOTAL correctly, so the negative assertion is the
+        // load-bearing half.
+        assert_eq!(
+            s.resting_fills_observed, 0,
+            "T must not touch the F carrier"
+        );
+        assert_eq!(s.resting_fills_observed_ask, 0);
+        assert_eq!(s.resting_fills_observed_bid, 0);
+        assert_eq!(s.resting_fills_observed_none, 0);
+        assert_eq!(s.resting_fills_volume_ask, 0);
+        assert_eq!(s.resting_fills_volume_bid, 0);
+        assert_eq!(s.resting_fills_volume_none, 0);
+    }
+
+    #[test]
+    fn carrier_census_resting_fill_records_side_and_volume() {
+        let mut lob = LobReconstructor::new(10);
+        lob.process_message(&carrier_msg(7_001, Action::Add, Side::Bid, 500))
+            .unwrap();
+        lob.process_message(&carrier_msg(7_001, Action::Fill, Side::Bid, 120))
+            .unwrap();
+
+        let s = lob.stats();
+        assert_eq!(s.resting_fills_observed, 1, "carrier total");
+        assert_eq!(s.resting_fills_observed_bid, 1, "F|B count");
+        assert_eq!(s.resting_fills_volume_bid, 120, "F|B volume");
+        assert_eq!(s.resting_fills_observed_ask, 0);
+        assert_eq!(s.resting_fills_observed_none, 0);
+
+        assert_eq!(
+            s.aggregate_trades_observed, 0,
+            "F must not touch the T carrier"
+        );
+        assert_eq!(s.aggregate_trades_observed_bid, 0);
+    }
+
+    #[test]
+    fn carrier_census_resting_fill_with_side_none_lands_in_the_none_row() {
+        // ⚠ THE ONLY THING IN EXISTENCE THAT CAN VALIDATE THESE TWO ROWS —
+        // NOT THE REST OF THIS SUITE, AND NOT THE GATE.
+        //
+        // Found by adversarial review 2026-08-23. Before this test, mutating
+        // `count_resting_fill`'s `Side::None` arm to write the `_ask` slots left
+        // the ENTIRE suite green AND the gate green on BOTH pre-registered days:
+        //   * the other fixtures drive only `Side::Bid` / `Side::Ask` fills;
+        //   * `carrier_census_total_equals_sum_of_side_rows` is invariant under
+        //     a mis-route between side rows;
+        //   * the serde round-trip uses a struct literal and never calls the
+        //     producer at all;
+        //   * and the vendor census carries NO `F|N` cell on 2025-07-01 or
+        //     2025-07-02, so G-SIGN scores `S-resting_fills-none-{count,volume}`
+        //     at expected 0 / observed 0 and PASSES, while `_ask` silently
+        //     absorbs zero extra records.
+        //
+        // The asymmetry is what gave the gap away: the `T` carrier's `_none` row
+        // IS covered behaviourally, and the `F` carrier's was not. This is the
+        // `FINDING-155` class arriving inside 2b's own oracle — a row whose
+        // correct live value on the graded days is 0, so correct and mis-routed
+        // are the same bytes.
+        //
+        // The state is reachable, not synthetic: venues do publish fills with no
+        // disclosed side, and `observe_resting_fill` treats `Side::None`
+        // explicitly as an ABSENCE of information rather than a disagreement.
+        let mut lob = LobReconstructor::new(10);
+        lob.process_message(&carrier_msg(4_001, Action::Add, Side::Ask, 300))
+            .unwrap();
+        lob.process_message(&carrier_msg(4_001, Action::Fill, Side::None, 75))
+            .unwrap();
+
+        let s = lob.stats();
+        assert_eq!(s.resting_fills_observed, 1, "carrier total");
+        assert_eq!(s.resting_fills_observed_none, 1, "F|N count");
+        assert_eq!(s.resting_fills_volume_none, 75, "F|N volume");
+        assert_eq!(
+            s.resting_fills_observed_ask + s.resting_fills_observed_bid,
+            0,
+            "F|N must not be folded into a directional row"
+        );
+        assert_eq!(s.resting_fills_volume_ask + s.resting_fills_volume_bid, 0);
+        assert_eq!(
+            s.fill_side_mismatch, 0,
+            "Side::None on a fill is an ABSENCE of information, not a side disagreement"
+        );
+    }
+
+    #[test]
+    fn carrier_census_side_none_is_a_first_class_row() {
+        // `check_carrier_sign.py` calls dropping `T|N` one of the traps it
+        // exists to catch: a side key present in the vendor census but absent
+        // from the subject is a Tier-3 FAILURE, not an absent subject. On
+        // 2025-07-01 that row carries 68,063 records — it is not a rounding
+        // bucket, and it must never be folded into ask/bid or silently dropped.
+        let mut lob = LobReconstructor::new(10);
+        for i in 0..5_u64 {
+            lob.process_message(&carrier_msg(
+                8_000 + i,
+                Action::TradeAggregate,
+                Side::None,
+                3,
+            ))
+            .unwrap();
+        }
+        let s = lob.stats();
+        assert_eq!(s.aggregate_trades_observed_none, 5, "T|N must be counted");
+        assert_eq!(s.aggregate_trades_volume_none, 15, "T|N volume must accrue");
+        assert_eq!(
+            s.aggregate_trades_observed_ask + s.aggregate_trades_observed_bid,
+            0,
+            "T|N must not be folded into a directional row"
+        );
+    }
+
+    #[test]
+    fn carrier_census_total_equals_sum_of_side_rows() {
+        // The invariant `count_aggregate_trade` / `count_resting_fill` exist to
+        // guarantee structurally: total and side row advance under one `?`.
+        let mut lob = LobReconstructor::new(10);
+        lob.process_message(&carrier_msg(6_001, Action::Add, Side::Ask, 400))
+            .unwrap();
+        for (i, side) in [Side::Ask, Side::Bid, Side::None].iter().enumerate() {
+            lob.process_message(&carrier_msg(
+                6_100 + i as u64,
+                Action::TradeAggregate,
+                *side,
+                10,
+            ))
+            .unwrap();
+        }
+        lob.process_message(&carrier_msg(6_001, Action::Fill, Side::Ask, 40))
+            .unwrap();
+
+        let s = lob.stats();
+        assert_eq!(
+            s.aggregate_trades_observed,
+            s.aggregate_trades_observed_ask
+                + s.aggregate_trades_observed_bid
+                + s.aggregate_trades_observed_none,
+            "T total must equal the sum of its side rows"
+        );
+        assert_eq!(
+            s.resting_fills_observed,
+            s.resting_fills_observed_ask
+                + s.resting_fills_observed_bid
+                + s.resting_fills_observed_none,
+            "F total must equal the sum of its side rows"
+        );
+    }
+
+    #[test]
+    fn carrier_census_counts_a_fill_the_book_cannot_recognise() {
+        // ⚠ THE REGRESSION GUARD FOR THE ONE "SIMPLIFICATION" THAT LOOKS RIGHT.
+        //
+        // Moving the census into `observe_resting_fill` compiles, reads more
+        // cohesively, and is WRONG: that function returns early when the vendor
+        // references an order the book does not hold, so the census would
+        // undercount by exactly the anomaly population. The subject is graded
+        // against the VENDOR's count of `F` records, not against the subset our
+        // book recognises, so the shortfall would be reported as a decode
+        // defect with no decode defect present.
+        let mut lob = LobReconstructor::new(10);
+        lob.process_message(&carrier_msg(5_555, Action::Fill, Side::Ask, 90))
+            .unwrap();
+
+        let s = lob.stats();
+        assert_eq!(
+            s.resting_fills_observed, 1,
+            "an unrecognised F is still a vendor F and must be censused"
+        );
+        assert_eq!(s.resting_fills_observed_ask, 1);
+        assert_eq!(s.resting_fills_volume_ask, 90);
+        assert_eq!(
+            s.fill_referenced_unknown_order, 1,
+            "and the conformance check must still fire"
+        );
+    }
+
+    #[test]
+    fn carrier_census_overflow_is_fail_loud() {
+        // hft-rules §1: an instrument that cannot go red is not an instrument.
+        // This drives the `checked_add` path red and proves the two properties
+        // claimed for it: it ERRORS rather than wrapping, and it leaves the
+        // census EXACTLY as it was (compute-then-commit) rather than half-applied.
+        let mut stats = LobStats::default();
+        stats.aggregate_trades_observed = u64::MAX;
+
+        let err = stats
+            .count_aggregate_trade(Side::Ask, 1)
+            .expect_err("a saturated carrier total MUST fail loud, never wrap");
+        assert!(
+            matches!(err, TlobError::CounterOverflow("aggregate_trades")),
+            "unexpected error variant: {err:?}"
+        );
+        assert_eq!(
+            stats.aggregate_trades_observed_ask, 0,
+            "compute-then-commit: no slot may advance when any slot overflows"
+        );
+        assert_eq!(stats.aggregate_trades_volume_ask, 0);
+
+        // The volume slot overflows independently of the count slots.
+        let mut stats = LobStats::default();
+        stats.resting_fills_volume_bid = u64::MAX - 1;
+        let err = stats
+            .count_resting_fill(Side::Bid, 5)
+            .expect_err("a saturated volume slot MUST fail loud");
+        assert!(matches!(err, TlobError::CounterOverflow("resting_fills")));
+        assert_eq!(
+            stats.resting_fills_observed, 0,
+            "the total must not advance when the volume slot overflows"
+        );
+        assert_eq!(stats.resting_fills_observed_bid, 0);
+
+        // ⚠ THE THIRD SEED IS NOT REDUNDANT — `accumulate` guards THREE
+        // INDEPENDENT SLOTS and each needs its own. Found by the mutation
+        // battery 2026-08-23: with only the total and volume seeds above,
+        // rewriting the per-side COUNT slot to `saturating_add` left this test
+        // GREEN, because neither seed reaches that slot. A guard with N
+        // independent failure paths needs N seeds, not one.
+        let mut stats = LobStats::default();
+        stats.aggregate_trades_observed_none = u64::MAX;
+        let err = stats
+            .count_aggregate_trade(Side::None, 1)
+            .expect_err("a saturated per-side COUNT slot MUST fail loud");
+        assert!(matches!(
+            err,
+            TlobError::CounterOverflow("aggregate_trades")
+        ));
+        assert_eq!(
+            stats.aggregate_trades_observed, 0,
+            "compute-then-commit: the total must not advance when the count slot overflows"
+        );
+        assert_eq!(stats.aggregate_trades_volume_none, 0);
+    }
+
+    #[test]
+    fn carrier_census_wire_names_match_the_gate_contract() {
+        // ⚠ THIS TEST EXISTS FOR THE TWO CARRIER TOTALS ABOVE ALL ELSE.
+        //
+        // Measured against the gate (2026-08-23): renaming one of the twelve
+        // PER-SIDE keys fails loudly, because `check_tier3` builds its rows from
+        // `ref_sides | sub_sides` and an absent key scores `observed=None`
+        // against an integer. But `present` is derived from the two TOTALS
+        // alone (check_carrier_sign.py:746-747) and gates tiers 2 and 3 (:988),
+        // so renaming a TOTAL un-grades all twelve correct per-side rows at once
+        // and the verdict reports `SUBJECT_ABSENT` — self-classified as
+        // "(ii) absence — NOT a discriminating failure", and not upgraded by
+        // `--assert`. A subject that is no longer graded looks exactly like a
+        // subject with nothing wrong.
+        //
+        // Nothing else in this repository checks those two names.
+        let v = serde_json::to_value(LobStats::default()).expect("LobStats must serialize");
+        let obj = v.as_object().expect("LobStats must serialize to an object");
+
+        let mut expected = vec![
+            "aggregate_trades_observed".to_string(),
+            "resting_fills_observed".to_string(),
+        ];
+        for carrier in ["aggregate_trades", "resting_fills"] {
+            for measure in ["observed", "volume"] {
+                for side in ["ask", "bid", "none"] {
+                    expected.push(format!("{carrier}_{measure}_{side}"));
+                }
+            }
+        }
+        assert_eq!(
+            expected.len(),
+            14,
+            "the canonical subject schema has 14 keys"
+        );
+        for key in &expected {
+            assert!(
+                obj.contains_key(key.as_str()),
+                "wire key {key:?} missing — check_carrier_sign.py would read None \
+                 and DROP this check instead of failing it"
+            );
+        }
     }
 }

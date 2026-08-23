@@ -76,6 +76,44 @@ pub enum TlobError {
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
 
+    /// A statistics counter would overflow `u64`.
+    ///
+    /// COMMIT 2b (the per-side carrier census). The carrier counters are
+    /// incremented with `checked_add` rather than `+=` because they are the
+    /// ACCEPTANCE SUBJECT of the per-carrier conjunction gate
+    /// (`scripts/ci/check_carrier_sign.py`): a silently wrapped counter would
+    /// be graded against the vendor census and read as a DECODE defect, which
+    /// is the most expensive wrong answer this pipeline can produce.
+    ///
+    /// ⚠ WHY NOT `.expect()`, AND WHY NOT A SATURATING ADD. Overflow here is
+    /// unreachable in practice — `u64::MAX` is ~1.8e19 against ~7e5 carrier
+    /// records/day — so an `.expect()` would be dead code that can never be
+    /// exercised, and `saturating_add` would report a WRONG count as if it
+    /// were right, the silent-corruption class hft-rules §8 forbids. Returning
+    /// an error keeps the failure path both real and REACHABLE: it is driven
+    /// red by `carrier_census_overflow_is_fail_loud`, per hft-rules §1
+    /// ("an instrument that cannot go red is not an instrument").
+    ///
+    /// ⚠ SCOPE OF "FAIL-LOUD", STATED HONESTLY (hft-rules §8 — fail-open vs
+    /// fail-closed is a DECISION, stated at the site). This variant is loud in
+    /// the LIBRARY. Its sole production consumer is NOT: `export_to_parquet`'s
+    /// per-message loop absorbs an `Err(other)` into `rows_skipped_other` with
+    /// a `log::warn!`, and the day still writes a stats file. Worse, the `?`
+    /// fires BEFORE `stats.messages_processed += 1`, so the shortfall would
+    /// surface downstream as G-SIGN's tier-1 `G2-processed-complements-skipped`
+    /// — an arithmetic abort diagnosed as an ADMISSION defect, one level up
+    /// from the mis-diagnosis `LobStats::accumulate`'s compute-then-commit
+    /// exists to prevent. That is a doc-overclaim, not a live bug: overflow
+    /// needs ~2.7e13 days at the observed ~6.8e5 carrier records/day. Changing
+    /// the exporter's error policy is a separate decision and is recorded as
+    /// owed rather than made here.
+    ///
+    /// The payload names the carrier, not the individual counter: the three
+    /// slots of one carrier advance together (see `LobStats::accumulate`), so
+    /// the carrier is the smallest unit that can fail.
+    #[error("Statistics counter would overflow u64 for carrier: {0}")]
+    CounterOverflow(&'static str),
+
     /// Generic error with context
     #[error("Error: {0}")]
     Generic(String),

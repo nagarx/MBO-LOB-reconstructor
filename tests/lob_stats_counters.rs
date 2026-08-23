@@ -293,9 +293,46 @@ fn test_lobstats_schema_version_constant_is_pinned() {
     // "this reconstructor counted nothing", which is exactly the
     // absence-indistinguishable-from-agreement failure hft-rules §1 forbids.
     // The envelope's `schema_version` is the only field that discriminates.
+    //
+    // 2.1.0 -> 2.2.0 at the CARRIER CENSUS (COMMIT 2b): a second intentional
+    // MINOR bump under the same policy. TWELVE fields were added — the
+    // per-side rows `{aggregate_trades,resting_fills}_{observed,volume}_{ask,bid,none}`.
+    //
+    // ⚠ CORRECTED 2026-08-23 — AN EARLIER VERSION OF THIS COMMENT CLAIMED THE
+    // ENVELOPE VERSION IS "THE ONLY DISCRIMINATOR THAT EXISTS" BETWEEN A 2a AND
+    // A 2b ARTIFACT. MEASUREMENT REFUTES THAT, AND THE BUMP IS STILL CORRECT.
+    //
+    // What is true: six of 2b's twelve rows — every `aggregate_trades_*` row —
+    // are STRUCTURALLY 0 on XNAS.ITCH until rung 4, because 100% of that
+    // venue's `TradeAggregate` population carries `order_id == 0` and is
+    // dropped ahead of the router. Those six rows genuinely cannot discriminate.
+    //
+    // What is FALSE is the leap from there to "the artifacts are identical". A
+    // 2a artifact carries the two totals and NONE of the twelve per-side keys,
+    // so G-SIGN's tier 3 — which iterates `ref_sides | sub_sides` and therefore
+    // generates a row from the VENDOR census even when the subject is silent —
+    // scores every one of them `observed=None` against an integer `expected`:
+    // 6 `aggregate_trades` rows + 4 `resting_fills` rows = 10 discriminating
+    // reds. A correct 2b artifact reds only the 6. KEY ABSENCE is the
+    // discriminator, it is stronger than a version string, and it needs no
+    // cooperation from the reader.
+    //
+    // So why bump at all? Because it is the constant's own documented policy
+    // ("MINOR: additive non-breaking changes (e.g., new `LobStats` field)") and
+    // this test exists to make that a DECISION rather than a side effect.
+    //
+    // ⚠ AND THE ONE PLACE THE ABSENT-VS-ZERO HAZARD IS REAL IS THE PLACE THE
+    // VERSION DOES NOT HELP. A Rust consumer loading an old artifact through
+    // `LobStats::load_from_file` gets `#[serde(default)]` mapping every absent
+    // key to 0 with no diagnostic — and `load_from_file` reads `schema_version`
+    // ONLY to choose the envelope-vs-legacy branch; it never compares the
+    // value. Across the monorepo there is currently NO consumer that compares
+    // this constant to anything. Under hft-rules §1 ("a hash or identity a
+    // producer EMITS must have a NAMED CONSUMER that fails when it disagrees")
+    // that is an open gap, recorded here rather than papered over.
     assert_eq!(
-        LOB_STATS_SCHEMA_VERSION, "2.1.0",
-        "LOB_STATS_SCHEMA_VERSION must remain pinned at 2.1.0 until the next \
+        LOB_STATS_SCHEMA_VERSION, "2.2.0",
+        "LOB_STATS_SCHEMA_VERSION must remain pinned at 2.2.0 until the next \
          intentional, coordinated bump"
     );
 }
