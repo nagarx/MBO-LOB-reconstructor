@@ -177,10 +177,66 @@ pub struct MboMessage {
     /// Timestamp (nanoseconds since epoch)
     /// Optional - not always needed for LOB reconstruction
     pub timestamp: Option<i64>,
+
+    /// The vendor's raw record-flag byte, carried verbatim from `dbn::MboMsg.flags`.
+    ///
+    /// Databento documents this field as "a bit field indicating event end, message
+    /// characteristics, and **data quality**"
+    /// ([`dbn::MboMsg::flags`], v0.64.0 `record.rs:91-93`). Until 2026-09-03 the
+    /// decoder never read it, so the byte was destroyed at
+    /// [`crate::DbnBridge::convert`] and no consumer downstream could recover it.
+    ///
+    /// # The bits, and what is actually set in this corpus
+    ///
+    /// Bit constants are `dbn::flags` (`flags.rs:10-23`). Measured 2026-09-03 over
+    /// **94,542,598** MBO records — 16 day-files, XNAS.ITCH + ARCX.PILLAR, 5
+    /// instruments, 2025-02-03 -> 2026-01-07:
+    ///
+    /// ```text
+    ///   LAST              1<<7   52.291% - 85.168% per file   the venue-event boundary
+    ///   PUBLISHER_SPECIFIC 1<<1  see the era note below
+    ///   BAD_TS_RECV       1<<3   exactly 1 record per file, 16/16 files (the leading `R`)
+    ///   TOB               1<<6   0
+    ///   SNAPSHOT          1<<5   0
+    ///   MBP               1<<4   0
+    ///   MAYBE_BAD_BOOK    1<<2   0
+    ///   bit 0                    0
+    /// ```
+    ///
+    /// ⚠ **Do not write "vendor data-quality flags are being lost".** The two bits
+    /// that carry a genuine quality signal — `MAYBE_BAD_BOOK` and `SNAPSHOT` — are
+    /// **absent** from every record measured. What was being destroyed is `LAST`,
+    /// `PUBLISHER_SPECIFIC` and `BAD_TS_RECV`.
+    ///
+    /// ⚠ **THE ENCODING IS NOT STABLE ACROSS THE CORPUS.** `PUBLISHER_SPECIFIC` went
+    /// from **52.197% -> 0.000%** between `xnas-itch-20250801` and
+    /// `xnas-itch-20250804`, and on ARCX from **84.228% -> 0.000%** on the same two
+    /// dates; the distinct raw-value set went `[0, 8, 128, 130] -> [0, 8, 128]`.
+    /// Re-measured here on three further instruments, all flipping on the same date
+    /// (SNAP 70.585 -> 0.000, CRSP 46.563 -> 0.000, PEP 55.354 -> 0.000). The
+    /// 233-day flagship corpus straddles that boundary, and nothing in either repo
+    /// could detect it. That is why the carrier is the **raw byte** rather than a
+    /// fixed set of per-bit counters: a counter set chosen today forecloses whichever
+    /// bit turns out to matter next.
+    ///
+    /// # Zero is a real value, not "unknown"
+    ///
+    /// `0` means "the vendor set no bits" — 130 is the modal value on a 2025-07 file
+    /// and `0` is the second-most common. A message built by
+    /// [`MboMessage::new`] also carries `0`, because a synthesised message has no
+    /// vendor flags. The field is deliberately a plain `u8` and not an
+    /// `Option<u8>`: the vendor's own type is a transparent `u8` bit field with, in
+    /// its own words, **no universal null**, and inventing a third "unknown" state
+    /// would create a distinction no consumer can act on.
+    pub flags: u8,
 }
 
 impl MboMessage {
     /// Create a new MBO message.
+    ///
+    /// `timestamp` is `None` and [`Self::flags`] is `0` — this constructor builds a
+    /// SYNTHESISED message, which by definition carries no vendor flag byte. The
+    /// vendor path is [`crate::DbnBridge::convert`], which populates both.
     pub fn new(order_id: u64, action: Action, side: Side, price: i64, size: u32) -> Self {
         Self {
             order_id,
@@ -189,6 +245,7 @@ impl MboMessage {
             price,
             size,
             timestamp: None,
+            flags: 0,
         }
     }
 
@@ -224,6 +281,56 @@ impl MboMessage {
     /// Unlike [`Self::is_system_message()`], this method checks whether a message
     /// that *should* represent a valid order actually has valid field values.
     /// System messages (heartbeats, status) should be filtered first.
+    /// # W04 — the undefined-value sentinels, and why `price <= 0` does not catch them
+    ///
+    /// `i64::MAX` is **positive**, so the vendor's undefined-price sentinel walks
+    /// straight past the `price <= 0` clause below and emerges from
+    /// [`Self::price_as_f64`] as `9_223_372_036.854_776` — a **finite, plausible**
+    /// $9.2-billion quote that satisfies every `is_finite()` guard downstream. That
+    /// is hft-rules §2's named failure: "an unguarded divide neither crashes nor
+    /// yields `NaN`". Measured on the candidate at HEAD before this change:
+    /// `convert() -> Ok`, `price_as_f64 = 9223372036.854776`, `validate() = true`,
+    /// `mid = Some(4611686096.947389)`, `is_finite(mid) = true`.
+    ///
+    /// ⚠ **ONLY THE PRICE SENTINEL IS CHECKED HERE, AND THE ASYMMETRY IS THE POINT**
+    /// (hft-rules §2: a sentinel is a PER-FIELD property of a vendor's wire format;
+    /// guard on what the schema declares for THAT field).
+    ///
+    /// * **PRICE — declared, mandated, and checked in BOTH places.** `MboMsg.price`
+    ///   carries the `fixed_price` attribute in the vendor's own record definition,
+    ///   and `data/DATABENTO_SCHEMA_REFERENCE.md` states the rule twice: the sentinel
+    ///   table gives `i64::MAX` for every fixed price or value, and §7 says "Test
+    ///   `i64::MAX` before dividing a fixed price or value by 1e9." Nothing in this
+    ///   crate treats `i64::MAX` as a legitimate price, and `price <= 0` above
+    ///   already asserts price sanity for this type, so the sentinel belongs here as
+    ///   well as at the boundary.
+    /// * **SIZE — a WIRE null only, so it is checked at the WIRE only.** See the
+    ///   comment beside the `size == 0` clause below for the full argument and the
+    ///   execution that settled it. `dbn::UNDEF_ORDER_SIZE` is guarded in
+    ///   [`crate::DbnBridge::convert`] and deliberately NOT here.
+    ///
+    /// # FAIL-CLOSED, and the decision is stated here (hft-rules §8)
+    ///
+    /// The clause REJECTS rather than clamps or zeroes. A rejection is observable —
+    /// the caller sees a typed `TlobError`, and on the loader path
+    /// `LoaderStats::messages_skipped` advances under `skip_invalid` — whereas a
+    /// clamped or zeroed value is a silent wrong number of exactly the kind this
+    /// pipeline exists to prevent.
+    ///
+    /// # Reachability, and the measured exposure
+    ///
+    /// `LobReconstructor::process_message_into` calls this under
+    /// `config.validate_messages`, which **defaults to `true`** — so it runs on every
+    /// non-`Clear` record. `Action::Clear` is exempted by the CALLER (it is not
+    /// supposed to represent a valid order, and it is the one action that
+    /// legitimately carries the sentinel), which is why no action test appears here.
+    ///
+    /// ⚠ **This is a GUARD GAP, not a live wrong number.** Re-measured 2026-09-03
+    /// over 94,542,598 MBO records / 16 files / 2 venues / 5 instruments:
+    /// `price == i64::MAX` occurs **20 times, 100% of them on `Action::Clear`**;
+    /// `size == u32::MAX`, `size == i32::MAX` and `price <= 0` occur **ZERO** times.
+    /// Nothing on disk changes because of this clause. Promoting it to a
+    /// block-production defect without that hedge would repeat `FINDING-181`.
     pub fn validate(&self) -> crate::error::Result<()> {
         use crate::error::TlobError;
 
@@ -235,9 +342,42 @@ impl MboMessage {
             return Err(TlobError::InvalidPrice(self.price));
         }
 
+        // `dbn::UNDEF_PRICE`. Spelled as `i64::MAX` because this module must compile
+        // without the `databento` feature, so it cannot name the vendor constant.
+        // `vendor_sentinel_constants_still_have_the_values_this_crate_hardcodes`
+        // in `tests/decode_sentinel_contract.rs` is the check that the two agree —
+        // without it this would be a second, silently-divergent copy of the vendor's
+        // map, which is exactly how `b'F'` came to decode as a trade.
+        if self.price == i64::MAX {
+            return Err(TlobError::InvalidPrice(self.price));
+        }
+
         if self.size == 0 {
             return Err(TlobError::InvalidSize(0));
         }
+
+        // ⛔ THERE IS DELIBERATELY NO `size == u32::MAX` CLAUSE HERE, AND THE
+        // OMISSION IS THE POINT. `dbn::UNDEF_ORDER_SIZE` is a property of the VENDOR
+        // WIRE FORMAT, not of this domain type, so it is guarded at the vendor
+        // boundary (`DbnBridge::convert`) and nowhere else — hft-rules §8: validate
+        // at system boundaries, trust internal code.
+        //
+        // Adding it here was tried and REFUTED BY EXECUTION. It fails
+        // `tests/integration_test.rs::test_edge_case_large_sizes`, a pre-existing
+        // OVERFLOW-BOUNDARY contract (hft-rules §6 "Boundary") that builds a book at
+        // `size = u32::MAX` through `MboMessage::new` and asserts the u32 -> u64
+        // widening does not overflow: `total_bid_volume == u32::MAX as u64`,
+        // `MarketImpact::simulate_buy(..).can_fill()`, `depth_imbalance ~ 0`. It uses
+        // the value as the LARGEST REPRESENTABLE SIZE, never as a sentinel, and it
+        // never touches the vendor path.
+        //
+        // Three independent sources agree that `u32::MAX` is a legal size for this
+        // TYPE and only a null on the WIRE: (1) the vendor declines to declare it —
+        // `data/DATABENTO_SCHEMA_REFERENCE.md` limits §4, "ordinary trade, MBO, MBP,
+        // BBO and CBBO size fields do not all document a field-specific null rule";
+        // (2) that test; (3) the live corpus, where `size == u32::MAX` occurs 0 times
+        // in 94,542,598 records. The price sentinel is NOT symmetric with it — see
+        // above — which is why exactly one of the two clauses lives here.
 
         Ok(())
     }

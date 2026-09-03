@@ -156,6 +156,79 @@ impl DbnBridge {
             Some(ts_signed)
         };
 
+        // ═══════════════════════════════════════════════════════════════════════
+        // W04 — THE VENDOR'S UNDEFINED-VALUE SENTINELS.
+        // ═══════════════════════════════════════════════════════════════════════
+        //
+        // ⚠ THIS IS THE SECOND ACTION-KEYED PARTITION IN THIS FUNCTION AND IT IS
+        // DELIBERATELY NOT THE SAME ONE AS THE TIMESTAMP DISPATCH ABOVE. Do not
+        // "harmonise" them. They answer different questions:
+        //
+        //   timestamp:  for which actions does the vendor legitimately OMIT a clock?
+        //               -> `TradeAggregate | Clear | None`
+        //   price/size: for which actions is a price or a quantity a MEANINGFUL
+        //               quantity at all?
+        //               -> everything except `Clear` (a book reset names no level)
+        //                  and `None` (a no-op that "may carry flags or other
+        //                  information", `types::Action::None`).
+        //
+        // `TradeAggregate` sits on opposite sides of the two: a trade print may
+        // arrive without a clock, but a trade print at an UNDEFINED PRICE is
+        // meaningless. Measured: zero `T` records carry the sentinel, so including
+        // it here rejects nothing that exists.
+        //
+        // 🔴 `Action::Clear` MUST STAY EXEMPT, AND THAT IS THE WHOLE DIFFICULTY OF
+        // THIS GUARD. Re-measured 2026-09-03 over 94,542,598 MBO records (16
+        // day-files, XNAS.ITCH + ARCX.PILLAR, 5 instruments, 2025-02-03 ->
+        // 2026-01-07): `price == UNDEF_PRICE` occurs **20 times and 100% of them are
+        // on `Action::Clear`** — 20 sentinels against exactly 20 `R` records, i.e.
+        // EVERY Clear carries it and nothing else does (1/day XNAS, 2/day ARCX;
+        // 699 corpus-wide on the 233+233-day flagship). A guard keyed on the FIELD
+        // instead of the ACTION rejects every session-boundary book reset in the
+        // corpus. Nothing would error: the book would simply never reset, and each
+        // day would inherit the previous day's resting orders.
+        // `the_clear_record_the_vendor_actually_sends_still_resets_the_book` in
+        // `tests/decode_sentinel_contract.rs` is the instrument that holds this; it
+        // was driven RED by construction (adding `Clear` to the arm below).
+        //
+        // ⚠ `Action::None` is exempt on a ZERO-RECORD population — `N` appears 0
+        // times in all 94,542,598 records, so this is a JUDGEMENT, not a
+        // measurement, and it is stated as one. It is grouped with `Clear` for the
+        // same reason the timestamp dispatch above groups it there: exempting cannot
+        // lose a record, whereas rejecting would be a new hard rejection of a
+        // population nobody has ever observed.
+        //
+        // ⚠ EVIDENCE ASYMMETRY BETWEEN THE TWO CLAUSES — see
+        // `MboMessage::validate` for the full statement. Short form: `UNDEF_PRICE`
+        // is DECLARED for this field (`MboMsg.price` carries the vendor's
+        // `fixed_price` attribute, and `data/DATABENTO_SCHEMA_REFERENCE.md` §7
+        // mandates the test); `UNDEF_ORDER_SIZE` is NOT declared for `MboMsg.size`
+        // (the same reference's limits §4 explicitly declines to infer it) and rests
+        // on the constant's declared domain — "unset or null **order quantity**"
+        // against a field documented as "The **order quantity**" — plus the
+        // arithmetic consequence of admitting 4,294,967,295 into `total_bid_volume`.
+        //
+        // FAIL-CLOSED, stated at the site (hft-rules §8): reject, never clamp. On the
+        // loader path a rejection is observable as `LoaderStats::messages_skipped`
+        // (when `skip_invalid`) or as a typed `BoundaryError::Convert` (when not) —
+        // never a silent drop. Exhaustive match, no wildcard: a future `Action`
+        // variant must be a compile error here rather than a silently admitted one.
+        match action {
+            Action::Add
+            | Action::Modify
+            | Action::Cancel
+            | Action::Fill
+            | Action::TradeAggregate => {
+                if msg.price == dbn::UNDEF_PRICE {
+                    return Err(TlobError::InvalidPrice(msg.price));
+                }
+                if msg.size == dbn::UNDEF_ORDER_SIZE {
+                    return Err(TlobError::InvalidSize(msg.size));
+                }
+            }
+            Action::Clear | Action::None => {}
+        }
+
         Ok(MboMessage {
             order_id: msg.order_id,
             action,
@@ -163,6 +236,11 @@ impl DbnBridge {
             price: msg.price,
             size: msg.size,
             timestamp,
+            // W05 — the vendor's record-flag byte, carried verbatim. Before this it
+            // was read by nothing and died here; see `MboMessage::flags` for the
+            // per-bit live census and for the 2025-08-04 encoding change that no
+            // code in either repo could detect.
+            flags: msg.flags.raw(),
         })
     }
 

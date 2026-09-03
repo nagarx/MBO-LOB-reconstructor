@@ -581,6 +581,8 @@ mod tests {
             price,
             size,
             timestamp: Some(ts),
+            // W05: synthetic fixture — no vendor flag byte.
+            flags: 0,
         }
     }
 
@@ -865,6 +867,8 @@ mod tests {
             price,
             size,
             timestamp: None,
+            // W05: synthetic fixture — no vendor flag byte.
+            flags: 0,
         }
     }
 
