@@ -307,6 +307,9 @@ impl MarketImpact {
     }
 
     /// Simulate order execution against a specific side.
+    ///
+    /// A `quantity` of 0 fills nothing, so it reports zero slippage against the
+    /// live best price rather than a full-width move from an unset worst price.
     fn simulate(state: &LobState, take_from_side: Side, quantity: u64) -> Self {
         let (prices, sizes) = match take_from_side {
             Side::Ask => (&state.ask_prices, &state.ask_sizes),
@@ -357,6 +360,16 @@ impl MarketImpact {
         } else {
             0.0
         };
+
+        // `worst_price` is assigned only inside the fill branch, which a
+        // zero-quantity order never enters -- it would otherwise stay 0.0 beside a
+        // live `best_price` and report a flat 10,000 bps. Fail-open by DECISION:
+        // an order that touches no level has no slippage, so collapse worst onto
+        // best. When there is no live level at all `best_price` is 0.0 too, and
+        // the two guards below already return 0.0.
+        if total_filled == 0 {
+            worst_price = best_price;
+        }
 
         let slippage = if best_price > 0.0 {
             (worst_price - best_price).abs()
@@ -580,5 +593,50 @@ mod tests {
         let metrics = LiquidityMetrics::from_lob_state(&state);
         assert!(metrics.is_liquid());
         assert_eq!(metrics.total_volume, 900);
+    }
+
+    /// A zero-quantity order touches no level, so it cannot have slippage.
+    ///
+    /// `worst_price` starts at 0.0 and is only assigned inside the fill branch,
+    /// which `quantity == 0` never enters. The record then carried a live
+    /// `best_price` beside a 0.0 `worst_price`, and `|0 - best| / best * 10_000`
+    /// reported a flat 10,000 bps -- 100% slippage -- on every book.
+    #[test]
+    fn a_zero_quantity_order_has_no_slippage() {
+        let state = create_test_state();
+
+        for impact in [
+            MarketImpact::simulate_buy(&state, 0),
+            MarketImpact::simulate_sell(&state, 0),
+        ] {
+            // Guard against a vacuous pass: on a book with no live side every
+            // quantity yields 0.0 bps and the assertions below cannot go red.
+            assert!(
+                impact.best_price > 0.0,
+                "fixture must have a live best price on {:?}, else this test checks nothing",
+                impact.side
+            );
+            assert_eq!(
+                impact.filled_quantity, 0,
+                "a zero-quantity {:?} order must fill nothing",
+                impact.side
+            );
+            assert_eq!(
+                impact.worst_price, impact.best_price,
+                "zero-quantity {:?}: worst_price {} must not sit below a live best_price {}",
+                impact.side, impact.worst_price, impact.best_price
+            );
+            assert_eq!(
+                impact.slippage, 0.0,
+                "zero-quantity {:?} slippage: expected 0.0 dollars, got {}",
+                impact.side, impact.slippage
+            );
+            assert_eq!(
+                impact.slippage_bps, 0.0,
+                "zero-quantity {:?} slippage: expected 0.0 bps, got {} \
+                 (10000.0 is the worst_price-left-at-0.0 defect)",
+                impact.side, impact.slippage_bps
+            );
+        }
     }
 }

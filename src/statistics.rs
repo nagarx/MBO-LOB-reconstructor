@@ -473,6 +473,13 @@ pub struct NormalizationParams {
 
 impl NormalizationParams {
     /// Create new normalization parameters.
+    ///
+    /// # Panics
+    /// If `means`, `stds` and `feature_names` differ in length, or if any std is
+    /// NaN or `< DIVISION_GUARD_EPS` -- `normalize` divides by it. Stds arrive
+    /// here from the CALLER, so a degenerate one is a caller error and is
+    /// rejected; `from_day_stats` DERIVES its stds from measured data, where a
+    /// constant column is a property of the data, and clamps instead.
     pub fn new(
         means: Vec<f64>,
         stds: Vec<f64>,
@@ -490,6 +497,18 @@ impl NormalizationParams {
             feature_names.len(),
             "feature_names must match means length"
         );
+        // Fail-closed by DECISION: `normalize` divides by these. `!(x >= EPS)`
+        // rather than `x < EPS` so that NaN is rejected too.
+        if let Some((i, s)) = stds
+            .iter()
+            .enumerate()
+            .find(|(_, s)| !(**s >= DIVISION_GUARD_EPS))
+        {
+            panic!(
+                "stds must be >= DIVISION_GUARD_EPS ({DIVISION_GUARD_EPS:e}); index {i} ({}) is {s}",
+                feature_names.get(i).map_or("<unnamed>", |n| n.as_str())
+            );
+        }
 
         Self {
             means,
@@ -512,7 +531,10 @@ impl NormalizationParams {
         // For now, use best bid/ask statistics for all levels
         // In practice, you'd want per-level statistics
         let price_mean = stats.mid_price.mean;
-        let price_std = stats.mid_price.std().max(DIVISION_GUARD_EPS); // Avoid division by zero
+        // Clamp, do NOT reject: a constant column is a property of the measured
+        // day, not a caller error. This is deliberately the opposite policy to
+        // `new` above -- see its # Panics section before "making them agree".
+        let price_std = stats.mid_price.std().max(DIVISION_GUARD_EPS);
         let size_mean = (stats.best_bid_size.mean + stats.best_ask_size.mean) / 2.0;
         let size_std =
             ((stats.best_bid_size.std() + stats.best_ask_size.std()) / 2.0).max(DIVISION_GUARD_EPS);
@@ -822,5 +844,77 @@ mod tests {
         assert_eq!(params.stds.len(), 40);
         assert_eq!(params.feature_names.len(), 40);
         assert!(params.feature_names[0].starts_with("ask_price_"));
+    }
+
+    /// `new` takes stds from its caller, so a non-positive std is a caller error
+    /// and is rejected -- matching the two `assert_eq!` length preconditions the
+    /// constructor already enforces.
+    #[test]
+    #[should_panic(expected = "stds must be >= DIVISION_GUARD_EPS")]
+    fn new_rejects_a_zero_std_instead_of_dividing_by_it() {
+        // A column that never moves has std exactly 0.0 -- FINDING-176 measures
+        // 6 of 148 feature columns identically zero on all 233 days.
+        let _ = NormalizationParams::new(
+            vec![5.0],
+            vec![0.0],
+            vec!["a_column_that_never_moves".to_string()],
+            1,
+            "test",
+        );
+    }
+
+    /// Locks the `!(x >= EPS)` form of the guard. A `x < EPS` "simplification"
+    /// reads identically on every finite input and silently stops rejecting NaN,
+    /// which `normalize` would then propagate into every downstream feature.
+    #[test]
+    #[should_panic(expected = "stds must be >= DIVISION_GUARD_EPS")]
+    fn new_rejects_a_nan_std_which_a_naive_less_than_comparison_would_admit() {
+        // black_box so the premise is checked at runtime rather than tripping
+        // the invalid_nan_comparisons lint on a constant-folded comparison.
+        let nan = std::hint::black_box(f64::NAN);
+        assert!(!(nan < DIVISION_GUARD_EPS), "premise: < admits NaN");
+        assert!(!(nan >= DIVISION_GUARD_EPS), "premise: !(>=) rejects NaN");
+        let _ = NormalizationParams::new(
+            vec![5.0],
+            vec![f64::NAN],
+            vec!["an_all_nan_column".to_string()],
+            1,
+            "test",
+        );
+    }
+
+    /// The sibling constructors take DELIBERATELY OPPOSITE policies, and this
+    /// locks the half that is easy to "fix" into agreement with the other:
+    /// `from_day_stats` DERIVES stds from measured data, where a constant column
+    /// is a property of the data and not a bug, so it clamps rather than panics.
+    #[test]
+    fn from_day_stats_clamps_a_constant_column_rather_than_rejecting_it() {
+        let mut stats = DayStats::new("2025-02-03");
+        // Same book five times => zero variance in both price and size.
+        for _ in 0..5 {
+            let mut state = LobState::new(10);
+            state.best_bid = Some(100_000_000_000);
+            state.best_ask = Some(100_010_000_000);
+            state.bid_sizes[0] = 100;
+            state.ask_sizes[0] = 100;
+            stats.update(&state);
+        }
+
+        let params = NormalizationParams::from_day_stats(&stats, 10);
+
+        assert_eq!(
+            stats.mid_price.std(),
+            0.0,
+            "fixture must produce a zero raw std, else the clamp is never exercised"
+        );
+        assert!(
+            params.stds.iter().all(|s| *s >= DIVISION_GUARD_EPS),
+            "from_day_stats must clamp a zero std to DIVISION_GUARD_EPS, got {:?}",
+            params.stds
+        );
+        assert!(
+            params.normalize(100.0, 0).is_finite(),
+            "a clamped std must keep normalize finite"
+        );
     }
 }
