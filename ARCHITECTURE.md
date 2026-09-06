@@ -291,7 +291,7 @@ pub struct LobState {
     pub best_ask: Option<i64>,           // Cached best ask price
     pub levels: usize,                   // Active levels (<= 20)
     pub timestamp: Option<i64>,          // Snapshot timestamp (ns since epoch)
-    pub sequence: u64,                   // Message sequence number
+    pub message_index: u64,              // OUR message counter, NOT the vendor's `sequence`
 
     // Temporal fields (FI-2010 features u6-u9)
     pub previous_timestamp: Option<i64>, // Previous snapshot timestamp
@@ -450,6 +450,7 @@ pub struct LobStats {
     // Fall-through observability counters (Phase M M.A.4, F-013):
     pub modify_order_not_found: u64,
     pub add_order_id_collision: u64,
+    pub add_side_none_dropped: u64,           // must be 0 on this corpus — see below
     // Additional:
     pub book_clears: u64,
     pub noop_messages: u64,

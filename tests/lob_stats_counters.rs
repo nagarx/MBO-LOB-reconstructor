@@ -330,9 +330,23 @@ fn test_lobstats_schema_version_constant_is_pinned() {
     // this constant to anything. Under hft-rules §1 ("a hash or identity a
     // producer EMITS must have a NAMED CONSUMER that fails when it disagrees")
     // that is an open gap, recorded here rather than papered over.
+    //
+    // 2.2.0 -> 2.3.0 at W31 (the side-None drop counter): a third intentional
+    // MINOR bump, ONE field — `add_side_none_dropped`.
+    //
+    // ⚠ THIS IS THE CASE THE CAVEAT ABOVE SAYS THE VERSION DOES NOT COVER, AND
+    // IT IS ALSO THE CASE WHERE IT MATTERS MOST. There is no G-SIGN row to make
+    // key-absence discriminate for this counter, and its CORRECT live value is
+    // 0 on every day of the corpus — zero `A|N` records in XNAS.ITCH 2025-07-03
+    // (5,098,240) or ARCX.PILLAR 2025-07-03 (2,686,200), measured on raw vendor
+    // bytes 2026-09-06. So a pre-W31 artifact and a post-W31 artifact that saw
+    // nothing are numerically IDENTICAL, and the envelope version really is the
+    // only discriminator. The gap recorded above stands unchanged: nothing in
+    // the monorepo yet COMPARES this constant, so the bump records intent
+    // rather than enforcing it.
     assert_eq!(
-        LOB_STATS_SCHEMA_VERSION, "2.2.0",
-        "LOB_STATS_SCHEMA_VERSION must remain pinned at 2.2.0 until the next \
+        LOB_STATS_SCHEMA_VERSION, "2.3.0",
+        "LOB_STATS_SCHEMA_VERSION must remain pinned at 2.3.0 until the next \
          intentional, coordinated bump"
     );
 }
@@ -421,4 +435,202 @@ fn test_export_envelope_load_round_trip_preserves_default_state() {
     assert!(!stats_after.has_warnings());
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// W31 — THE THREE SILENT-RECOVERY BRANCHES THAT NO TEST COULD DISTINGUISH
+// ════════════════════════════════════════════════════════════════════════════
+//
+// A mutation campaign over the book engine left three survivors. A survivor is
+// not "an untested line" — it is a branch whose CORRECT behaviour and a WRONG
+// behaviour produce identical output on the entire suite, so the suite cannot
+// state which one shipped. Each test below was proven to fail under the exact
+// mutation named in its doc comment, on this tree, before it was committed.
+//
+// All three branches are RECOVERIES: they keep going after an input the book
+// did not expect. That is the right policy — a research corpus is worth more
+// with one odd record absorbed than with a day aborted — but a recovery that
+// nothing observes is indistinguishable from a silent loss.
+
+/// Kills mutation **M8** (`add_order`'s id-collision arm returns `Ok(())`
+/// instead of `return self.modify_order(msg)`).
+///
+/// The pre-existing `test_add_order_id_collision_increments_on_silent_fall_through`
+/// asserts the COUNTER and nothing else, so it passes whether the colliding
+/// message repriced the book or was thrown away. This asserts the recovery
+/// itself: an `Add` on an id already resting must land as a MODIFY — the order
+/// moves to the new price and size, and does not duplicate.
+#[test]
+fn an_add_on_a_resting_order_id_reprices_the_book_instead_of_dropping_the_message() {
+    let mut lob = LobReconstructor::new(10);
+    lob.process_message(&msg(12345, Action::Add, Side::Bid, 100.0, 100))
+        .expect("seed add must succeed");
+    lob.process_message(&msg(12345, Action::Add, Side::Bid, 101.0, 200))
+        .expect("a colliding add must recover, not error");
+
+    let st = lob.stats();
+    assert_eq!(
+        st.add_order_id_collision, 1,
+        "the collision must be counted exactly once"
+    );
+
+    let book = lob.get_lob_state();
+    assert_eq!(
+        book.best_bid,
+        Some(101_000_000_000),
+        "M8 DISCRIMINATOR: the colliding add carries the NEW price, so the book \
+         must move to it. A dropped message leaves the stale 100.00 resting and \
+         every downstream price feature reads a book the venue does not have"
+    );
+    assert_eq!(
+        book.bid_sizes[0], 200,
+        "the recovery is a MODIFY: the new size replaces the old, it does not add to it"
+    );
+    assert_eq!(
+        book.bid_prices[1], 0,
+        "exactly ONE bid level may exist — a recovery that added without removing \
+         would leave the 100.00 level orphaned beside the new one"
+    );
+    assert_eq!(
+        st.active_orders, 1,
+        "one order id was seen twice; the tracker must still hold exactly one order"
+    );
+}
+
+/// Kills mutation **M10** (`reduce_or_remove_order`'s Stage-4 partial branch
+/// drops `order.size = order.size.saturating_sub(msg.size)`).
+///
+/// A partial cancel reduces TWO things: the price level's total, and the
+/// per-order size shadowed in `self.orders`. Only the first is visible in the
+/// exported book, so a suite that checks the book alone cannot see the shadow
+/// go stale — and a stale shadow silently mis-grades every later fill against
+/// that order.
+///
+/// The shadow is observable through the `Fill` oracle, which compares
+/// `msg.size` against the tracked `order.size`. Choosing a fill size BETWEEN
+/// the reduced and the unreduced value makes the two states disagree.
+#[test]
+fn a_partial_cancel_reduces_the_tracked_order_size_and_not_only_the_level_total() {
+    let mut lob = LobReconstructor::new(10);
+    lob.process_message(&msg(1001, Action::Add, Side::Bid, 100.0, 500))
+        .expect("seed add must succeed");
+    lob.process_message(&msg(1001, Action::Cancel, Side::Bid, 100.0, 300))
+        .expect("a partial cancel must succeed");
+
+    let book = lob.get_lob_state();
+    assert_eq!(
+        book.bid_sizes[0], 200,
+        "the LEVEL total is the half that was already covered: 500 - 300"
+    );
+
+    // 250 lies strictly between the reduced shadow (200) and the unreduced one
+    // (500). Against a correctly reduced shadow the vendor is claiming more
+    // than we hold; against a stale one it is not.
+    lob.process_message(&msg(1001, Action::Fill, Side::Bid, 100.0, 250))
+        .expect("a Fill must never error");
+
+    let st = lob.stats();
+    assert_eq!(
+        st.resting_fills_observed, 1,
+        "the oracle must have RUN — a zero here would make the assertion below \
+         vacuous for the wrong reason"
+    );
+    assert_eq!(
+        st.fill_size_exceeded_resting, 1,
+        "M10 DISCRIMINATOR: 250 > 200 (shadow correctly reduced) must fire. If \
+         the shadow still read 500 this stays 0, and the reconstructor would be \
+         silently crediting a resting order with size it no longer has"
+    );
+    assert_eq!(
+        st.fill_side_mismatch, 0,
+        "SEPARATION: the side matched — a non-zero here means this test is \
+         measuring the wrong channel"
+    );
+    assert_eq!(
+        st.fill_referenced_unknown_order, 0,
+        "the order WAS resting; a lookup miss would make the size comparison unreachable"
+    );
+}
+
+/// Kills mutation **N5** (`add_order`'s `Side::None` arm inserts the order as a
+/// bid instead of returning).
+///
+/// An `Add` carrying `side == None` clears both admission guards —
+/// `is_system_message()` and `validate()` — reaches `add_order`, matches the
+/// `Side::None` arm, and is discarded. `messages_processed` still advances.
+/// Before this commit NO counter recorded it: the failure path returned
+/// success, so a venue that published non-directional adds would lose them at
+/// a rate nothing could report (`FINDING-151`).
+///
+/// # Why `active_orders == 0` is the load-bearing assertion
+///
+/// The drop is also what keeps the engine's recursion bounded, and that is not
+/// obvious. `add_order` delegates to `modify_order` when an id is already
+/// resting; `modify_order` delegates back to `add_order` when it is not. The
+/// cycle terminates only because `remove_order_internal` removes the id from
+/// the tracker in between — and its own `Side::None` arm returns BEFORE that
+/// removal. So an order stored with `side == None` would make
+/// `add_order` ↔ `modify_order` recurse without bound on the next `Modify`
+/// for that id, i.e. a stack overflow rather than a wrong number.
+///
+/// It is unreachable today precisely because nothing stores such an order:
+/// both `self.orders.insert` sites sit downstream of a `Side::None` guard.
+/// That makes this assertion a guard on the OBVIOUS FIX — "just store the
+/// order instead of dropping it" would arm the crash. The counter is the
+/// correct fix; storing it is not.
+///
+/// # This counter reads ZERO on the whole corpus, by construction
+///
+/// Measured 2026-09-06 on raw vendor bytes: XNAS.ITCH 2025-07-03 (5,098,240
+/// records) and ARCX.PILLAR 2025-07-03 (2,686,200 records) contain **zero**
+/// `A|N` records; `lob.add_collision` is likewise 0 on 1,435/1,435 exported
+/// diagnostics sidecars. A counter whose correct live value is 0 cannot be
+/// validated by live data — correct and dead read identically — so this
+/// behavioural test IS its only evidence that the channel works.
+#[test]
+fn a_non_directional_add_is_counted_and_never_enters_the_order_tracker() {
+    let mut lob = LobReconstructor::new(10);
+    lob.process_message(&msg(777, Action::Add, Side::None, 100.0, 100))
+        .expect("a non-directional add must be absorbed, not error");
+
+    let st = lob.stats();
+    assert_eq!(
+        st.add_side_none_dropped, 1,
+        "N5 DISCRIMINATOR: the drop must be observable exactly once"
+    );
+    assert_eq!(
+        st.messages_processed, 1,
+        "the message WAS processed — the drop is a book decision, not a decode rejection"
+    );
+    assert_eq!(
+        st.active_orders, 0,
+        "ANTI-RECURSION INVARIANT: a Side::None order must never enter the \
+         tracker. remove_order_internal returns on Side::None BEFORE removing, \
+         so a stored one makes add_order <-> modify_order recurse unboundedly"
+    );
+
+    let book = lob.get_lob_state();
+    assert_eq!(
+        book.best_bid, None,
+        "a non-directional add carries no side, so it must not create a bid level"
+    );
+    assert_eq!(
+        book.best_ask, None,
+        "...nor an ask level — N5 puts it on one of the two"
+    );
+
+    // ---- NEGATIVE: a directional add must NOT move this counter. ----
+    let mut lob = LobReconstructor::new(10);
+    lob.process_message(&msg(778, Action::Add, Side::Bid, 100.0, 100))
+        .expect("an ordinary add must succeed");
+    let st = lob.stats();
+    assert_eq!(
+        st.add_side_none_dropped, 0,
+        "without this arm the test would be satisfied by a counter that always fires"
+    );
+    assert_eq!(
+        st.active_orders, 1,
+        "and the ordinary add must still reach the tracker — proving the guard \
+         discriminates on side rather than rejecting every add"
+    );
 }

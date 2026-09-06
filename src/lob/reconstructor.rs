@@ -27,6 +27,13 @@ use crate::types::{Action, BookConsistency, LobState, MboMessage, Order, Side};
 ///   envelope existed before — pre-M.A.5 was implicit-1.0).
 /// - `2.1.0` COMMIT 2a (L-ROUTE): +6 carrier/Fill-oracle fields.
 /// - `2.2.0` COMMIT 2b (carrier census): +12 per-side rows.
+/// - `2.3.0` W31 (the side-None drop counter): +1 field,
+///   `add_side_none_dropped`. ⚠ THE ABSENT-VS-ZERO HAZARD IS SHARPEST HERE:
+///   this counter's CORRECT live value is 0 on the whole corpus, so an old
+///   artifact (key absent → `#[serde(default)]` → 0) and a new one that
+///   genuinely observed nothing are numerically identical. The envelope
+///   version is the only thing that separates "never counted" from
+///   "counted nothing".
 ///
 /// **Independent of** [`crate::export::SCHEMA_VERSION`] (`"1.0"`), which
 /// versions the Parquet export schema — a different artifact. When either
@@ -38,7 +45,7 @@ use crate::types::{Action, BookConsistency, LobState, MboMessage, Order, Side};
 ///   field, rename a field, change an envelope key).
 /// - MINOR: additive non-breaking changes (e.g., new `LobStats` field).
 /// - PATCH: docs-only changes.
-pub const LOB_STATS_SCHEMA_VERSION: &str = "2.2.0";
+pub const LOB_STATS_SCHEMA_VERSION: &str = "2.3.0";
 
 /// How to handle crossed quotes (bid >= ask) when they occur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -499,6 +506,34 @@ pub struct LobStats {
     #[serde(default)]
     pub add_order_id_collision: u64,
 
+    /// Number of `Action::Add` records discarded because `side == Side::None`.
+    ///
+    /// A non-directional add clears both admission guards
+    /// ([`MboMessage::is_system_message`] and `validate()`) and reaches
+    /// `LobReconstructor::add_order` (private), which has no side to file it
+    /// under and therefore drops it. **FAIL-OPEN, deliberately**: absorbing one
+    /// unfileable record is worth more than aborting a day of reconstruction —
+    /// but until this counter existed the drop was invisible, so a venue that
+    /// published non-directional adds would lose them at a rate nothing could
+    /// report.
+    ///
+    /// ⚠ **THE CORRECT VALUE HERE IS 0, AND THAT IS WHY IT NEEDS A BEHAVIOURAL
+    /// TEST.** Measured 2026-09-06 on raw vendor bytes: zero `A|N` records in
+    /// XNAS.ITCH 2025-07-03 (5,098,240) and ARCX.PILLAR 2025-07-03 (2,686,200).
+    /// A counter whose correct live value is 0 cannot be validated by live data
+    /// — correct and never-wired read identically. Its evidence is
+    /// `tests/lob_stats_counters.rs::a_non_directional_add_is_counted_and_never_enters_the_order_tracker`,
+    /// which forces an increment.
+    ///
+    /// ⚠ **DO NOT "FIX" THE DROP BY STORING THE ORDER.** See that test's
+    /// anti-recursion note: a `Side::None` order in `self.orders` makes
+    /// `add_order` <-> `modify_order` recurse without bound.
+    ///
+    /// Deliberately NOT summed into [`Self::total_warnings`], which is a frozen
+    /// 8-counter aggregate that the L-ROUTE carrier counters also stay out of.
+    #[serde(default)]
+    pub add_side_none_dropped: u64,
+
     /// Number of book clears/resets
     pub book_clears: u64,
 
@@ -686,7 +721,7 @@ impl LobStats {
     /// rename to `path`. Eliminates the SIGKILL-mid-write partial-file risk
     /// of the pre-M.A.5 `BufWriter + serde_json::to_writer_pretty` path.
     ///
-    /// **Envelope wrapper**: output JSON is `{ "schema_version": "2.2.0",
+    /// **Envelope wrapper**: output JSON is `{ "schema_version": "2.3.0",
     /// "stats": {...} }`. The `schema_version` field is the
     /// [`LOB_STATS_SCHEMA_VERSION`] constant. **Breaking change** for the
     /// on-disk format; pre-M.A.5 flat-shape files cannot round-trip through
@@ -763,7 +798,7 @@ impl LobStats {
     /// Load stats from a JSON file (dual-format aware).
     ///
     /// Phase M M.A.5 (REV 3 boundary discipline cycle): accepts BOTH:
-    /// - **Envelope shape** (post-M.A.5): `{ "schema_version": "2.2.0",
+    /// - **Envelope shape** (post-M.A.5): `{ "schema_version": "2.3.0",
     ///   "stats": {...} }` — preferred.
     /// - **Legacy flat shape** (pre-M.A.5): `{messages_processed: ..., ...}`
     ///   without an envelope. Emits a `log::warn!` (per call) so operators
@@ -862,7 +897,7 @@ impl LobStats {
 #[derive(Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct LobStatsExportEnvelope {
-    /// Schema version string (e.g., `"2.2.0"`).
+    /// Schema version string (e.g., `"2.3.0"`).
     pub schema_version: String,
 
     /// The wrapped [`LobStats`] payload.
@@ -981,7 +1016,7 @@ impl LobReconstructor {
     ///
     /// # Temporal Fields
     ///
-    /// Returns `triggering_action`, `triggering_side`, and `sequence` populated
+    /// Returns `triggering_action`, `triggering_side`, and `message_index` populated
     /// from the current message. `delta_ns` is always 0 and `previous_timestamp`
     /// is always `None` because each call uses a fresh buffer with no temporal
     /// chain. Use `process_message_into()` with a reused buffer for temporal
@@ -1087,8 +1122,16 @@ impl LobReconstructor {
             //
             // Phase M M.A.4 (REV 3 F-013 sibling closure): increment
             // `add_order_id_collision` counter BEFORE the silent recovery
-            // fall-through. Production NVDA data shows ~0.5% — small but
-            // non-zero; persistent values help operators detect feed quirks.
+            // fall-through.
+            //
+            // ⚠ CORRECTED 2026-09-06: this said "Production NVDA data shows
+            // ~0.5% — small but non-zero". It is ZERO. Re-derived over every
+            // exported diagnostics sidecar on disk: `lob.add_collision` = 0 on
+            // 1,435 of 1,435. The "~0.5%" figure belongs to
+            // `cancel_order_not_found`, a DIFFERENT counter, whose own ~0.5%
+            // was itself retracted on 2026-08-01 and driven to 0 by L-ROUTE.
+            // Persistent non-zero values here would still be worth
+            // investigating — but nothing in this corpus has ever produced one.
             self.stats.add_order_id_collision += 1;
             return self.modify_order(msg);
         }
@@ -1098,7 +1141,16 @@ impl LobReconstructor {
             Side::Bid => self.bids.entry(msg.price).or_default(),
             Side::Ask => self.asks.entry(msg.price).or_default(),
             Side::None => {
-                // Non-directional orders are ignored
+                // FAIL-OPEN: a non-directional add has no side to file under, so
+                // it is dropped rather than aborting the day — and the drop is
+                // COUNTED, because before this counter the failure path returned
+                // success and nothing downstream could see the loss.
+                //
+                // ⚠ Dropping is also what bounds the engine's recursion: storing
+                // a `Side::None` order would make `add_order` <-> `modify_order`
+                // recurse without bound, because `remove_order_internal`'s own
+                // `Side::None` arm returns BEFORE `self.orders.remove`.
+                self.stats.add_side_none_dropped += 1;
                 return Ok(());
             }
         };
@@ -1406,7 +1458,7 @@ impl LobReconstructor {
     ///
     /// This creates a snapshot of the top N levels on each side.
     /// For most use cases, prefer `get_lob_state_with_metadata` which includes
-    /// timestamp and sequence information.
+    /// timestamp and message-index information.
     #[inline]
     pub fn get_lob_state(&self) -> LobState {
         self.get_lob_state_with_metadata(None)
@@ -1414,8 +1466,8 @@ impl LobReconstructor {
 
     /// Get current LOB state snapshot with metadata.
     ///
-    /// This creates a snapshot of the top N levels on each side,
-    /// including timestamp and message sequence number.
+    /// This creates a snapshot of the top N levels on each side, including the
+    /// timestamp and this crate's own message index (NOT the vendor's `sequence`).
     ///
     /// # Arguments
     /// * `timestamp` - Optional timestamp from the message that triggered this snapshot
@@ -1506,7 +1558,7 @@ impl LobReconstructor {
 
         // Metadata
         state.timestamp = timestamp.or(self.stats.last_timestamp);
-        state.sequence = self.stats.messages_processed;
+        state.message_index = self.stats.messages_processed;
         state.levels = levels;
 
         // Temporal fields
@@ -1804,7 +1856,7 @@ impl LobReconstructor {
                         (Some(current), Some(prev)) if current > prev => (current - prev) as u64,
                         _ => 0,
                     };
-                    state.sequence = self.stats.messages_processed;
+                    state.message_index = self.stats.messages_processed;
                 } else {
                     self.fill_lob_state_with_temporal(state, timestamp, action, side);
                 }
@@ -3467,8 +3519,8 @@ mod tests {
                 msg.order_id
             );
             assert_eq!(
-                state1.sequence, reused_state.sequence,
-                "sequence mismatch at msg {:?}",
+                state1.message_index, reused_state.message_index,
+                "message_index mismatch at msg {:?}",
                 msg.order_id
             );
 
@@ -3798,6 +3850,7 @@ mod tests {
             fill_price_differs_from_resting: 36,
             modify_order_not_found: 8,
             add_order_id_collision: 6,
+            add_side_none_dropped: 9,
             book_clears: 1,
             noop_messages: 100,
         };
@@ -3846,6 +3899,7 @@ mod tests {
         assert_eq!(loaded.fill_price_differs_from_resting, 36);
         assert_eq!(loaded.modify_order_not_found, 8);
         assert_eq!(loaded.add_order_id_collision, 6);
+        assert_eq!(loaded.add_side_none_dropped, 9);
         assert_eq!(loaded.book_clears, 1);
         assert_eq!(loaded.noop_messages, 100);
 
@@ -4314,8 +4368,8 @@ mod tests {
             "delta_ns should be non-zero (5000 - 2000 = 3000)"
         );
         assert_eq!(
-            state.sequence, 3,
-            "Sequence should be current message count"
+            state.message_index, 3,
+            "message_index should be the current message count"
         );
         assert_eq!(state.triggering_action, Some(Action::Add));
         assert_eq!(state.triggering_side, Some(Side::Bid));

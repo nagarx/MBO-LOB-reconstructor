@@ -492,8 +492,32 @@ pub struct LobState {
     /// Timestamp of this snapshot (nanoseconds since epoch).
     pub timestamp: Option<i64>,
 
-    /// Message sequence number that produced this state.
-    pub sequence: u64,
+    /// Index of the message that produced this state — this crate's OWN
+    /// counter, **not the vendor's `sequence` field**.
+    ///
+    /// It is `LobStats::messages_processed` at the moment the snapshot was
+    /// filled: 1 for the first message the reconstructor accepted, and +1 for
+    /// every message thereafter. It says where a row sits in OUR stream. It
+    /// says nothing about where the record sat in the VENUE's.
+    ///
+    /// ⚠ **THE TWO ARE NOT INTERCHANGEABLE, AND THIS FIELD WAS CALLED
+    /// `sequence` UNTIL 2026-09-06.** `dbn::MboMsg` carries its own
+    /// `sequence: u32` — the venue's number, which is what a gap check, a
+    /// message-loss estimate or a cross-feed join needs. This crate has never
+    /// read it: it is dropped at [`crate::DbnBridge::convert`], which builds
+    /// [`MboMessage`] without a sequence field at all. So a consumer that took
+    /// the old name at face value was handed a dense `+1` counter in place of
+    /// the sparse venue one, and any gap check over it returns "no gaps"
+    /// unconditionally, for any input, forever.
+    ///
+    /// Measured on ARCX.PILLAR NVDA (9,314,830 records): the vendor's
+    /// `sequence` spans 0..=657,600,477 with 7,188,190 distinct values. Ours
+    /// would have spanned 1..=9,314,830 with no repeats and no holes.
+    ///
+    /// ⚠ **THE EXPORTED PARQUET COLUMN IS STILL NAMED `sequence`** — see
+    /// `crate::export::schema::lob_snapshot_schema` for why that name did not
+    /// move with the field.
+    pub message_index: u64,
 
     // =========================================================================
     // Temporal Information (FI-2010 time-sensitive features u6-u9)
@@ -555,7 +579,7 @@ impl LobState {
             best_ask: None,
             levels: levels.min(MAX_LOB_LEVELS), // Clamp to max
             timestamp: None,
-            sequence: 0,
+            message_index: 0,
             // Temporal fields
             previous_timestamp: None,
             delta_ns: 0,
@@ -1461,15 +1485,15 @@ mod tests {
     fn test_lob_state_new_fields() {
         let mut state = LobState::new(10);
 
-        // Test timestamp and sequence fields
+        // Test timestamp and message_index fields
         assert!(state.timestamp.is_none());
-        assert_eq!(state.sequence, 0);
+        assert_eq!(state.message_index, 0);
 
         state.timestamp = Some(1234567890_000_000_000);
-        state.sequence = 42;
+        state.message_index = 42;
 
         assert_eq!(state.timestamp, Some(1234567890_000_000_000));
-        assert_eq!(state.sequence, 42);
+        assert_eq!(state.message_index, 42);
     }
 
     // =========================================================================

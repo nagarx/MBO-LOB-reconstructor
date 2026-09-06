@@ -237,7 +237,7 @@ pub struct LobState {
     pub best_ask: Option<i64>,
     pub levels: usize,                      // Number of levels tracked
     pub timestamp: Option<i64>,
-    pub sequence: u64,                      // Message sequence number
+    pub message_index: u64,                 // OUR message counter, NOT the vendor's `sequence`
     
     // Temporal fields (for time-sensitive features FI-2010 u6-u9)
     pub previous_timestamp: Option<i64>,    // For Δt calculation
@@ -690,6 +690,7 @@ pub struct LobStats {
     // falls through to modify_order on collision).
     pub modify_order_not_found: u64,
     pub add_order_id_collision: u64,
+    pub add_side_none_dropped: u64,  // A-with-side-None, dropped; 0 on this corpus
     pub book_clears: u64,
     pub noop_messages: u64,
 }

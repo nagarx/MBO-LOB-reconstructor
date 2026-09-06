@@ -72,7 +72,7 @@ fn make_test_state(levels: usize) -> LobState {
     }
 
     state.timestamp = Some(1_000_000_000_000_000_000); // 1e18 ns
-    state.sequence = 42;
+    state.message_index = 42;
     state.delta_ns = 1_000_000; // 1ms
     state.triggering_action = Some(Action::Add);
     state.triggering_side = Some(Side::Bid);
@@ -1641,7 +1641,7 @@ fn test_lob_multi_row_varying_states() {
 
     for (i, action) in actions.iter().enumerate() {
         let mut state = make_test_state(2);
-        state.sequence = i as u64;
+        state.message_index = i as u64;
         state.timestamp = Some((i as i64 + 1) * 1_000_000_000);
         state.triggering_action = Some(*action);
         state.bid_sizes[0] = (100 + i as u32 * 10) as u32;

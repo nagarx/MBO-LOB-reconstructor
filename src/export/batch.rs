@@ -29,6 +29,10 @@ pub(crate) struct LobBatch {
 
     // Core columns
     pub(crate) timestamp_ns: Vec<Option<i64>>,
+    /// Buffer for the Arrow column literally named `sequence`. Named for the
+    /// COLUMN, not for its source field — it is fed from
+    /// `LobState::message_index`. See `LobBatch::push` and
+    /// `super::schema::lob_snapshot_schema` for why the two names differ.
     pub(crate) sequence: Vec<u64>,
     pub(crate) level_count: Vec<u8>,
     pub(crate) best_bid: Vec<Option<i64>>,
@@ -148,7 +152,17 @@ impl LobBatch {
         // records no vendor record, so a per-snapshot "missing clock" tally would
         // have no increment path that is not already the null count of this column.
         self.timestamp_ns.push(state.timestamp);
-        self.sequence.push(state.sequence);
+        // ⚠ THE FIELD AND THE COLUMN HAVE DIFFERENT NAMES, DELIBERATELY.
+        // The source field was renamed `sequence` -> `message_index` on
+        // 2026-09-06 because it is this crate's own message counter and not the
+        // vendor's `sequence`. The COLUMN keeps the old name: it is a wire
+        // contract with a live consumer — `MBO-LOB-analyzer`'s
+        // `io/schema.py::LOB_CORE_COLUMNS` / `LOB_SCHEMA`, enforced at
+        // `io/loader.py::validate_lob_schema`, which raises
+        // `SchemaValidationError` on a missing column — so renaming it is a
+        // coordinated cross-repo change (hft-rules §1) and must land WITH that
+        // consumer, not ahead of it. Values are unaffected either way.
+        self.sequence.push(state.message_index);
         // B.1: SSoT for the per-file `levels` column is self.levels (=
         // ExportConfig.levels). Pre-B.1 this was state.levels, which could
         // diverge from the FixedSizeList column width under misconfiguration.
