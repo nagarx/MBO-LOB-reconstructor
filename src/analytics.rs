@@ -443,17 +443,22 @@ pub struct LiquidityMetrics {
     /// Volume imbalance: (bid - ask) / (bid + ask)
     pub volume_imbalance: f64,
 
-    /// Spread in dollars
-    pub spread: f64,
+    /// Spread in dollars, or `None` when either side of the book is absent.
+    ///
+    /// `None` is not zero. A book with no ask has an *undefined* spread; a 0.0
+    /// there would describe the tightest possible market — the one direction
+    /// that manufactures apparent liquidity rather than removing it.
+    pub spread: Option<f64>,
 
-    /// Spread in basis points
-    pub spread_bps: f64,
+    /// Spread in basis points, or `None` when the spread or the mid is undefined.
+    pub spread_bps: Option<f64>,
 
-    /// Mid-price in dollars
-    pub mid_price: f64,
+    /// Mid-price in dollars, or `None` when either side of the book is absent.
+    pub mid_price: Option<f64>,
 
-    /// Microprice (volume-weighted mid)
-    pub microprice: f64,
+    /// Microprice (volume-weighted mid), or `None` when either side is absent
+    /// or both best levels carry no size, leaving the weighting undefined.
+    pub microprice: Option<f64>,
 
     /// Average depth per level (both sides)
     pub avg_depth_per_level: f64,
@@ -464,6 +469,11 @@ pub struct LiquidityMetrics {
 
 impl LiquidityMetrics {
     /// Compute comprehensive liquidity metrics from a LOB state.
+    ///
+    /// Depth, volume and level counts are always populated — they are well
+    /// defined on a one-sided book. The four price-derived quantities
+    /// (`spread`, `spread_bps`, `mid_price`, `microprice`) are `Option` and are
+    /// `None` whenever the book does not define them; see each field.
     pub fn from_lob_state(state: &LobState) -> Self {
         let bid_depth = DepthStats::from_lob_state(state, Side::Bid);
         let ask_depth = DepthStats::from_lob_state(state, Side::Ask);
@@ -483,10 +493,18 @@ impl LiquidityMetrics {
             0.0
         };
 
-        let spread = state.spread().unwrap_or(0.0);
-        let mid_price = state.mid_price().unwrap_or(0.0);
-        let spread_bps = state.spread_bps().unwrap_or(0.0);
-        let microprice = state.microprice().unwrap_or(mid_price);
+        // FAIL-OPEN, with the absence carried IN the value rather than erased:
+        // each accessor returns `None` exactly when its quantity is undefined
+        // (a side is absent, or both best levels carry no size), and we
+        // propagate that `None` instead of substituting a number. This is the
+        // same treatment the live parquet path already gives these four
+        // quantities in `export::batch`, which pushes these very `Option`s into
+        // nullable columns — so the two surfaces now describe an absent level
+        // identically instead of disagreeing by 0.0.
+        let spread = state.spread();
+        let mid_price = state.mid_price();
+        let spread_bps = state.spread_bps();
+        let microprice = state.microprice();
 
         Self {
             bid_depth,

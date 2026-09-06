@@ -1083,8 +1083,18 @@ fn test_liquidity_metrics_with_real_data() {
     }
 
     // Calculate averages
-    let avg_spread_bps: f64 =
-        metrics_samples.iter().map(|m| m.spread_bps).sum::<f64>() / metrics_samples.len() as f64;
+    // These samples were filtered on `is_liquid()`, i.e. BOTH sides present, so
+    // every price-derived quantity MUST be `Some`. Unwrapping with `expect`
+    // turns that filter into an assertion: if a two-sided book ever yields
+    // `None` here, this test fails loudly instead of averaging a substituted 0.
+    let avg_spread_bps: f64 = metrics_samples
+        .iter()
+        .map(|m| {
+            m.spread_bps
+                .expect("a two-sided (is_liquid) book must define spread_bps")
+        })
+        .sum::<f64>()
+        / metrics_samples.len() as f64;
 
     let avg_total_volume: f64 = metrics_samples
         .iter()
@@ -1118,12 +1128,19 @@ fn test_liquidity_metrics_with_real_data() {
     if let Some(sample) = metrics_samples.last() {
         println!();
         println!("  📊 Sample Metrics (last):");
-        println!("     Mid-price:        ${:.4}", sample.mid_price);
-        println!("     Microprice:       ${:.4}", sample.microprice);
-        println!(
-            "     Spread:           ${:.6} ({:.2} bps)",
-            sample.spread, sample.spread_bps
-        );
+        let mid = sample
+            .mid_price
+            .expect("two-sided book must define mid_price");
+        let micro = sample
+            .microprice
+            .expect("two-sided book with size must define microprice");
+        let spr = sample.spread.expect("two-sided book must define spread");
+        let spr_bps = sample
+            .spread_bps
+            .expect("two-sided book must define spread_bps");
+        println!("     Mid-price:        ${mid:.4}");
+        println!("     Microprice:       ${micro:.4}");
+        println!("     Spread:           ${spr:.6} ({spr_bps:.2} bps)");
         println!("     Bid volume:       {}", sample.bid_depth.total_volume);
         println!("     Ask volume:       {}", sample.ask_depth.total_volume);
         println!("     Book pressure:    {:.4}", sample.book_pressure());
@@ -1188,6 +1205,19 @@ fn test_edge_case_empty_book() {
     assert!(!metrics.is_liquid());
     assert_eq!(metrics.total_volume, 0);
 
+    // W37: an empty book DEFINES no price. Every price-derived quantity must be
+    // absent, not 0.0 — a 0.0 spread here reads as the tightest market possible.
+    assert!(metrics.spread.is_none(), "empty book reported a spread");
+    assert!(
+        metrics.spread_bps.is_none(),
+        "empty book reported a spread in bps"
+    );
+    assert!(metrics.mid_price.is_none(), "empty book reported a mid");
+    assert!(
+        metrics.microprice.is_none(),
+        "empty book reported a microprice"
+    );
+
     println!("  ✅ Empty book edge cases passed");
 }
 
@@ -1234,6 +1264,59 @@ fn test_edge_case_one_sided_book() {
     // LiquidityMetrics should show not liquid
     let metrics = LiquidityMetrics::from_lob_state(&state);
     assert!(!metrics.is_liquid());
+
+    // W37 FALSIFIER — the consequential half. This book carries 500 real shares
+    // on the bid and NO ask, so its spread is undefined. Reporting 0.0 would
+    // describe the tightest possible market on a book that cannot trade at all,
+    // and `is_liquid()` being false does not stop a consumer reading the field.
+    // Measured on live data (NVDA/HOOD, XNAS ITCH + ARCX Pillar, 5 sessions):
+    // this state occurs on EVERY session at the open, before both sides are
+    // populated, and the present side usually carries real volume.
+    assert!(
+        metrics.spread.is_none(),
+        "bid-only book reported a dollar spread"
+    );
+    assert!(
+        metrics.spread_bps.is_none(),
+        "bid-only book reported a ZERO-BPS spread — the tightest market possible"
+    );
+    assert!(metrics.mid_price.is_none(), "bid-only book reported a mid");
+    assert!(
+        metrics.microprice.is_none(),
+        "bid-only book reported a microprice"
+    );
+    // The depth half stays fully populated: absence of a price must not erase
+    // the liquidity that IS present.
+    assert_eq!(metrics.total_volume, 500);
+    assert_eq!(metrics.bid_depth.total_volume, 500);
+
+    // The mirror case. On live XNAS data ask-only is the MORE common variant
+    // (16 of 17 non-two-sided states on 2025-02-03), so a fix verified only on
+    // the bid side would leave the dominant one untested.
+    let mut ask_only = LobState::new(10);
+    ask_only.ask_prices[0] = 100_010_000_000; // $100.01
+    ask_only.ask_sizes[0] = 500;
+    ask_only.best_ask = Some(100_010_000_000);
+    let ask_metrics = LiquidityMetrics::from_lob_state(&ask_only);
+    assert!(!ask_metrics.is_liquid());
+    assert!(
+        ask_metrics.spread.is_none(),
+        "ask-only book reported a dollar spread"
+    );
+    assert!(
+        ask_metrics.spread_bps.is_none(),
+        "ask-only book reported a ZERO-BPS spread — the tightest market possible"
+    );
+    assert!(
+        ask_metrics.mid_price.is_none(),
+        "ask-only book reported a mid"
+    );
+    assert!(
+        ask_metrics.microprice.is_none(),
+        "ask-only book reported a microprice"
+    );
+    assert_eq!(ask_metrics.total_volume, 500);
+    assert_eq!(ask_metrics.ask_depth.total_volume, 500);
 
     println!("  ✅ One-sided book edge cases passed");
 }

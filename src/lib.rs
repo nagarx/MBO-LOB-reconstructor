@@ -100,9 +100,14 @@
 //! let impact = MarketImpact::simulate_buy(&state, 100);
 //! println!("Slippage: {:.2} bps", impact.slippage_bps);
 //!
-//! // Combined liquidity metrics
+//! // Combined liquidity metrics. The price-derived quantities are `Option`:
+//! // `None` means the book does not define them (e.g. one side is absent),
+//! // which is NOT the same as a zero spread.
 //! let metrics = LiquidityMetrics::from_lob_state(&state);
-//! println!("Spread: {:.2} bps", metrics.spread_bps);
+//! match metrics.spread_bps {
+//!     Some(bps) => println!("Spread: {bps:.2} bps"),
+//!     None => println!("Spread: undefined (book is one-sided)"),
+//! }
 //! ```
 //!
 //! ### High-Performance Zero-Allocation Processing

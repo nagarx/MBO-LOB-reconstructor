@@ -326,13 +326,29 @@ fn demo_liquidity_metrics(state: &LobState) {
 
     let metrics = LiquidityMetrics::from_lob_state(state);
 
+    // `None` renders as "undefined", never as a number: a one-sided book has no
+    // spread, and printing 0.0 for it would read as an infinitely tight market.
+    fn or_undefined(v: Option<f64>, prec: usize) -> String {
+        match v {
+            Some(x) => format!("{x:.prec$}"),
+            None => "undefined (one-sided book)".to_string(),
+        }
+    }
+
     println!("  📊 Market Overview:");
     println!("     Is Liquid:        {}", metrics.is_liquid());
-    println!("     Mid-price:        ${:.4}", metrics.mid_price);
-    println!("     Microprice:       ${:.4}", metrics.microprice);
     println!(
-        "     Spread:           ${:.4} ({:.2} bps)",
-        metrics.spread, metrics.spread_bps
+        "     Mid-price:        {}",
+        or_undefined(metrics.mid_price, 4)
+    );
+    println!(
+        "     Microprice:       {}",
+        or_undefined(metrics.microprice, 4)
+    );
+    println!(
+        "     Spread:           {} ({} bps)",
+        or_undefined(metrics.spread, 4),
+        or_undefined(metrics.spread_bps, 2)
     );
 
     println!("\n  📦 Volume Analysis:");
