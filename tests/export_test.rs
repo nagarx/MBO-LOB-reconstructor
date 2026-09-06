@@ -1814,3 +1814,208 @@ fn test_lob_triggering_action_column_separates_trade_and_fill_bytes() {
          trades by ~1.82x."
     );
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// THE EXPORT-BOUNDARY DECLARATION CONTRACT (W23 / W24)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Three properties of the emitted Parquet that a consumer cannot infer from the
+// bytes, and that were previously undeclared:
+//
+//   1. an ABSENT snapshot clock is a null, not epoch 0 (W23);
+//   2. the MBO `price` column may carry the vendor's undefined-price sentinel (W24a);
+//   3. an ABSENT book level is encoded price 0 / size 0 (W24b).
+//
+// ⚠ THE SCOPING IS THE FINDING, AND TEST 4 IS WHAT PINS IT. The specification put
+// BOTH declarations in the shared `schema_metadata()`, which both schemas consume.
+// Measured over the two emitted development day-files
+// (`data/exports/raw_lob_full/{2025-02-03,2025-07-01}_lob_snapshots.parquet`,
+// 27,790,852 rows): `bid_prices`, `ask_prices`, `best_bid` and `best_ask` carry
+// `i64::MAX` **ZERO** times. A shared key would therefore have declared a sentinel
+// on four columns that provably never carry one — hft-rules §2, a sentinel is a
+// per-FIELD property of the wire format, not a per-file constant.
+//
+// Written as literals, never as `dbn::UNDEF_PRICE`, for the reason
+// `tests/decode_sentinel_contract.rs` states at length: `FINDING-177`, a test that
+// imports the constant its guard imports passes by construction.
+
+/// `dbn::UNDEF_PRICE`, written out. See `tests/decode_sentinel_contract.rs`.
+const EXPORT_UNDEF_PRICE_LITERAL: i64 = 9_223_372_036_854_775_807;
+
+/// W23 — an absent snapshot clock must reach Parquet as NULL, never as epoch 0.
+///
+/// `LobState::timestamp` is `Option<i64>`; before this contract the LOB writer
+/// coerced `None` to `0` into a NON-NULLABLE column, so "the venue never gave us a
+/// clock" and "the venue gave us 1970-01-01T00:00:00Z" were the same 8 bytes. The
+/// sibling `MboBatch` in the same file already pushed `Option<i64>` into a nullable
+/// column — one struct away, two conventions.
+#[test]
+fn an_absent_snapshot_clock_is_null_in_parquet_not_epoch_zero() {
+    let tmp = TempDir::new("absent_clock");
+    let path = tmp.file("lob.parquet");
+    let config = small_config(2, false);
+
+    let mut state = make_test_state(2);
+    state.timestamp = None; // the vendor gave us no clock for this snapshot
+
+    let mut writer = LobSnapshotWriter::new(&path, &config, HashMap::new()).unwrap();
+    writer.write_snapshot(&state).unwrap();
+    writer.finish().unwrap();
+
+    let file = fs::File::open(&path).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+    let batch = &batches[0];
+    let ts = batch.column_by_name("timestamp_ns").unwrap();
+
+    assert_eq!(ts.len(), 1, "expected exactly one snapshot row");
+    assert!(
+        ts.is_null(0),
+        "an absent LobState::timestamp must be NULL in the parquet column. Got a non-null \
+         value ({}), which is indistinguishable from a genuine 1970-01-01 timestamp and sorts \
+         before every real row.",
+        ts.as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|a| a.value(0))
+            .unwrap_or(-1),
+    );
+}
+
+/// W24a — the MBO `price` column must DECLARE the vendor sentinel it can carry.
+///
+/// `DbnBridge::convert` fail-closes `UNDEF_PRICE` on every order-bearing action and
+/// deliberately EXEMPTS `Clear`/`None`, so the sentinel reaches this column by
+/// design. Measured on the emitted corpus: `2025-02-03_mbo_events.parquet` carries
+/// it once in 18,476,041 rows and `2025-07-01` once in 9,314,830 — 100% on
+/// `action == 82` (`b'R'`, `Action::Clear`), matching the decode-boundary census of
+/// 20 sentinels on 20 `R` records. One unmasked row moves that day's mean price
+/// from ~$153 to ~$1,143, and `np.isfinite` is True on every row.
+#[test]
+fn the_mbo_price_column_declares_the_undefined_price_sentinel_it_carries() {
+    let declared = mbo_event_schema()
+        .metadata()
+        .get("price_undef_sentinel")
+        .cloned();
+
+    assert_eq!(
+        declared.as_deref(),
+        Some(EXPORT_UNDEF_PRICE_LITERAL.to_string().as_str()),
+        "the MBO event schema must declare `price_undef_sentinel` = {EXPORT_UNDEF_PRICE_LITERAL} \
+         so a consumer can mask the column without re-deriving the vendor's map. Got {declared:?}",
+    );
+
+    // And the writer must still PRESERVE the byte — declaring is not dropping.
+    let tmp = TempDir::new("undef_price");
+    let path = tmp.file("mbo.parquet");
+    let config = small_config(2, false);
+
+    let msg = MboMessage::new(0, Action::Clear, Side::None, EXPORT_UNDEF_PRICE_LITERAL, 0)
+        .with_timestamp(1_000_000_000_000_000_000);
+
+    let mut writer = MboEventWriter::new(&path, &config, HashMap::new()).unwrap();
+    writer.write_event(&msg).unwrap();
+    writer.finish().unwrap();
+
+    let file = fs::File::open(&path).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+    let price = batches[0].column_by_name("price").unwrap();
+    let price = price.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(
+        price.value(0),
+        EXPORT_UNDEF_PRICE_LITERAL,
+        "the vendor byte must be preserved verbatim; the defect is the missing declaration, \
+         not the value",
+    );
+}
+
+/// W24b — the LOB schema must DECLARE how an absent book level is encoded.
+///
+/// A level with no resting liquidity is emitted as price 0 / size 0 into
+/// non-nullable columns, so "no level here" is indistinguishable from "a level at
+/// $0.00" without an out-of-band declaration. Measured on the emitted corpus:
+/// 338 absent bid cells / 197 rows on 2025-02-03 and 557 / 118 on 2025-07-01
+/// (0.0011% and 0.0013% of rows).
+#[test]
+fn the_lob_schema_declares_how_an_absent_level_is_encoded() {
+    let declared = lob_snapshot_schema(10, true)
+        .metadata()
+        .get("absent_level_encoding")
+        .cloned();
+
+    assert_eq!(
+        declared.as_deref(),
+        Some("price_0_size_0"),
+        "the LOB snapshot schema must declare `absent_level_encoding`. Got {declared:?}",
+    );
+
+    // And that is genuinely what the writer emits for an unpopulated level.
+    let tmp = TempDir::new("absent_level");
+    let path = tmp.file("lob.parquet");
+    let config = small_config(2, false);
+
+    let mut state = make_test_state(2);
+    state.bid_prices[1] = 0; // level 1 holds nothing
+    state.bid_sizes[1] = 0;
+
+    let mut writer = LobSnapshotWriter::new(&path, &config, HashMap::new()).unwrap();
+    writer.write_snapshot(&state).unwrap();
+    writer.finish().unwrap();
+
+    let file = fs::File::open(&path).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+    let bp = batches[0].column_by_name("bid_prices").unwrap();
+    let bp = bp.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+    let row = bp.value(0);
+    let row = row.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(
+        row.value(1),
+        0,
+        "an absent level must still be emitted as 0 — the declaration describes the encoding, \
+         it does not change it",
+    );
+}
+
+/// W24, THE SCOPE CORRECTION — the LOB schema must NOT declare a price sentinel.
+///
+/// This is the guard on the specification's own minimal fix, which put
+/// `price_undef_sentinel` in the shared `schema_metadata()` that BOTH schemas
+/// consume. It goes RED the moment anyone implements it that way.
+///
+/// Basis: measured over 27,790,852 emitted LOB rows across the two development
+/// day-files, `bid_prices` / `ask_prices` / `best_bid` / `best_ask` carry
+/// `i64::MAX` ZERO times. The reconstructor never routes a `Clear`'s price into the
+/// book — `Clear` resets it — so the sentinel that reaches the MBO event stream has
+/// no path into a snapshot column. Declaring one here would tell 48 downstream
+/// analysis modules to mask a value that cannot occur, and would make the
+/// declaration a per-file constant rather than the per-field property hft-rules §2
+/// requires.
+#[test]
+fn the_lob_schema_does_not_declare_a_price_sentinel_its_columns_never_carry() {
+    let schema = lob_snapshot_schema(10, true);
+    let meta = schema.metadata();
+    assert!(
+        meta.get("price_undef_sentinel").is_none(),
+        "`price_undef_sentinel` belongs to the MBO event schema's `price` field ONLY. The LOB \
+         snapshot price columns were measured at ZERO occurrences of i64::MAX over 27,790,852 \
+         rows; declaring it here would be a false declaration on four columns.",
+    );
+    assert!(
+        mbo_event_schema()
+            .metadata()
+            .get("absent_level_encoding")
+            .is_none(),
+        "`absent_level_encoding` belongs to the LOB snapshot schema ONLY — the MBO event schema \
+         has no level columns for it to describe.",
+    );
+}

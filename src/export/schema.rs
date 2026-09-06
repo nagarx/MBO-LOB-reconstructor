@@ -28,7 +28,7 @@ use super::SCHEMA_VERSION;
 ///
 /// | Column             | Type                       | Nullable |
 /// |--------------------|----------------------------|----------|
-/// | timestamp_ns       | Int64                      | false    |
+/// | timestamp_ns       | Int64                      | true     |
 /// | sequence           | UInt64                     | false    |
 /// | levels             | UInt8                      | false    |
 /// | best_bid           | Int64                      | true     |
@@ -75,7 +75,12 @@ pub fn lob_snapshot_schema(levels: usize, include_derived: bool) -> Schema {
     let n = levels as i32;
 
     let mut fields = vec![
-        Field::new("timestamp_ns", DataType::Int64, false),
+        // NULLABLE, and deliberately so — `LobState::timestamp` is `Option<i64>`
+        // and an absent venue clock must stay absent. Pre-W23 this was
+        // non-nullable and `LobBatch::push` coerced `None` to `0`, so "no clock"
+        // and "1970-01-01T00:00:00Z" were the same 8 bytes; the sibling
+        // `mbo_event_schema` below already declared the same concept nullable.
+        Field::new("timestamp_ns", DataType::Int64, true),
         Field::new("sequence", DataType::UInt64, false),
         Field::new("levels", DataType::UInt8, false),
         Field::new("best_bid", DataType::Int64, true),
@@ -118,7 +123,17 @@ pub fn lob_snapshot_schema(levels: usize, include_derived: bool) -> Schema {
         ]);
     }
 
-    let metadata = schema_metadata();
+    let mut metadata = schema_metadata();
+    // W24b — SCOPED TO THIS SCHEMA. A book level with no resting liquidity is
+    // emitted as price 0 / size 0 into the non-nullable `{bid,ask}_{prices,sizes}`
+    // columns, so "no level here" and "a level at $0.00" are the same bytes. The
+    // encoding is not changed — re-encoding absent levels as nulls would move the
+    // data under 48 downstream analysis modules — it is DECLARED, so a consumer
+    // can mask on it instead of inferring it.
+    //
+    // ⚠ This key is meaningless for `mbo_event_schema`, which has no level
+    // columns, which is why it is inserted here and not in `schema_metadata`.
+    metadata.insert("absent_level_encoding".into(), "price_0_size_0".into());
     Schema::new_with_metadata(fields, metadata)
 }
 
@@ -144,7 +159,25 @@ pub fn mbo_event_schema() -> Schema {
         Field::new("size", DataType::UInt32, false),
     ];
 
-    let metadata = schema_metadata();
+    let mut metadata = schema_metadata();
+    // W24a — SCOPED TO THIS SCHEMA'S `price` FIELD. `DbnBridge::convert` fail-closes
+    // `dbn::UNDEF_PRICE` on every order-bearing action and deliberately EXEMPTS
+    // `Clear`/`None` (a book reset names no level), so the sentinel reaches this
+    // column BY DESIGN and preserving it is correct. What was missing is the
+    // declaration: the column is a non-nullable `Int64` whose only descriptor was
+    // `price_unit=nanodollars`, and `i64::MAX * 1e-9` is a finite, `isfinite`-True
+    // $9.22bn that silently poisons any mean taken over it.
+    //
+    // ⚠ NOT IN `schema_metadata` — a sentinel is a per-FIELD property of the wire
+    // format (hft-rules §2), not a per-file constant. The LOB snapshot price
+    // columns were measured at ZERO occurrences over 27,790,852 emitted rows;
+    // declaring it there would be a false declaration on four columns.
+    //
+    // Spelled as a literal for the same reason `MboMessage::validate` does: this
+    // module compiles without the `databento` feature and cannot name
+    // `dbn::UNDEF_PRICE`. `the_mbo_price_column_declares_the_undefined_price_sentinel_it_carries`
+    // in `tests/export_test.rs` is the check that the two agree.
+    metadata.insert("price_undef_sentinel".into(), "9223372036854775807".into());
     Schema::new_with_metadata(fields, metadata)
 }
 
@@ -340,6 +373,8 @@ mod tests {
     fn test_lob_schema_nullability() {
         let schema = lob_snapshot_schema(10, true);
         let nullable_fields = [
+            // W23: an absent venue clock stays absent rather than becoming epoch 0.
+            "timestamp_ns",
             "best_bid",
             "best_ask",
             "triggering_action",
@@ -351,7 +386,6 @@ mod tests {
             "depth_imbalance",
         ];
         let non_nullable_fields = [
-            "timestamp_ns",
             "sequence",
             "levels",
             "bid_prices",

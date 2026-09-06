@@ -28,7 +28,7 @@ pub(crate) struct LobBatch {
     capacity: usize,
 
     // Core columns
-    pub(crate) timestamp_ns: Vec<i64>,
+    pub(crate) timestamp_ns: Vec<Option<i64>>,
     pub(crate) sequence: Vec<u64>,
     pub(crate) level_count: Vec<u8>,
     pub(crate) best_bid: Vec<Option<i64>>,
@@ -139,7 +139,15 @@ impl LobBatch {
             state.levels, self.levels,
         );
 
-        self.timestamp_ns.push(state.timestamp.unwrap_or(0));
+        // W23 — FAIL-OPEN ON ABSENCE, PRESERVING IT: an absent `LobState::timestamp`
+        // is pushed as `None` and lands as a Parquet NULL. It is NOT coerced to 0,
+        // which would be indistinguishable from a genuine 1970 timestamp, would sort
+        // before every real row, and would feed `end_ts.saturating_sub(0)` ~55.5
+        // years into any downstream age statistic (hft-rules §1: absence must never
+        // be indistinguishable from agreement). No counter is added: `LobState`
+        // records no vendor record, so a per-snapshot "missing clock" tally would
+        // have no increment path that is not already the null count of this column.
+        self.timestamp_ns.push(state.timestamp);
         self.sequence.push(state.sequence);
         // B.1: SSoT for the per-file `levels` column is self.levels (=
         // ExportConfig.levels). Pre-B.1 this was state.levels, which could
@@ -191,7 +199,7 @@ impl LobBatch {
         let row_count = self.len();
 
         let mut columns: Vec<ArrayRef> = vec![
-            Arc::new(Int64Array::from(std::mem::take(&mut self.timestamp_ns))),
+            Arc::new(nullable_i64_array(std::mem::take(&mut self.timestamp_ns))),
             Arc::new(UInt64Array::from(std::mem::take(&mut self.sequence))),
             Arc::new(UInt8Array::from(std::mem::take(&mut self.level_count))),
             Arc::new(nullable_i64_array(std::mem::take(&mut self.best_bid))),

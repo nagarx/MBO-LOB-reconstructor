@@ -824,7 +824,7 @@ From `src/export/mod.rs`: `SCHEMA_VERSION: &str = "1.0"`, `DEFAULT_BATCH_SIZE: u
 
 | Column | Arrow Type | Nullable |
 |--------|-----------|----------|
-| `timestamp_ns` | Int64 | false |
+| `timestamp_ns` | Int64 | true |
 | `sequence` | UInt64 | false |
 | `levels` | UInt8 | false |
 | `best_bid` | Int64 | true |
@@ -864,6 +864,28 @@ From `src/export/mod.rs`: `SCHEMA_VERSION: &str = "1.0"`, `DEFAULT_BATCH_SIZE: u
 | `side` | UInt8 | false |
 | `price` | Int64 | false |
 | `size` | UInt32 | false |
+
+### Absence and sentinels — what the metadata declares
+
+`timestamp_ns` is nullable in **both** schemas: `LobState::timestamp` and
+`MboMessage::timestamp` are both `Option<i64>`, and an absent venue clock is
+emitted as NULL rather than coerced to epoch 0 (which would be
+indistinguishable from a genuine 1970 timestamp and would sort before every
+real row).
+
+Two encodings a consumer cannot infer from the bytes are declared as schema
+metadata, each scoped to the schema whose columns it describes:
+
+| Key | Schema | Meaning |
+|-----|--------|---------|
+| `price_undef_sentinel` | MBO event only | The `price` column may carry `9223372036854775807` (`dbn::UNDEF_PRICE`). The decode boundary fail-closes it on every order-bearing action and exempts `Clear`/`None`, so it arrives by design — measured at 1 row per XNAS day-file, 100% on `Action::Clear`. Mask before any statistic: unmasked, `i64::MAX * 1e-9` is a finite $9.22bn that passes every `isfinite` check. |
+| `absent_level_encoding` | LOB snapshot only | `price_0_size_0` — a level with no resting liquidity is emitted as price 0 / size 0 into non-nullable columns. |
+
+⚠ The scoping is load-bearing. A sentinel is a per-FIELD property of the wire
+format, not a per-file constant (hft-rules §2). The LOB snapshot price columns
+carry `i64::MAX` **zero** times, so `price_undef_sentinel` is deliberately
+absent from that schema; declaring it there would be a false declaration on
+four columns.
 
 ### File Metadata
 

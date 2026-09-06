@@ -1435,7 +1435,7 @@ analysis population; the applicable filters and denominators must be stated.
 
 | Column | Type | Nullable | Description |
 |--------|------|----------|-------------|
-| `timestamp_ns` | Int64 | No | Nanoseconds since epoch |
+| `timestamp_ns` | Int64 | Yes | Nanoseconds since epoch; NULL when the venue gave no clock (never coerced to epoch 0) |
 | `sequence` | UInt64 | No | Message sequence number |
 | `levels` | UInt8 | No | Active level count |
 | `best_bid` | Int64 | Yes | Best bid in nanodollars |
