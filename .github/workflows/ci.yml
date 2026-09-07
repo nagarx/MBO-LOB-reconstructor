@@ -48,6 +48,20 @@ jobs:
       - name: Run tests (no default features)
         run: cargo test --no-default-features
 
+      # The throughput assertions in tests/integration_test.rs are gated
+      # `#[cfg(not(debug_assertions))]`, so the debug `cargo test` above never
+      # compiles them. This step does.
+      #
+      # SCOPE, stated so nobody reads more into a green tick than is there:
+      # it proves those blocks still COMPILE. It does NOT prove they pass.
+      # Passing needs a release build AND the ~100 GB pipeline `data/` volume,
+      # and a GitHub runner has neither -- every test in that file stops at its
+      # `test_data_available_or_fail()` guard here. The assertions themselves
+      # are exercised only by `cargo test --release` on a machine with the data
+      # (README.md "Testing", WARNINGS.md "Contact" step 2).
+      - name: Type-check release-only test code (perf assertions)
+        run: cargo check --all-features --release --tests
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
