@@ -136,9 +136,10 @@
 
 use mbo_lob_reconstructor::{Action, LobConfig, LobReconstructor, MboMessage, Side};
 
-// NOTE: do NOT `use mbo_lob_reconstructor::Fill` — that is the *struct* re-exported
-// from `trade_aggregator` and it collides with the `Action::Fill` *variant* under
-// test. Always write `Action::Fill` fully qualified.
+// NOTE: `mbo_lob_reconstructor::Fill` NO LONGER EXISTS (un-exported 2026-09-07), so the
+// collision this note used to warn about is now a COMPILE ERROR rather than a convention.
+// It named a *struct* re-exported from `trade_aggregator` that collided with the
+// `Action::Fill` *variant* under test. Kept as the record of why the export went.
 
 /// Nanodollar fixed-point message constructor (matches `tests/lob_stats_counters.rs`).
 fn msg(order_id: u64, action: Action, side: Side, price_dollars: f64, size: u32) -> MboMessage {

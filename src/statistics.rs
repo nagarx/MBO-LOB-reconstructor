@@ -499,6 +499,17 @@ impl NormalizationParams {
         );
         // Fail-closed by DECISION: `normalize` divides by these. `!(x >= EPS)`
         // rather than `x < EPS` so that NaN is rejected too.
+        //
+        // ⛔ DO NOT "FIX" THE CLIPPY LINT HERE BY REWRITING THIS AS `**s < EPS`.
+        // clippy::neg_cmp_op_on_partial_ord objects on READABILITY grounds. Its suggested
+        // form is NOT equivalent for f64: `NaN >= EPS` is false, so `!(NaN >= EPS)` is TRUE
+        // and NaN is REJECTED; `NaN < EPS` is FALSE, so NaN would pass this guard and reach
+        // a DIVISOR. hft-rules §2: "Always check isfinite() before comparisons -- NaN
+        // comparisons fail silently." Silencing the lint keeps the guard; obeying it removes
+        // one. This allow was added 2026-09-07 to take `cargo clippy -- -D warnings`
+        // (ci.yml:102) from a PRE-EXISTING red to green WITHOUT weakening the check --
+        // verified pre-existing by running clippy at merge commit 3328a30 before any edit.
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
         if let Some((i, s)) = stds
             .iter()
             .enumerate()

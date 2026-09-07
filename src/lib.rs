@@ -204,7 +204,14 @@ pub use lob::reconstructor::{LobStatsExportEnvelope, LOB_STATS_SCHEMA_VERSION};
 pub use lob::{DayBoundary, DayBoundaryConfig, DayBoundaryDetector, DayBoundaryStats};
 
 // Re-exports - Trade Aggregation
-pub use lob::{Fill, Trade, TradeAggregator, TradeAggregatorConfig};
+// UN-EXPORTED 2026-09-07 (operator ruling, pre-v0.4.0). `pub use lob::{Fill, Trade,
+// TradeAggregator, TradeAggregatorConfig}` published a SIGN-INVERTED signed-volume API at the
+// crate root. trade_aggregator.rs:270 says of itself "This module is therefore STILL WRONG
+// after this commit", and the live mbo-gates waiver records "net signed volume +248 sh where
+// the truth is -319,783". Its entire safety argument was "zero code consumers" -- TRUE today
+// (0 import-shaped hits outside this crate; the one xsec hit is a doc comment) AND DESTROYED BY
+// TAGGING, which makes the API available to every future consumer under a green [WAIVED] gate.
+// The module is retained in full for the ladder commit that will fix it (archive, never delete).
 
 // Re-exports - Order Lifecycle Tracking
 pub use lob::{

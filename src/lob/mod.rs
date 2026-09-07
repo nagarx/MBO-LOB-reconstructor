@@ -83,7 +83,20 @@ pub mod order_lifecycle;
 pub mod price_level;
 pub mod queue_position;
 pub mod reconstructor;
-pub mod trade_aggregator;
+// RETAINED, PRIVATE, AND DELIBERATELY UNUSED pending the ladder's `trade_aggregator` commit.
+// The un-export (2026-09-07) made the module private, and dead_code IMMEDIATELY FIRED on 9
+// items -- which is the point: while `pub use` stood, those items were externally reachable so
+// dead_code COULD NOT fire, and the waiver's whole safety argument ("safe ONLY because the
+// module has zero code consumers") was invisible to the compiler and had to be asserted by a
+// human. It is now mechanically checked on every build.
+// This allow is therefore a RECORD, not a silencing: CI runs `cargo clippy --all-features --
+// -D warnings` (ci.yml:102), so without it the 9 warnings break the build. ⛔ DELETE THIS
+// ATTRIBUTE when the trade_aggregator commit lands -- if the module is then still dead, the
+// warnings returning is the correct signal that it should be archived rather than fixed.
+// The module is NOT deleted: hft-rules §0, archive never delete -- it is the comparison
+// subject for whatever replaces it. See src/lib.rs for why the re-export went.
+#[allow(dead_code)]
+mod trade_aggregator;
 
 pub use day_boundary::{DayBoundary, DayBoundaryConfig, DayBoundaryDetector, DayBoundaryStats};
 pub use multi_symbol::MultiSymbolLob;
@@ -97,4 +110,4 @@ pub use queue_position::{
     QueuePositionTracker, QueueStats,
 };
 pub use reconstructor::{CrossedQuotePolicy, LobConfig, LobReconstructor, LobStats};
-pub use trade_aggregator::{Fill, Trade, TradeAggregator, TradeAggregatorConfig};
+// UN-EXPORTED 2026-09-07 with the crate-root re-export above it; see src/lib.rs.

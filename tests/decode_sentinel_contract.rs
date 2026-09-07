@@ -157,7 +157,14 @@ mod vendor_decode {
 
     /// Build a `dbn::MboMsg` with a real timestamp, so nothing under test is
     /// entangled with the separate `ts_event == 0` dispatch.
-    fn vendor_msg(action: u8, side: u8, order_id: u64, price: i64, size: u32, flags: u8) -> dbn::MboMsg {
+    fn vendor_msg(
+        action: u8,
+        side: u8,
+        order_id: u64,
+        price: i64,
+        size: u32,
+        flags: u8,
+    ) -> dbn::MboMsg {
         dbn::MboMsg {
             hd: dbn::RecordHeader::new::<dbn::MboMsg>(0, 2, 11667, 1_751_356_800_002_015_312),
             order_id,
@@ -195,7 +202,14 @@ mod vendor_decode {
     #[test]
     fn undef_order_size_is_rejected_on_every_price_bearing_action() {
         for action in PRICE_BEARING_ACTIONS {
-            let msg = vendor_msg(action, b'B', 12345, GOOD_PRICE, UNDEF_ORDER_SIZE_LITERAL, 128);
+            let msg = vendor_msg(
+                action,
+                b'B',
+                12345,
+                GOOD_PRICE,
+                UNDEF_ORDER_SIZE_LITERAL,
+                128,
+            );
             match DbnBridge::convert(&msg) {
                 Err(TlobError::InvalidSize(s)) => assert_eq!(s, UNDEF_ORDER_SIZE_LITERAL),
                 other => panic!(
@@ -266,26 +280,39 @@ mod vendor_decode {
         for (id, side, px) in [(1u64, b'B', GOOD_PRICE), (2, b'A', GOOD_PRICE + 10_000_000)] {
             let add = DbnBridge::convert(&vendor_msg(b'A', side, id, px, 100, 128))
                 .expect("seed add must decode");
-            lob.process_message(&add).expect("seed add must be admitted");
+            lob.process_message(&add)
+                .expect("seed add must be admitted");
         }
-        assert_eq!(lob.order_count(), 2, "the book must be non-empty before the Clear");
+        assert_eq!(
+            lob.order_count(),
+            2,
+            "the book must be non-empty before the Clear"
+        );
         assert_eq!(lob.stats().book_clears, 0);
 
         // The vendor's own Clear, decoded exactly as the loader would decode it.
         let clear = DbnBridge::convert(&vendor_msg(b'R', b'N', 0, UNDEF_PRICE_LITERAL, 0, 8))
             .expect("the vendor sends exactly this record 1-2x per day per venue");
         assert_eq!(clear.action, Action::Clear);
-        assert_eq!(clear.price, UNDEF_PRICE_LITERAL, "the sentinel must survive verbatim");
+        assert_eq!(
+            clear.price, UNDEF_PRICE_LITERAL,
+            "the sentinel must survive verbatim"
+        );
 
         lob.process_message(&clear)
             .expect("the vendor's Clear must be admitted, sentinel price and all");
 
         assert_eq!(
-            lob.stats().book_clears, 1,
+            lob.stats().book_clears,
+            1,
             "the Clear did not reach the reset arm — a sentinel guard swallowed the \
              session boundary"
         );
-        assert_eq!(lob.order_count(), 0, "the Clear was counted but the book was not emptied");
+        assert_eq!(
+            lob.order_count(),
+            0,
+            "the Clear was counted but the book was not emptied"
+        );
     }
 
     /// The other exempt action, on a ZERO-RECORD population. `N` appears 0 times in
@@ -302,7 +329,12 @@ mod vendor_decode {
             );
             assert!(
                 DbnBridge::convert(&vendor_msg(
-                    action, b'N', 0, GOOD_PRICE, UNDEF_ORDER_SIZE_LITERAL, 0
+                    action,
+                    b'N',
+                    0,
+                    GOOD_PRICE,
+                    UNDEF_ORDER_SIZE_LITERAL,
+                    0
                 ))
                 .is_ok(),
                 "action {} must stay exempt from the size guard",

@@ -64,8 +64,9 @@ pub enum Action {
     /// ⚠ Not interchangeable with [`Action::Fill`]: the two carry **opposite** side conventions
     /// and are exact side-mirrors of one another, so merging them annihilates signed order flow.
     ///
-    /// ⚠ **NOT** related to [`crate::TradeAggregator`] or its [`crate::Trade`], which live one
-    /// `pub use` away in `lob::trade_aggregator`. That type builds one `Trade` by *aggregating
+    /// ⚠ **NOT** related to `TradeAggregator` or its `Trade` in `lob::trade_aggregator` (both
+    /// UN-EXPORTED 2026-09-07 and no longer reachable from the crate root; the intra-doc links
+    /// that stood here would now be broken). That type builds one `Trade` by *aggregating
     /// many* [`crate::Fill`]s; this variant is **one vendor print per physical execution**.
     /// "TradeAggregate" here means *the vendor's aggregate trade print*, not *an aggregate of
     /// trades*.
