@@ -276,8 +276,10 @@ impl DbnBridge {
     ///
     /// Both are also documented by the vendor as **book no-ops**.
     ///
-    /// 🔴 **STRUCK 2026-08-16 — THE "ZERO `F`" PREMISE IS REFUTED. THE COMMIT-2 IMPLEMENTER MUST
-    /// NOT BUILD ON IT.** ~~Databento's own MBP-10 contains **zero `F` records**~~ — **FALSE.**
+    /// 🔴 **STRUCK 2026-08-16 — THE "ZERO `F`" PREMISE IS REFUTED. DO NOT CITE IT, HERE OR
+    /// ANYWHERE.** (Scope widened at the 2026-09-07 bring-forward: it read "the COMMIT-2
+    /// implementer must not build on it", and COMMIT 2 has LANDED — a warning scoped to a
+    /// discharged task reads as spent.) ~~Databento's own MBP-10 contains **zero `F` records**~~ — **FALSE.**
     /// Measured across the 21 vendor MBP-10 day files: **38 `F` records on 11 of the 21 days**,
     /// every one at the opening or closing cross. The claim was generalised from one of the 10
     /// genuinely-zero days. A gate that asserts "the vendor MBP-10 contains no `F`" will read a

@@ -70,6 +70,31 @@ This document catalogs known warnings, issues, and edge cases that may occur dur
 > **both** red at `left: 0 / right: 1`, reproduced from two separately-constructed trees.
 
 
+> ✅ **THE FIX LANDED — and ONE OF THE TWO ROWS ABOVE IS NOT A VALID CHANNEL (2026-08-17).**
+> The decoder split (COMMIT 1) and the router fix (COMMIT 2a) are on
+> `claude/backbone-v5-reconstructor` **`c9c6f60`**. ⚠️ **`main` does NOT carry them — the production
+> book is still defective**, so every shipped number in this file still describes what production
+> emits.
+>
+> **`cancel_order_not_found` is the PRIMARY falsifier and it FIRED**, on two venues across seven
+> days: XNAS 261,386 → **0** (07-01) and 207,959 → **0** (07-02); ARCX 157,493 → **0** and
+> 127,527 → **0**. It is the primary channel precisely because **its code path SURVIVES the commit**
+> — `Action::Cancel` still calls `reduce_or_remove_order` and the miss branch is still live — so
+> reaching 0 is a **measurement**, not a removal. A third counter, `modify_order_not_found`
+> (369 → **0**, 324 → **0**), fires on a path **invisible on XNAS**, which emits zero `M` bytes.
+>
+> 🔴 **NEVER quote `trade_order_not_found → 0` as a passing channel (KNOWN-WRONG row N1).** After
+> the commit that counter — and its two `trade_*` siblings — have **ZERO increment sites in
+> production code**, so they read 0 on any data, on any venue, forever. A deliberately-built
+> *impostor* fix scores 0 on it too. It carries **zero discriminating power**. Its historical
+> 33,293 / 18,061 mass above is retained as the record of the defect, not as an acceptance target.
+>
+> ⚠️ **AND THE MASS ITSELF WAS SYMPTOM, NOT SIGNAL (KNOWN-WRONG row N2).** The plan predicted those
+> 18,061 events would reappear in a new `fill_referenced_unknown_order` counter once `Fill` stopped
+> mutating. It reads **0** — because the 18,061 was *itself* an artifact of the double-decrement
+> (`F` and its paired `C` both reducing an already-exhausted order, so later `F` records missed).
+> Fix the bug and nothing misses. Do not describe that counter's mass as signal being discarded.
+
 > **FINDING-122 scope boundary (validated 2026-08-01).** The decoder merge has
 > two different observed consequences. A direct raw-tape consumer sees total
 > signed-direction annihilation because `T` carries aggressor side and `F`
@@ -364,10 +389,20 @@ depth-specific book-construction defect**.
 ⚠️ SCOPE, stated because the numbers above are strong: 14 of 21 available days (input set
 deliberately frozen), **NVDA / XNAS / July-2025 only**, and the `T` stratum (6.19%) excluded exactly
 as the shipped gate excludes it. ~~There is **no ARCX MBP-10 anywhere on the data volume** — a
-full-volume search for `*mbp*10*` returns 21 XNAS + 20 GLBX + **0 ARCX**~~ — **true when written,
-FALSE since 2026-08-16; see the ARCX note below.** The two venues remain structurally different
-(XNAS carries 0 filter-escaping `T` records on 12/12 sampled days; ARCX carries 25,901–97,956 per
-day, 100.0000% `side='N'`).
+full-volume search for `*mbp*10*` returns 21 XNAS + 20 GLBX + **0 ARCX** — so no external-oracle
+conformance claim can be made for ARCX at all~~ **← STRUCK 2026-08-17: true when written, FALSE
+since 2026-08-16.** BOTH halves are dead — two ARCX MBP-10 days were acquired under ruling R7, so
+the files exist AND an external-oracle ARCX conformance claim can now be made. See the ARCX block
+below. The two venues remain structurally different (XNAS carries 0 filter-escaping `T` records on
+12/12 sampled days; ARCX carries 25,901–97,956 per day, 100.0000% `side='N'`).
+
+> ⚠️ **AND DO NOT READ A FILTERING MECHANISM INTO THAT `side='N'` (KNOWN-WRONG row N5).** Those
+> ARCX oid-bearing `T` records are **not** stopped by any `side == Side::None` guard — there is no
+> `msg.side` guard on that path at all; `reduce_or_remove_order` reads `order.side`, the **resting**
+> order's, and never `msg.side`. They die at the **Stage-1 order lookup**: 0 of 88,024 of their ids
+> ever appear as an `Add` id. That is **namespace disjointness — structural**, not a dormant guard
+> that could be "woken up". The `side='N'` figure is a true measurement of the population; it is not
+> the reason the population is book-invisible.
 
 ⭐ **THE ORACLE HAS NOW BEEN RUN AGAINST AN ACTUAL RUST SUBJECT — the qualification above was
 correct and is now DISCHARGED for the development days.** The 2026-08-11 arm was an independent
@@ -395,16 +430,24 @@ measured.
 ⭐ **ARCX MBP-10 NOW EXISTS ON THE VOLUME — for exactly two days.** Acquired 2026-08-16 under
 operator ruling R7 for the two development days only (`data/ARCX_MBP10_2025-07/`:
 `arcx-pillar-20250701.mbp-10.dbn.zst` 3,797,338 records, `arcx-pillar-20250702.mbp-10.dbn.zst`
-2,799,305 records; sha256-verified after an SSD disconnect/reconnect). Against it the candidate
-build reaches **100.0000%** at A-L1 and C-L1 on both days, where HEAD measures 91.8865% / 91.0339%
-(A-L1) and 91.0107% / 90.0705% (C-L1) with all 20 cells nonconforming.
-⛔ **THE ARCX DATA IS INERT TO THE CHECKED-IN ORACLES UNTIL A `--venue` OPTION LANDS.** Both oracle
-scripts hardcode XNAS on **eleven** sites, on the **MBO side as well as the MBP-10 side**. Fixing
-only the MBP-10 side does **not** produce "file not found" — it produces a run that **succeeds and
-returns a confident, wrong number**: an ARCX MBP-10 graded against an **XNAS** MBO book, emitted at
-full precision with no error. The resolution is a **triple** — (MBO dir, MBP-10 dir, filename
-prefix) — behind one option defaulting to XNAS so every existing citation keeps working. Tracked as
-repo task #33; the scripts live at the monorepo root, not in this repo.
+2,799,305 records; cost $0.9043; sha256-verified after an SSD disconnect/reconnect). The other 19
+conformance days stay a **frozen holdout**, and the full 233-day corpus was deliberately **not**
+bought. Against it the candidate build reaches **100.0000%** at A-L1 and C-L1 on both days, where
+HEAD measures 91.8865% / 91.0339% (A-L1) and 91.0107% / 90.0705% (C-L1) with **all 20 cells
+nonconforming**. So an external-oracle conformance claim *can* now be made for ARCX, and it says the
+same thing XNAS did. Detail:
+`hft-wiki/audit/2026-08-15-mbo-backbone-redesign/ARCX_MBP10_ACQUISITION_2026_08_16.md`.
+⚠️ Never quote the purchase size unqualified: **2.261 GiB** billable-uncompressed vs **177.2 MB**
+compressed-on-disk vs a **~129 MB** pre-purchase estimate of the compressed quantity are three
+different numbers (KNOWN-WRONG row N8).
+
+⛔ **THE REMAINING 19 DAYS ARE INERT TO THE CHECKED-IN ORACLES UNTIL A `--venue` OPTION LANDS.** Both
+oracle scripts hardcode XNAS on **eleven** sites, on the **MBO side as well as the MBP-10 side**.
+Fixing only the MBP-10 side does **not** produce "file not found" — it produces a run that
+**succeeds and returns a confident, wrong number**: an ARCX MBP-10 graded against an **XNAS** MBO
+book, emitted at full precision with no error. The resolution is a **triple** — (MBO dir, MBP-10
+dir, filename prefix) — behind one option defaulting to XNAS so every existing citation keeps
+working. Tracked as repo task #33; the scripts live at the monorepo root, not in this repo.
 
 ---
 
@@ -427,13 +470,33 @@ defect, not aggregation timing.
 > every one at the opening or closing cross. The claim was generalised from one of the 10 genuinely
 > zero days. A gate or a reviewer asserting "the vendor MBP-10 contains no `F`" will read a
 > **correct** vendor file as anomalous on 11 days in 21.
-> ⭐ **The conclusion survives on a strictly stronger argument — cite the PAIRING, never the zero.**
-> `F` is a book no-op because **the venue removes the resting order itself, with a paired `C`**, not
-> because `F` is absent from the vendor's book view: `F`→`C` pairing **1.00000000 over 6 days /
-> 1,808,570 records**, paired `C` the literal next record, `side` and `size` matching, holding
-> **inside both auction crosses** (so **no auction carve-out is required**). The 100.000%
-> reproduction quoted above is unaffected by the struck premise and stands. Struck in production
-> source at `src/dbn_bridge.rs` by the same correction — see §7 for the full pairing evidence.
+>
+> ⚠️ **AND IT CANNOT BE REPAIRED BY SCOPING IT TO XNAS — that repair was proposed 2026-08-17 and the
+> line above refutes it.** Those 21 day files ARE the **XNAS** vendor MBP-10 — the volume held
+> 21 XNAS + 20 GLBX + 0 ARCX MBP-10 files when that census ran, and the oracle's own scope is
+> NVDA/XNAS-only (see the scope note above) — so "the XNAS vendor MBP-10 contains zero `F` records"
+> is itself false on 11 of the 21 days. A venue qualifier does not
+> rescue the premise; it only narrows the population on which it is still wrong. **ARCX is a
+> near-zero rather than a literal zero, and for a different reason** — measured publication rates
+> from the ARCX MBO tape into the ARCX vendor MBP-10: `A` **75.90%** (2,296,220 → 1,742,798) ·
+> `C` **75.94%** (2,303,272 → 1,749,069) · `T` **100.00%** (235,317 → 235,317) ·
+> **`F` 0.0199% — 37 of 185,706**. ⇒ On **every** venue write "**the vendor does not publish `F` as
+> book-affecting**"; never "contains zero `F` records", with or without a venue qualifier.
+>
+> ⭐ **The conclusion survives on TWO strictly stronger arguments — cite these, never the zero.**
+> **(1) THE PAIRING.** `F` is a book no-op because **the venue removes the resting order itself,
+> with a paired `C`**, not because `F` is absent from the vendor's book view: `F`→`C` pairing
+> **1.00000000 over 6 days / 1,808,570 records**, the paired `C` the literal next record, `side` and
+> `size` matching, holding **inside both auction crosses** (so **no auction carve-out is required**).
+> **(2) THE PUBLICATION RATE.** If `F` reduced a resting order the way `C` does it would publish at
+> ~76%, like `C`. It publishes roughly **3,800× less** — the vendor's own book model does not treat
+> `F` as book-mutating, which is exactly what L-ROUTE implements. The ARCX rates therefore
+> **STRENGTHEN** the case: they were mis-framed as a scope repair when they are a second refutation
+> of the zero and an independent corroboration of the no-op.
+>
+> The 100.000% reproduction quoted above is unaffected by the struck premise and stands. Struck in
+> production source at `src/dbn_bridge.rs` by the same correction — see §7 for the full pairing
+> evidence.
 
 **Impact** *(corrected; ⚠️ now HISTORICAL — the defect is fixed on this branch)*: NOT minor at
 sequence resolution. The distortion was transient — it lived between each `F` and its paired `C` —
@@ -589,27 +652,105 @@ For issues not covered here, please:
 
 ---
 
-## ⚠️ BRANCH NOTE — this copy is one merge behind `main` on the BBO/oracle/D1 block
+## BBO accuracy and the MBP-10 oracle — what may and may not be cited
 
-`main` carries an additional trailing section, **"BBO accuracy and the MBP-10 oracle — what may and
-may not be cited"**, added there (and only there) when that block was relocated out of the root
-`CLAUDE.md` always-on layer. It is **not** on this candidate branch, which branched earlier. Nothing
-above is written to replace it: it arrives intact on the next merge, and this file deliberately adds
-no copy of it, so the merge stays clean.
+> **RELOCATED HERE 2026-08-16 from root `CLAUDE.md` §Pipeline Overview.** It was a module-scoped
+> warning (NVDA/XNAS/July-2025, `T` stratum excluded, zero ARCX MBP-10) being paid for by every
+> agent on every turn, including agents working on the backtester, the wiki, or crypto. The oracle
+> half was already duplicated below; **the D1 material existed ONLY in the root file** — measured
+> 2026-08-16: `grep -c D1_two_day WARNINGS.md` -> 0, `grep -c D1_two_day CLAUDE.md` -> 2. Root now
+> carries a one-line pointer here.
 
-Two things in that block are **dated statements this branch's measurements now bound** — read them
-together, not in isolation:
+🔴 **SUPERSEDED 2026-08-12 — THE CORRECTION BELOW IS ITSELF PROVENANCE-FREE.** Its source,
+`data/validation_results_july2025.json`, **HAS NO EMITTING CODE.** Measured unscoped over the whole
+tree: **68 files reference it and every one is a `.md`** — not one `.rs`, `.py` or `.sh`. It is
+hand-transcribed, dated `2025-12-01`, and its own `book_clears` is **21** where today's
+reconstructor emits **0**, so it describes a book the current code does not produce. The
+2026-08-01 fix therefore replaced one unsourced number with another. **Quote NEITHER `99.17%` NOR
+`95.56%/95.73%` as a current measurement.**
+**CITE INSTEAD** the ten-level MBP-10 oracle (2026-08-11; script + frozen verdicts git-backed at
+`hft-wiki/audit/2026-08-11-mbo-backbone-second-opinion/evidence/phase8_census_oracle/`):
+the candidate `F`-as-book-no-op arm reaches **100.000%** ten-level conformance with the vendor
+MBP-10 — **465,065,790 level-comparisons, 0 misses, 14 days**, price bit-identical L1 and L10 —
+while the **shipped** book measures **83.632% at L1 rising to 94.935% at L10** (stratum A). The
+rise with depth IS the F-merge signature (a fill hits the resting order at the touch) and shows
+there is **no second, depth-specific book defect**. Scope: 14/21 days, **NVDA/XNAS/July-2025 only**,
+`T` stratum (6.19%) excluded; ~~**there is no ARCX MBP-10 on the data volume at all** (`*mbp*10*` →
+21 XNAS + 20 GLBX + **0 ARCX**)~~ **← STALE, STRUCK 2026-08-17: two ARCX MBP-10 days were acquired
+2026-08-16 under ruling R7 and the oracle has been run on them — see the ARCX block above.**
+Full detail: `MBO-LOB-reconstructor/WARNINGS.md`.
 
-* *"there is no ARCX MBP-10 on the data volume at all"* — true when written, **false since
-  2026-08-16** for exactly two days. See the ARCX note in the oracle section above.
-* *"a Python port of the candidate semantics matches the vendor MBP-10"* / *"never write 'the oracle
-  validates the reconstructor'"* — the **correct** rule through 2026-08-15, and the reason it was
-  written still holds for every day the Rust subject has not covered. As of L-ROUTE the same oracle
-  **has** been run against actual Rust subjects (a HEAD build and the candidate build, paired on
-  identical rows) for the two development days plus five held-out days. State the scope; do not
-  drop either half.
+🔴 **AND ONE MORE SCOPE LINE, ADDED 2026-08-13 — THE ORACLE IS A PYTHON PORT. IT QUALIFIES THE
+SEMANTICS, NOT THE RUST.** Orchestrator-verified: all **3** scripts in that evidence directory
+contain **0** occurrences of `cargo`/`rustc`/`target/`; the only subprocess they launch is
+`dbn.cli_path()` (the Databento CLI); `oracle10.py:23` self-declares *"an independent 10-level
+**Python** book"* and `:169` *"the 10-level independent **Python book port**"*. **Re-running it
+after editing `MBO-LOB-reconstructor/src/dbn_bridge.rs` or `reconstructor.rs` produces
+byte-identical output whether a fix is applied, unapplied, or applied WRONG.** The programme's own
+packet says the same: `contracts/mbo_backbone/d0_evidence_receipt_v1.json` carries
+`authorizes: "nothing"`, `status: "observed_pass_nonadmitting"`, and the limitation *"the oracle
+evaluates a **Python candidate** … **not actual Rust candidate behavior**."*
+✅ **What it DOES establish stands and is valuable**: the candidate `F`-as-book-no-op SEMANTICS
+reproduce the vendor MBP-10 exactly, and the shipped book's rise with depth is the F-merge
+signature. Both survive. **What it does NOT establish is that any Rust implementation of those
+semantics is correct** — that is the packet's next pre-registered gate,
+`D1_two_day_development_replay_with_actual_Rust_subject`.
+⚠️ **SCOPE ADDED 2026-08-14 — "the next pre-registered gate" is TRUE OF THE LIST AND MISLEADING AS
+A PLAN. D1 IS NOT ACTIONABLE.** Measured: `grep -rn --no-ignore-files "D1_two_day"
+contracts/mbo_backbone/` returns **1 line** — a bare string in `required_sequence` — and a
+recursive walk for any D1-keyed entry across all **11** packet artifacts returns **0**. D0 has a
+builder, a receipt, two evidence files and a Makefile target; **D1 has none of the four.** It is
+specified in SCOPE, INPUTS and PROHIBITIONS, with **no METHOD and no ACCEPTANCE CRITERION**.
+Worse, `phase_gates.transition_states` puts **`semantic_change_authorize` BEFORE `d1_candidate`**,
+and Phase-0 closure was **unsatisfiable as coded** until 2026-08-14 (two validators demanded
+contradictory values of one key; proven by experiment, settled fact **S35**). **Do not open the
+parked candidate worktree and "run D1" — it would produce an unjudgeable artifact.** The authorized
+work is specification: see `hft-wiki/audit/2026-08-11-mbo-backbone-second-opinion/06_SETTLED_REGISTER.md`
+**S31–S39** and the continuation contract's KNOWN-WRONG **#26**.
+⇒ **Never write "the oracle validates the reconstructor" or "the gate is open". Write "a Python
+port of the candidate semantics matches the vendor MBP-10".**
 
-Its other qualifications — the provenance-free status of `data/validation_results_july2025.json`,
-the `T`-stratum exclusion, the NVDA/XNAS/July-2025 bound, and the fact that `D1` has no method or
-acceptance criterion in the packet — are **unaffected by anything on this branch and stand as
-written**.
+> ✅ **CLOSED 2026-08-17 — BY A CHANGE OF SUBJECT, NOT BY THE SCAR BEING WRONG. Read both halves.**
+> Everything above stays true **of the 2026-08-11 evidence copy**, which really is a Python
+> re-implementation and really would score identically whether a Rust fix were applied, unapplied,
+> or applied wrong. What changed is the **PROMOTED** copy at `scripts/ci/oracle10.py`:
+>
+> - It has a **`--subjects R`** arm whose subject is the **candidate book export the Rust
+>   reconstructor actually wrote** (`{day}_lob_snapshots.parquet` under a `--raw-lob` root). It is
+>   **refused outright without `--raw-lob`** (`[BLOCKED] … R would silently grade the SHIPPED
+>   default`), so it cannot quietly grade the wrong artifact under a candidate's name.
+>   The Python is now only the **grader and vendor-comparator**; the **subject is Rust**.
+> - It has **`--assert`** (demand `n_minus_exact == 0` on every graded stratum × level) and
+>   **`--self-test`**, so it can return a non-zero exit code. 🔴 **KNOWN-WRONG row N4: "oracle10.py
+>   has no `--assert` and exits 0 on a wrong book" is TRUE of the 2026-08-11 evidence copy and
+>   FALSE of `scripts/ci/oracle10.py`.** State which copy you mean; do not just flip the verdict.
+>
+> **Measured with a Rust subject on 2025-07-01**, three arms paired on identical rows
+> (`ts_row_proof_pct = 100.0`, `n_scored = 4,214,602` identical across all three):
+>
+> | subject | exit | A-L1 | C-L1 | A-L10 | C-L10 |
+> |---|---|---|---|---|---|
+> | P — shipped artifact | 1 | 86.5490% | 84.3066% | 96.4154% | 96.0378% |
+> | R — **HEAD build** | 1 | 86.5490% | 84.3066% | 96.4154% | 96.0378% |
+> | R — **candidate** | **0** | **100.0000%** | **100.0000%** | **100.0000%** | **100.0000%** |
+>
+> The candidate is also exit-0 on 2025-07-02 and on five held-out days (2025-07-03/09/16/23/30).
+> ⭐ **The HEAD-build arm is the load-bearing control**: a freshly-built HEAD scores *bit-identically*
+> to a shipped artifact produced five months earlier by pre-COMMIT-1 code. That is what proves
+> **COMMIT 1 is book-neutral** and **COMMIT 2a is the sole cause** of 86.549% → 100.000%.
+>
+> ⇒ You may now write: **"the promoted ten-level oracle grades the Rust candidate book against the
+> vendor MBP-10 and it conforms exactly, with a HEAD-build control isolating the cause."** You may
+> still NOT write it of the 2026-08-11 evidence copy, and you may still not write "the gate is open"
+> for the packet's `D1_*` entry, which remains unspecified as an artifact.
+
+⚠️ **BBO-accuracy correction (2026-08-01) — RETAINED AS THE RECORD, SUPERSEDED AS A FIGURE.** OLD: "BBO accuracy **99.17%**" (also quoted in
+`MBO-LOB-reconstructor/{README,CLAUDE,CODEBASE}.md` and its `WARNINGS.md`). NEW: **best-price exact
+match 95.56% bid / 95.73% ask; best-SIZE exact match 83.66% / 83.06%** — read directly out of the
+claim's own source artifact, `data/validation_results_july2025.json` (21 days, 88,062,096 aligned
+MBO-vs-MBP-10 comparisons). The numbers 99.17% / 91.15% / 99.71% / 99.69% do not appear anywhere in
+that artifact. Two further problems recorded in `MBO-LOB-reconstructor/WARNINGS.md`: the artifact's
+acceptance gate was set at **80%**, just under the buggy 83% size figure, so it could never fail;
+and the shortfall is now attributed to the `T`/`F` merge in `dbn_bridge.rs:125` (F-as-no-op is
+bit-exact to Databento's own MBP-10 on 100.000% of book-affecting records), not to the
+"aggregation timing" the artifact's notes claimed.
