@@ -67,7 +67,7 @@ pub enum Action {
     /// ⚠ **NOT** related to `TradeAggregator` or its `Trade` in `lob::trade_aggregator` (both
     /// UN-EXPORTED 2026-09-07 and no longer reachable from the crate root; the intra-doc links
     /// that stood here would now be broken). That type builds one `Trade` by *aggregating
-    /// many* [`crate::Fill`]s; this variant is **one vendor print per physical execution**.
+    /// many* `Fill`s; this variant is **one vendor print per physical execution**.
     /// "TradeAggregate" here means *the vendor's aggregate trade print*, not *an aggregate of
     /// trades*.
     TradeAggregate = b'T',
@@ -262,30 +262,187 @@ impl MboMessage {
         self.price as f64 / NANODOLLARS_PER_DOLLAR_F64
     }
 
-    /// Returns `true` if this message represents a system event (heartbeat,
-    /// status update, metadata) rather than a valid order.
+    /// Returns `true` if this message has the FIELD SHAPE of a record that cannot
+    /// describe a resting order.
     ///
-    /// System messages are identified by any of:
+    /// The shape is any of:
     /// - `order_id == 0` (no associated order)
     /// - `size == 0` (no quantity)
     /// - `price <= 0` (no valid price)
     ///
-    /// These messages are common in Databento MBO data (~10-15% of messages)
-    /// and should typically be filtered before LOB reconstruction.
+    /// ⚠ **THIS IS A FIELD-SHAPE TEST, NOT AN ADMISSION DECISION.** It is ACTION-BLIND,
+    /// so it also matches two records that are not heartbeats: the vendor's book-reset
+    /// `Action::Clear` (`order_id == 0`, `size == 0`) and every XNAS.ITCH trade print
+    /// `Action::TradeAggregate` (`order_id == 0` on 100% of them). Do NOT use it to
+    /// decide whether to skip a record before reconstruction — that drops every `Clear`
+    /// and every XNAS `T`. The reconstructor's skip gate uses [`Self::is_heartbeat`].
+    /// Measured share of records matching it: 375,644 of 9,314,830 (4.03%) on XNAS NVDA
+    /// 2025-07-01 and 185,531 of 5,234,876 (3.54%) on ARCX NVDA 2025-07-01 — every one of
+    /// them a `T` or a `Clear` (an earlier note here said "~10-15%" with no source).
+    ///
+    /// Its body is deliberately BYTE-IDENTICAL across rung 4 (DESIGN B — see
+    /// [`Self::is_heartbeat`]).
     #[inline]
     pub fn is_system_message(&self) -> bool {
         self.order_id == 0 || self.size == 0 || self.price <= 0
     }
 
+    /// Returns `true` if this message is a **heartbeat** in this crate's LOCAL sense: a
+    /// record on an order-bearing or no-op action (`Add`, `Modify`, `Cancel`, `Fill`,
+    /// `None`) whose fields cannot name an order or a level (`order_id == 0`, `size == 0`
+    /// or `price <= 0`). The reconstructor's skip gate (`LobConfig::skip_system_messages`,
+    /// default `true`) skips such a record rather than routing it.
+    ///
+    /// ⚠ **CRATE-LOCAL — NOT DATABENTO'S HEARTBEAT.** `dbn`'s `SystemMsg::is_heartbeat()`
+    /// tests a different RECORD TYPE (a gateway `SystemMsg` whose text is the heartbeat
+    /// string), which never becomes an `MboMessage`. The two share a name only.
+    ///
+    /// ⚠ **ON REAL DATA IT MATCHES NOTHING.** The COMMIT A review's vendor census (1,807
+    /// day-files, 5,143,699,736 MBO records; relayed, not re-derived here) found no record
+    /// this predicate matches: every field-shape match is a `TradeAggregate` or a `Clear`.
+    /// So since rung 4A `LobStats::system_messages_skipped` is a STRUCTURAL 0 on the corpus,
+    /// where a correct counter and a dead one read identically (`FINDING-155`); its
+    /// validation is behavioural —
+    /// `tests/l_admit_half_landing_lock.rs::heartbeat_still_skipped`.
+    ///
+    /// This is the ACTION-AWARE admission predicate added at rung 4 (L-ADMIT). For five
+    /// actions it is exactly the field-shape test [`Self::is_system_message`]. For the two
+    /// actions whose vendor wire shape legitimately matches that test it is `false`,
+    /// whatever the fields:
+    ///
+    /// * [`Action::Clear`] — **Phase O Cycle 1 / B.2a (NEW-AUDIT-A3 closure), moved here
+    ///   from the call site in `LobReconstructor::process_message_into` at rung 4.** A Clear
+    ///   is a SEMANTIC market event — the session-boundary / mid-day book wipe (circuit
+    ///   breaker, market-wide halt) — that canonically carries a heartbeat's zero-field shape:
+    ///   the vendor sends `order_id == 0`, `size == 0` and `price == UNDEF_PRICE`. Before B.2a
+    ///   the skip gate swallowed it under the DEFAULT config, so the `Action::Clear =>
+    ///   self.reset()` handler was unreachable, the book never reset, and each day inherited
+    ///   the previous day's resting orders. The companion Phase O B.2b fix exempted Clear in
+    ///   the sibling extractor's outer filter; B.2a is the load-bearing book-state fix.
+    ///   Locked by `tests/l_admit_half_landing_lock.rs::clear_is_never_a_heartbeat`.
+    /// * [`Action::TradeAggregate`] — **rung 4 (L-ADMIT).** The vendor `T` is the aggressing
+    ///   order's EXECUTION PRINT, not an order: it carries `order_id == 0` on 100% of
+    ///   XNAS.ITCH records (375,643 / 375,643 on 2025-07-01) and on 100% of ARCX's `T|A` and
+    ///   `T|B` cells (104,268 and 81,261 on 2025-07-01). It is a vendor book no-op that must
+    ///   be COUNTED (the carrier census, `LobStats::aggregate_trades_*`), not skipped as a
+    ///   heartbeat; under the field-shape test every XNAS `T` was skipped and the census read
+    ///   a structural 0 there. Admission is for the ROUTER and the COUNTERS only — the
+    ///   router's `TradeAggregate` arm mutates no book state.
+    ///
+    /// [`Action::None`] is deliberately **NOT** exempt: it has the same zero-field shape but
+    /// is a no-op with no required handler side effect, so a zero-field `None` stays a
+    /// heartbeat — the pre-B.2a behaviour, preserved. (`N` measures ZERO records in the
+    /// 94,542,598-record census cited in `DbnBridge::convert`, so this is a judgement, not a
+    /// measured need.) [`Action::Fill`], the OTHER carrier, is not exempt either: its
+    /// `order_id` is a real reference to a resting order, so an order-less `Fill` is not a
+    /// fill.
+    ///
+    /// # DESIGN B — `is_system_message()` is deliberately left BYTE-IDENTICAL
+    ///
+    /// Rung 4 could have been landed by editing [`Self::is_system_message`] to exempt
+    /// `TradeAggregate`. It must not be. Three consumers — `feature-extractor-MBO-LOB`,
+    /// `mbo-statistical-profiler` and `xsec_equity_discovery/extractor` — are linked to this
+    /// crate BY PATH during the candidate cycle, and the extractor drops system messages with
+    /// its OWN call to `is_system_message()` before its sampler counts the event. Changing
+    /// that body would admit `T` in the extractor with NO extractor edit and silently
+    /// re-phase its exported rows, with no counter moving and no test going red. So the
+    /// action-aware predicate is ADDED here, and each repo migrates its own call sites in its
+    /// own commit. Locked by
+    /// `tests/l_admit_half_landing_lock.rs::design_b_is_system_message_truth_table_unchanged`.
+    ///
+    /// # Why an exhaustive match with one arm per variant
+    ///
+    /// No wildcard, so a future `Action` variant fails to compile here until it is
+    /// dispositioned. No or-pattern naming a carrier: `scripts/ci/check_carrier_disjunction.py`
+    /// flags an arm that names both carriers, and a predicate that decides a carrier's fate
+    /// must never read as a merge of the two.
+    #[inline]
+    pub fn is_heartbeat(&self) -> bool {
+        match self.action {
+            Action::Add => self.is_system_message(),
+            Action::Modify => self.is_system_message(),
+            Action::Cancel => self.is_system_message(),
+            Action::TradeAggregate => false,
+            Action::Fill => self.is_system_message(),
+            Action::Clear => false,
+            Action::None => self.is_system_message(),
+        }
+    }
+
+    /// Validate a message for ADMISSION to the reconstructor's router: [`Self::validate`]
+    /// made action-aware (rung 4, L-ADMIT). The reconstructor's validation gate
+    /// (`LobConfig::validate_messages`, default `true`) calls this, not `validate()`.
+    ///
+    /// * [`Action::Clear`] => `Ok(())`. A Clear names no order and no level. This is the
+    ///   Phase O B.2a validation exemption, unchanged in meaning, moved here from the call
+    ///   site: without it the B.2a skip exemption would only move the silent drop one line
+    ///   down (Clear passes the skip gate, then dies here as `InvalidOrderId(0)`).
+    /// * [`Action::TradeAggregate`] => every clause of [`Self::validate`] EXCEPT
+    ///   `order_id == 0`: the FIELD clauses (`price > 0`, `price != UNDEF_PRICE`,
+    ///   `size != 0`, in `validate()`'s own order). A trade print's `order_id` is not an
+    ///   order reference (0 on XNAS; a trade identifier on ARCX `T|N`), so the
+    ///   ORDER-REFERENCE clause is inapplicable to it.
+    /// * every other action => [`Self::validate`], unchanged.
+    ///
+    /// `validate()` is two private clause groups, `validate_order_reference` then
+    /// `validate_fields`; the `TradeAggregate` arm calls `validate_fields` alone. So the
+    /// W04 undefined-price test and any future field clause have ONE definition shared with
+    /// the order-bearing actions, and a future clause that reads `order_id` belongs in
+    /// `validate_order_reference`, where it cannot silently pass a trade print.
+    ///
+    /// # A malformed trade print FAILS CLOSED — deliberately
+    ///
+    /// A trade print whose fields fail a clause gets exactly the error [`Self::validate`]
+    /// gives an order-bearing record with those fields. End to end under the DEFAULT config
+    /// the two are NOT treated alike, and the asymmetry is the decision (hft-rules §8,
+    /// fail-open vs fail-closed stated at the site): a malformed `Add`, `Modify`, `Cancel`,
+    /// `Fill` or `None` (`size == 0` or `price <= 0`) is a heartbeat and is SKIPPED before
+    /// validation runs, but a `TradeAggregate` is never a heartbeat, so its malformation
+    /// surfaces here as an `Err` instead of a silent skip. Before rung 4A such a print was
+    /// skipped. The measured population is zero — the COMMIT A review's vendor census found
+    /// 0 malformed `T` among 202,054,096 (relayed, not re-derived here) — so nothing on disk
+    /// moves, and a consumer that propagates with `?` (`mbo-statistical-profiler`) would
+    /// abort on the first one rather than lose it.
+    ///
+    /// # ⚠ THE SKIP GATE AND THIS GATE ARE ONE CHANGE
+    ///
+    /// Once [`Self::is_heartbeat`] admits a `TradeAggregate`, a validation gate that still
+    /// called `validate()` would return `Err(InvalidOrderId(0))` for EVERY XNAS trade print.
+    /// Four production sites turn that into a silent skip — three `.is_err()` sites
+    /// (`xsec_equity_discovery/extractor`'s panel producer `continue`s;
+    /// `fill_bracket_extract` and `auction_book_extract` return from the per-message
+    /// handler) plus one counted, WARN-logged `Err` arm in this crate's `export_to_parquet`
+    /// — so the carrier would vanish from their counts on a green build with exit code 0.
+    /// Locked by
+    /// `tests/l_admit_half_landing_lock.rs::l_admit_relaxes_both_gates_or_the_carrier_is_rejected_not_merely_skipped`.
+    pub fn validate_admission(&self) -> crate::error::Result<()> {
+        match self.action {
+            Action::Add => self.validate(),
+            Action::Modify => self.validate(),
+            Action::Cancel => self.validate(),
+            Action::TradeAggregate => self.validate_fields(),
+            Action::Fill => self.validate(),
+            Action::Clear => Ok(()),
+            Action::None => self.validate(),
+        }
+    }
+
     /// Validate the message fields.
     ///
     /// Unlike [`Self::is_system_message()`], this method checks whether a message
-    /// that *should* represent a valid order actually has valid field values.
-    /// System messages (heartbeats, status) should be filtered first.
+    /// that *should* represent a valid order actually has valid field values. The
+    /// reconstructor skips heartbeats ([`Self::is_heartbeat`]) before it validates, and
+    /// validates through [`Self::validate_admission`], not this method directly.
+    ///
+    /// Since rung 4A the body is two private clause groups, `validate_order_reference`
+    /// (`order_id == 0`) then `validate_fields` (`price <= 0`, the undefined-price
+    /// sentinel, `size == 0`), in the original clause order: behaviour and error
+    /// precedence are unchanged.
+    ///
     /// # W04 — the undefined-value sentinels, and why `price <= 0` does not catch them
     ///
     /// `i64::MAX` is **positive**, so the vendor's undefined-price sentinel walks
-    /// straight past the `price <= 0` clause below and emerges from
+    /// straight past the `price <= 0` clause and emerges from
     /// [`Self::price_as_f64`] as `9_223_372_036.854_776` — a **finite, plausible**
     /// $9.2-billion quote that satisfies every `is_finite()` guard downstream. That
     /// is hft-rules §2's named failure: "an unguarded divide neither crashes nor
@@ -302,12 +459,12 @@ impl MboMessage {
     ///   and `data/DATABENTO_SCHEMA_REFERENCE.md` states the rule twice: the sentinel
     ///   table gives `i64::MAX` for every fixed price or value, and §7 says "Test
     ///   `i64::MAX` before dividing a fixed price or value by 1e9." Nothing in this
-    ///   crate treats `i64::MAX` as a legitimate price, and `price <= 0` above
-    ///   already asserts price sanity for this type, so the sentinel belongs here as
+    ///   crate treats `i64::MAX` as a legitimate price, and `price <= 0` already
+    ///   asserts price sanity for this type, so the sentinel belongs here as
     ///   well as at the boundary.
     /// * **SIZE — a WIRE null only, so it is checked at the WIRE only.** See the
-    ///   comment beside the `size == 0` clause below for the full argument and the
-    ///   execution that settled it. `dbn::UNDEF_ORDER_SIZE` is guarded in
+    ///   comment beside the `size == 0` clause in `validate_fields` for the full argument
+    ///   and the execution that settled it. `dbn::UNDEF_ORDER_SIZE` is guarded in
     ///   [`crate::DbnBridge::convert`] and deliberately NOT here.
     ///
     /// # FAIL-CLOSED, and the decision is stated here (hft-rules §8)
@@ -320,11 +477,12 @@ impl MboMessage {
     ///
     /// # Reachability, and the measured exposure
     ///
-    /// `LobReconstructor::process_message_into` calls this under
-    /// `config.validate_messages`, which **defaults to `true`** — so it runs on every
-    /// non-`Clear` record. `Action::Clear` is exempted by the CALLER (it is not
-    /// supposed to represent a valid order, and it is the one action that
-    /// legitimately carries the sentinel), which is why no action test appears here.
+    /// `LobReconstructor::process_message_into` calls this through
+    /// [`Self::validate_admission`] under `config.validate_messages`, which **defaults to
+    /// `true`** — so it runs on every admitted non-`Clear` record (on a `TradeAggregate`
+    /// only its field clauses, since rung 4). `Action::Clear` is exempted by
+    /// the CALLER (it is not supposed to represent a valid order, and it is the one action
+    /// that legitimately carries the sentinel), which is why no action test appears here.
     ///
     /// ⚠ **This is a GUARD GAP, not a live wrong number.** Re-measured 2026-09-03
     /// over 94,542,598 MBO records / 16 files / 2 venues / 5 instruments:
@@ -333,11 +491,28 @@ impl MboMessage {
     /// Nothing on disk changes because of this clause. Promoting it to a
     /// block-production defect without that hedge would repeat `FINDING-181`.
     pub fn validate(&self) -> crate::error::Result<()> {
-        use crate::error::TlobError;
+        self.validate_order_reference()?;
+        self.validate_fields()
+    }
 
+    /// The ORDER-REFERENCE clause of [`Self::validate`]: a record that references a
+    /// resting order must name one (`order_id != 0`). Split out at rung 4A so the
+    /// `TradeAggregate` arm of [`Self::validate_admission`] can apply every OTHER clause —
+    /// a trade print's `order_id` is not an order reference. A future clause that reads
+    /// `order_id` belongs here, where it cannot silently pass a trade print.
+    fn validate_order_reference(&self) -> crate::error::Result<()> {
         if self.order_id == 0 {
-            return Err(TlobError::InvalidOrderId(0));
+            return Err(crate::error::TlobError::InvalidOrderId(0));
         }
+        Ok(())
+    }
+
+    /// The FIELD clauses of [`Self::validate`], in its order: `price <= 0`, the vendor's
+    /// undefined-price sentinel, `size == 0`. The one definition shared by `validate()`
+    /// and the `TradeAggregate` arm of [`Self::validate_admission`], so a field clause
+    /// added here reaches both. It must read no `order_id`.
+    fn validate_fields(&self) -> crate::error::Result<()> {
+        use crate::error::TlobError;
 
         if self.price <= 0 {
             return Err(TlobError::InvalidPrice(self.price));
@@ -378,7 +553,7 @@ impl MboMessage {
         // BBO and CBBO size fields do not all document a field-specific null rule";
         // (2) that test; (3) the live corpus, where `size == u32::MAX` occurs 0 times
         // in 94,542,598 records. The price sentinel is NOT symmetric with it — see
-        // above — which is why exactly one of the two clauses lives here.
+        // `validate()`'s docs — which is why exactly one of the two clauses lives here.
 
         Ok(())
     }

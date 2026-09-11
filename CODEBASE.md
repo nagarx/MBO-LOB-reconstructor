@@ -37,7 +37,7 @@ Converts Market-By-Order (MBO) data streams into Limit Order Book (LOB) snapshot
 | Capability | Description |
 |------------|-------------|
 | LOB Reconstruction | MBO events → price-level aggregation |
-| System-shaped filtering | Internal predicate `order_id == 0 || size == 0 || price <= 0`; Clear exempt. This is not a universal DBN heartbeat taxonomy and affects true-Trade coverage on the bounded NVDA/XNAS feature path. |
+| System-shaped filtering | The default config skips `MboMessage::is_heartbeat()` records: the internal shape `order_id == 0 || size == 0 || price <= 0` with `Clear` and `TradeAggregate` exempt (rung 4A). Not a DBN heartbeat taxonomy (and not dbn's `SystemMsg` heartbeat). The sibling extractor still pre-filters trade prints out with `is_system_message()` until rung 4B, which is what limits true-Trade coverage on the bounded NVDA/XNAS feature path. |
 | Crossed Quote Handling | Configurable policies for bid ≥ ask |
 | Temporal Fields | Time delta, triggering action/side (FI-2010 u6-u9) |
 | Analytics | Microprice, VWAP, depth imbalance, market impact |
@@ -170,7 +170,12 @@ always rejected after the checked signed-domain test.
 - `MboMessage::is_system_message()` implements
   `order_id == 0 || size == 0 || price <= 0`. That is an internal structural
   filter, not a DBN heartbeat/status type test. `Action::Clear` is exempted by
-  the reconstructor and extractor.
+  the reconstructor and extractor. Since rung 4A (L-ADMIT, reconstructor half)
+  the reconstructor's own gates use `MboMessage::is_heartbeat()` (that shape on
+  every action except `Clear` and `TradeAggregate`) and
+  `MboMessage::validate_admission()`; `is_system_message()` itself is
+  byte-identical (Design B), so the extractor's two call sites are unchanged
+  until rung 4B migrates them.
 - DBN MBO's primary/index timestamp is `ts_recv`; common-header `hd.ts_event`
   is matching-engine-received time. Current v0.3.0 `DbnBridge` stores
   `hd.ts_event` and drops `ts_recv`.
@@ -357,24 +362,38 @@ impl PriceLevel {
 
 ### Structural Filtering (Step 1)
 
-Current `process_message_into()` behavior is:
+Current `process_message_into()` behavior (since rung 4A) is:
 
 ```rust
-if self.config.skip_system_messages
-    && msg.is_system_message()
-    && msg.action != Action::Clear
-{
+// G1 — the skip gate
+if self.config.skip_system_messages && msg.is_heartbeat() {
     self.stats.system_messages_skipped += 1;
     // Temporal output is still populated before the early return.
     return Ok(());
 }
+// G2 — the validation gate
+if self.config.validate_messages {
+    msg.validate_admission()?;
+}
 ```
 
-The predicate is a crate-local structural heuristic, not a DBN system-record
-classification. The Clear exemption is load-bearing because a valid wire `R`
-record is zero-shaped. FINDING-122 additionally shows that, on the bounded
-NVDA/XNAS feature path, `order_id == 0` selects true Trades; upstream use of
-this filter therefore changes trade coverage.
+`is_heartbeat()` is the crate-local structural heuristic `is_system_message()`
+on every action EXCEPT `Clear` and `TradeAggregate`, which are never skipped:
+a valid wire `R` record is zero-shaped (the Phase O B.2a exemption, formerly an
+`&& msg.action != Action::Clear` clause at this call site), and 100% of
+XNAS.ITCH `T` records carry `order_id == 0` (FINDING-122: on the bounded
+NVDA/XNAS path `order_id == 0` selects true Trades). `validate_admission()` is
+`validate()` except that `Clear` is exempt and `TradeAggregate` is exempt from
+the `order_id == 0` clause only. G1 and G2 are one change: relaxing G1 alone
+turns every XNAS `T` into `Err(InvalidOrderId(0))`, which four production sites
+turn into a silent skip — three `.is_err()` sites in `xsec_equity_discovery`
+(the panel producer `continue`s; `fill_bracket_extract` and
+`auction_book_extract` return from the per-message handler) plus one counted,
+WARN-logged `Err` arm in this crate's `export_to_parquet`
+(`tests/l_admit_half_landing_lock.rs`). The sibling extractor's own pre-filter
+(`pipeline.rs`) is `is_system_message() && action != Clear`, so it passes
+`Clear` but drops every XNAS `T`, and its adapter (`adapters.rs`) then drops
+both as heartbeats — the extractor's state until rung 4B.
 
 ### Action Processing (Step 3)
 
@@ -477,9 +496,10 @@ When `ask_size > bid_size`, microprice is closer to bid (buying pressure).
 pub struct LobConfig {
     pub levels: usize,                    // Number of price levels (default: 10)
     pub crossed_quote_policy: CrossedQuotePolicy,  // How to handle bid ≥ ask
-    pub validate_messages: bool,          // Run msg.validate() (default: true)
+    pub validate_messages: bool,          // Run msg.validate_admission() (default: true)
     pub log_warnings: bool,               // Log anomalies (default: true)
-    pub skip_system_messages: bool,       // Skip order_id=0 etc. (default: true)
+    pub skip_system_messages: bool,       // Skip msg.is_heartbeat() records; never Clear or
+                                          // TradeAggregate (default: true)
 }
 ```
 
@@ -678,7 +698,7 @@ pub struct LobStats {
     // All six are #[serde(default)], which is exactly why the envelope
     // version had to move: absent keys deserialize to 0 and would be
     // indistinguishable from a genuine zero observation.
-    pub aggregate_trades_observed: u64,        // b'T' seen (0 on XNAS until L-ADMIT)
+    pub aggregate_trades_observed: u64,        // b'T' seen (counted on every venue since rung 4A / 3.0.0)
     pub resting_fills_observed: u64,           // b'F' seen
     pub fill_referenced_unknown_order: u64,    // must be 0
     pub fill_size_exceeded_resting: u64,       // must be 0
@@ -697,7 +717,10 @@ pub struct LobStats {
 ```
 
 For the field count, read the struct — `awk '/^pub struct LobStats \{/,/^\}/' src/lob/reconstructor.rs | grep -c '^    pub '`.
-The envelope's `LOB_STATS_SCHEMA_VERSION` was bumped at L-ROUTE; its current value lives in
+The envelope's `LOB_STATS_SCHEMA_VERSION` moved 2.0.0 → 2.1.0 (L-ROUTE), 2.2.0 (the carrier
+census) and 2.3.0 (W31), each labelled MINOR for its new fields — although L-ROUTE also changed
+existing values (`cancel_order_not_found` → 0) and so was MAJOR under root `VERSIONING.md` R7 —
+and then to 3.0.0 at rung 4A, MAJOR for a change of values alone. Its current value lives in
 `src/lob/reconstructor.rs` and in `CHANGELOG.md` — do not hand-copy it here.
 
 ### DayStats (src/statistics.rs)
@@ -1012,11 +1035,13 @@ assert!(stats.is_clean_eof(), "torn DBN: mid_record_eof={}", stats.mid_record_eo
 ### Data Quality Issues in Real Markets
 
 ```rust
-// Typical stats from one day of NVDA data:
-// messages_processed: 10,000,000
-// system_messages_skipped: 1,393,000 (~14%)
-// cancel_order_not_found: 50,000 (~0.5%) - NOT normal, and post-L-ROUTE it is 0.
-// crossed_quotes: 100 (~0.001%) - Normal!
+// Measured, XNAS NVDA 2025-07-01, candidate branch after rung 4A (export_to_parquet):
+// messages_processed:      9,314,830  (every record; 8,939,187 before rung 4A)
+// system_messages_skipped: 0          (375,643 before rung 4A: every trade print)
+// cancel_order_not_found:  0          (261,386 before L-ROUTE: an artifact, NOT normal)
+// crossed_quotes:          0
+// (An earlier block here gave round "typical" figures -- 10,000,000 processed and
+//  1,393,000 (~14%) skipped -- with no source; they matched no measured day.)
 ```
 
 > ⚠️ **CORRECTION 2026-08-01 — `cancel_order_not_found` / `trade_order_not_found` are NOT normal

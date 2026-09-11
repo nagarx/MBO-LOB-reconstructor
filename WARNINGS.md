@@ -185,8 +185,10 @@ orders for the instrument. It legitimately has the zero-shaped fields that
 also satisfy the crate-local `is_system_message()` heuristic. Pre-B.2a,
 default-config callers filtered Clear before dispatch, so the book never reset
 and `LobStats.book_clears` stayed zero. Current v0.3.0 code exempts
-`Action::Clear` from the inner structural filter and message validation; the
-sibling extractor carries the companion outer-filter exemption. This is why
+`Action::Clear` from the inner structural filter and message validation (since
+rung 4A both exemptions live inside `MboMessage::is_heartbeat()` /
+`MboMessage::validate_admission()` rather than at the call site); the sibling
+extractor carries the companion outer-filter exemption. This is why
 `order_id == 0 || size == 0 || price <= 0` must not be documented as a universal
 DBN heartbeat/status taxonomy. Preserve the dated closure record in
 `CHANGELOG.md [0.2.1]`.
@@ -297,6 +299,16 @@ an unplanned cross-check between two independently-derived instruments.
 319,230/319,230 on 2025-07-02), so `is_system_message()` drops it upstream of the router. It becomes
 reachable only when L-ADMIT lands. A gate that reads a scalar sum over these counters would go
 **green** in that window without the fix; use a **per-carrier conjunction**, never a sum.
+
+✅ **UPDATED AT RUNG 4A (L-ADMIT, reconstructor half; `LOB_STATS_SCHEMA_VERSION` 3.0.0).** The
+paragraph above — and the `0` in the table — is the pre-4A state. The skip gate now keys on
+`MboMessage::is_heartbeat()`, which exempts `TradeAggregate`, so the passing value is the vendor
+census, measured on the post-4A `export_to_parquet` arm: `aggregate_trades_observed` **375,643**
+(`_ask` 160,209 / `_bid` 147,371 / `_none` 68,063) on 2025-07-01 and **319,230** (125,651 / 123,041 /
+70,538) on 2025-07-02, with `system_messages_skipped` **0** and `messages_processed` equal to the
+tape; G-SIGN `--assert` exits 0 on both days with every tier's `failed_ids` empty. ⚠️ That receipt
+reads only `{day}_reconstruction_stats.json` and the tape — it says nothing about the sibling
+extractor, which still drops `T` at its own `is_system_message()` call sites until rung 4B.
 
 ⚠️ **A PREDICTION THAT WAS WRONG, RECORDED BECAUSE THE FINDING IS INSIDE IT.** The plan expected the
 18,061 `trade_order_not_found` events to *transfer* into `fill_referenced_unknown_order`. It reads

@@ -72,10 +72,14 @@
 //!
 //! # System Messages
 //!
-//! DBN/MBO data contains system messages (order_id=0, heartbeats, status updates)
-//! that are not valid orders. By default, `LobConfig::skip_system_messages = true`
-//! causes these to be silently skipped. The count is tracked in
-//! `LobStats::system_messages_skipped`.
+//! By default (`LobConfig::skip_system_messages = true`) the reconstructor skips
+//! records for which `MboMessage::is_heartbeat()` is true: the field shape
+//! `order_id == 0 || size == 0 || price <= 0` on any action EXCEPT `Action::Clear`
+//! and `Action::TradeAggregate`, which are never skipped — a Clear resets the book
+//! and a trade print is counted (a book no-op). The count is tracked in
+//! `LobStats::system_messages_skipped`, which on the measured corpus is a structural
+//! 0 since rung 4A. The default validation gate (`validate_messages = true`) runs
+//! `MboMessage::validate_admission()`, not `validate()`.
 
 pub mod day_boundary;
 mod multi_symbol;

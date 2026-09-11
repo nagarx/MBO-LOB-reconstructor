@@ -75,14 +75,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Suppression here is intentional and matches src/bin/export_to_parquet.rs.
     #[allow(deprecated)]
     for mbo_msg in loader.iter_messages()? {
-        // Skip invalid messages (system messages, metadata, etc.)
-        // Common patterns: order_id=0, size=0, invalid price
-        if mbo_msg.is_system_message() {
+        // Skip heartbeats — the reconstructor's own skip gate would skip them anyway.
+        // Use `is_heartbeat()`, never the field-shape `is_system_message()`: that also
+        // matches every `Clear` (the book would never reset — the pre-B.2a defect) and
+        // every XNAS trade print (`order_id == 0`), so pre-filtering with it drops both
+        // before the reconstructor can reset the book or count the carrier.
+        if mbo_msg.is_heartbeat() {
             skipped_invalid_count += 1;
             if skipped_invalid_count <= 10 {
                 // Log first few skipped messages for debugging
                 log::debug!(
-                    "Skipping invalid message #{}: order_id={}, action={:?}, side={:?}, price={}, size={}",
+                    "Skipping heartbeat #{}: order_id={}, action={:?}, side={:?}, price={}, size={}",
                     skipped_invalid_count, mbo_msg.order_id, mbo_msg.action, mbo_msg.side,
                     mbo_msg.price as f64 / NANODOLLARS_PER_DOLLAR_F64, mbo_msg.size
                 );
@@ -163,7 +166,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format_number(message_count)
     );
     println!(
-        "  Skipped (invalid):         {:>15}",
+        "  Skipped (heartbeat):       {:>15}",
         format_number(skipped_invalid_count)
     );
     println!(

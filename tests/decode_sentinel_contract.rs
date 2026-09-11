@@ -87,8 +87,10 @@ fn mbo_message_fits_the_documented_forty_byte_hot_path_budget() {
 /// hft-rules §2's named scar: "an unguarded divide neither crashes nor yields NaN".
 ///
 /// The live reachability of this guard: `LobReconstructor::process_message_into`
-/// calls `msg.validate()?` under `config.validate_messages`, which **defaults to
-/// `true`** — so it runs on every non-`Clear` record of every day.
+/// calls `msg.validate_admission()?` under `config.validate_messages`, which
+/// **defaults to `true`** — `validate()` for every order-bearing action and `None`,
+/// and the same field clauses (this sentinel among them) for a `TradeAggregate` — so
+/// it runs on every admitted non-`Clear` record of every day.
 #[test]
 fn validate_rejects_the_undef_price_sentinel_but_accepts_a_real_price() {
     let sentinel = MboMessage::new(1, Action::Add, Side::Bid, UNDEF_PRICE_LITERAL, GOOD_SIZE);

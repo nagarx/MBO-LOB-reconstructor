@@ -576,6 +576,9 @@ impl OrderLifecycleTracker {
             // MANUFACTURE a phantom completed lifecycle. That hazard is dormant
             // on XNAS.ITCH only because `is_system_message()` above drops 100%
             // of them; on ARCX, and after any L-ADMIT change, it would wake.
+            // (Rung 4A changed the RECONSTRUCTOR's gate to `is_heartbeat()`; this
+            // tracker's gate above is deliberately unchanged, and the split arm
+            // keeps the hazard closed whichever predicate guards it.)
             // Splitting the arm closes it structurally rather than relying on
             // an upstream guard that a later commit is expected to modify.
             Action::TradeAggregate => {

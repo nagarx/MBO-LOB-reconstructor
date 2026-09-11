@@ -12,8 +12,10 @@ use mbo_lob_reconstructor::{
 };
 
 /// Helper — construct a test message via the public `MboMessage::new` API.
-/// Price in nanodollars (i64 fixed-point). System messages are detected by the
-/// loader/lob via `is_system_message()` (order_id == 0 || size == 0 || price <= 0).
+/// Price in nanodollars (i64 fixed-point). The loader COUNTS field-shape system
+/// messages via `is_system_message()` (order_id == 0 || size == 0 || price <= 0);
+/// the reconstructor SKIPS only heartbeats, `is_heartbeat()` — that shape on every
+/// action except `Clear` and `TradeAggregate` (rung 4A).
 fn msg(order_id: u64, action: Action, side: Side, price_dollars: f64, size: u32) -> MboMessage {
     MboMessage::new(order_id, action, side, (price_dollars * 1e9) as i64, size)
 }
@@ -344,9 +346,27 @@ fn test_lobstats_schema_version_constant_is_pinned() {
     // only discriminator. The gap recorded above stands unchanged: nothing in
     // the monorepo yet COMPARES this constant, so the bump records intent
     // rather than enforcing it.
+    //
+    // 2.3.0 -> 3.0.0 at RUNG 4A (L-ADMIT, reconstructor half): the first MAJOR
+    // since the envelope, and the first bump with NO field added, removed or
+    // renamed. It is a VALUE-SEMANTICS break, MAJOR under the policy row that
+    // operator ruling DECISION-041 Ruling 1 added to the constant's docstring in
+    // the same change: the skip gate now keys on `MboMessage::is_heartbeat()`, so
+    // every `TradeAggregate` is counted instead of skipped, and
+    // `system_messages_skipped`, `messages_processed` and every
+    // `aggregate_trades_*` row carry a different population on either side of
+    // this bump (the measured deltas are in the constant's 3.0.0 entry).
+    //
+    // ⚠ WHY MAJOR AND NOT "NO BUMP". The old policy had no row for a value
+    // change, so read literally it authorised no bump at all — and a pre-4A
+    // artifact's `aggregate_trades_observed: 0` on XNAS (a STRUCTURAL zero: the
+    // skip gate dropped 100% of the population) would then be indistinguishable
+    // from a post-4A genuine zero. The gap recorded above still stands: readers
+    // of this envelope accept any string version and none compares it, so the
+    // bump records the break rather than enforcing it.
     assert_eq!(
-        LOB_STATS_SCHEMA_VERSION, "2.3.0",
-        "LOB_STATS_SCHEMA_VERSION must remain pinned at 2.3.0 until the next \
+        LOB_STATS_SCHEMA_VERSION, "3.0.0",
+        "LOB_STATS_SCHEMA_VERSION must remain pinned at 3.0.0 until the next \
          intentional, coordinated bump"
     );
 }
@@ -556,6 +576,7 @@ fn a_partial_cancel_reduces_the_tracked_order_size_and_not_only_the_level_total(
 /// bid instead of returning).
 ///
 /// An `Add` carrying `side == None` clears both admission guards —
+/// `is_heartbeat()` and `validate_admission()`, which for an `Add` are exactly
 /// `is_system_message()` and `validate()` — reaches `add_order`, matches the
 /// `Side::None` arm, and is discarded. `messages_processed` still advances.
 /// Before this commit NO counter recorded it: the failure path returned

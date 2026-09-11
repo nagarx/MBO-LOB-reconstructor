@@ -82,11 +82,16 @@ pub fn lob_snapshot_schema(levels: usize, include_derived: bool) -> Schema {
         // `mbo_event_schema` below already declared the same concept nullable.
         Field::new("timestamp_ns", DataType::Int64, true),
         // ⚠ THIS COLUMN IS *NOT* THE VENDOR'S `sequence`. It carries
-        // `LobState::message_index` — this crate's own 1-based message counter
-        // — so it is dense and strictly +1 per row, and a venue-gap or
-        // message-loss check computed over it reports "no gaps" for ANY input,
-        // forever. The vendor's own `sequence` is present on `dbn::MboMsg` and
-        // is dropped at `DbnBridge::convert`; carrying it instead would change
+        // `LobState::message_index` — this crate's own 1-based count of
+        // PROCESSED messages (`LobStats::messages_processed`) when the row was
+        // emitted — so it says nothing about the vendor feed: a venue-gap or
+        // message-loss check computed over it can only ever see this crate's
+        // own processing. It is NOT dense or +1 per row either: downsampling
+        // and invalid-state rows leave gaps, and in schema-2.0 files every row
+        // emitted for a SKIPPED message (every XNAS trade print, before rung 4A)
+        // repeated the previous value — the value change behind `SCHEMA_VERSION`
+        // 3.0. The vendor's own `sequence` is present on `dbn::MboMsg` and is
+        // dropped at `DbnBridge::convert`; carrying it instead would change
         // this column's VALUES and is an open decision, not a rename.
         //
         // The NAME was deliberately left behind when the source field was

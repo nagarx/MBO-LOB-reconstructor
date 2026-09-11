@@ -11,6 +11,138 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > **NOT on `main`**. No version has been cut for it. `main` still produces the defective book, and
 > so does every export currently on disk.
 
+### Rung 4A — L-ADMIT, reconstructor half: the trade print is COUNTED, not skipped
+
+Every XNAS.ITCH `TradeAggregate` (`T`) carries `order_id == 0` (375,643 / 375,643 on 2025-07-01),
+so the field-shape skip gate `is_system_message() && action != Clear` dropped the whole population
+ahead of the router, and every `aggregate_trades_*` census row read a structural 0 on XNAS.
+
+- **Added**: `MboMessage::is_heartbeat()` — the reconstructor's action-aware skip predicate. It is
+  `is_system_message()` for `Add`, `Modify`, `Cancel`, `Fill` and `None`, and `false` for `Clear`
+  (the Phase O B.2a exemption, moved here from the call site) and `TradeAggregate`, whatever their
+  fields. An exhaustive match with one arm per variant — no wildcard, no or-pattern naming a carrier.
+  Crate-local: not `dbn`'s `SystemMsg::is_heartbeat()`, a different record type. On real data it
+  matches nothing (the COMMIT A review's vendor census: 0 of 5,143,699,736 MBO records; relayed),
+  so `system_messages_skipped` is a structural 0 from here on (`FINDING-155`); its validation is
+  behavioural.
+- **Added**: `MboMessage::validate_admission()` — `validate()` made action-aware: `Clear` is exempt
+  (unchanged meaning, moved from the call site); `TradeAggregate` gets the field clauses only;
+  every other action gets `validate()` unchanged.
+- **Changed (refactor; public behaviour unchanged)**: `validate()` is now two private clause
+  groups in its original clause order — `validate_order_reference()` (`order_id == 0`) then
+  `validate_fields()` (`price <= 0`, the undefined-price sentinel, `size == 0`); same errors, same
+  precedence. `validate_admission()`'s `TradeAggregate` arm calls `validate_fields()`, so the field
+  clauses have ONE definition and a future clause that reads `order_id` cannot silently pass a trade
+  print. (This replaces the first draft's placeholder-`order_id` copy.)
+- **Changed (behaviour, fail-closed by decision)**: a MALFORMED trade print (`size == 0` or
+  `price <= 0`) goes from skipped to `Err` — the same error `validate()` gives an order-bearing record
+  with those fields. It is NOT treated like a malformed order end to end: under the default config a
+  malformed order-bearing record is still a heartbeat and still skipped. Fail-closed is deliberate
+  (hft-rules §8, stated at the site). Measured population: 0 malformed `T` of 202,054,096 (the
+  COMMIT A review's vendor census; relayed); a consumer propagating with `?`
+  (`mbo-statistical-profiler`) would abort on the first one.
+- **Changed (G1 + G2, ONE change)**: `LobReconstructor::process_message_into` skips on
+  `is_heartbeat()` and validates with `validate_admission()`. Relaxing the skip gate alone would turn
+  every XNAS trade print into `Err(InvalidOrderId(0))`, which four production sites turn into a silent
+  skip: three `.is_err()` sites in `xsec_equity_discovery` (the panel producer `continue`s;
+  `fill_bracket_extract` and `auction_book_extract` return from the per-message handler) plus one
+  counted, WARN-logged `Err` arm in this crate's `export_to_parquet`. The router's `TradeAggregate`
+  arm is unchanged: a counted book no-op. A trade print now also passes through the crossed-quote
+  policy: under `Error` one arriving on a crossed or locked book returns `Err(CrossedQuote |
+  LockedQuote)`, under `UseLastValid` / `SkipUpdate` its emitted state is `last_valid_state`; the
+  default `Allow` is unaffected.
+- **Unchanged, deliberately (DESIGN B)**: the body of `MboMessage::is_system_message()` is
+  byte-identical (fn item sha256[:16] `7e0f9a1407bbcc61` at `21eec9a` and after).
+  `feature-extractor-MBO-LOB`, `mbo-statistical-profiler` and `xsec_equity_discovery/extractor` are
+  linked to this crate BY PATH; editing that body would admit `T` in the extractor with no extractor
+  edit and silently re-phase its exported rows. The extractor migrates its own call sites in rung 4B.
+- **Changed (BREAKING, VALUES)**: `LOB_STATS_SCHEMA_VERSION` `2.3.0` → **`3.0.0`**, under a new
+  VALUES row in its versioning policy (operator ruling `DECISION-041` Ruling 1), with the rows aligned
+  to root `VERSIONING.md` R7/R8: any change to an existing field's values is MAJOR, and MINOR requires
+  every existing field bit-identical on real data. No field is added, removed or renamed. Measured on
+  the pre/post `export_to_parquet` arms, NVDA 2025-07-01 (28 of 37 fields identical on XNAS, 30 of 37
+  on ARCX):
+
+  | field | XNAS before → after | ARCX before → after |
+  |---|---|---|
+  | `system_messages_skipped` | 375,643 → 0 | 185,529 → 0 |
+  | `messages_processed` | 8,939,187 → 9,314,830 | 5,049,347 → 5,234,876 |
+  | `aggregate_trades_observed` | 0 → 375,643 | 49,788 → 235,317 |
+  | `aggregate_trades_observed_{ask,bid,none}` | 0/0/0 → 160,209 / 147,371 / 68,063 | 0/0/49,788 → 104,268 / 81,261 / 49,788 |
+  | `aggregate_trades_volume_{ask,bid,none}` | 0/0/0 → 13,982,947 / 13,663,164 / 19,661,605 | 0/0/3,652,830 → 7,651,408 / 6,153,219 / 3,652,830 |
+
+  `crossed_quotes`, `locked_quotes` and `last_timestamp` change population by construction too (the
+  consistency check and the timestamp update now run at trade-print instants); they measured
+  unchanged on the four venue-days only because both counters were 0 and the day's last timestamped
+  record did not move — an absence of exposure, not invariance. The book itself is unchanged by
+  construction: the `TradeAggregate` arm calls only `LobStats::count_aggregate_trade`.
+- **Changed (BREAKING, VALUES)**: `export::SCHEMA_VERSION` `2.0` → **`3.0`**. The Parquet `sequence`
+  column (= `LobState::message_index` = `messages_processed`) now counts every admitted trade print;
+  in 2.0 files every row emitted for a skipped trade print repeated the previous value. Measured on
+  XNAS NVDA 2025-07-01: the second sampled row's `sequence` 4,789,812 → 5,000,003 at the same
+  `timestamp_ns`, every other column identical. No column is added or removed; `MBO-LOB-analyzer`
+  validates only `source`, and this crate's tests compare against the constant.
+- **Fixed**: the CI docs job (`RUSTDOCFLAGS=-D warnings cargo doc --all-features --no-deps`) had been
+  red since `21eec9a` on the broken `[crate::Fill]` intra-doc link in `src/types.rs` (`Fill` was
+  un-exported); it is now a plain code span and the job exits 0.
+- **Changed**: `examples/process_nvda_single_day.rs` pre-filters with `is_heartbeat()` instead of
+  `is_system_message()`, which had no `Clear` exemption at all (a live pre-B.2a swallow in a build
+  target) and dropped every XNAS trade print.
+- **Changed**: `is_valid_order`'s deprecation note now points at `is_heartbeat()`; its body (the
+  field-shape test) is unchanged.
+- **Docs, swept file by file**: `src/types.rs` (the predicate and validation docs; the
+  `Action::TradeAggregate` link); `src/lob/reconstructor.rs` (`LobConfig`, the `LobStats` field docs,
+  the carrier-census block, `count_aggregate_trade` — the `T`/`F` mirror scoped to one venue message
+  per `FINDING-211`, the correlations labelled XNAS NVDA 60-s bars — the two gate comments, the router
+  arm, the in-file carrier-test prelude); `src/lob/mod.rs` (`# System Messages`);
+  `src/lob/order_lifecycle.rs` (one note); `src/loader/mod.rs` (module doc, `skip_invalid`,
+  `system_messages_seen` — its cross-counter identity re-anchored to the extractor's own counters,
+  where it holds until rung 4B — and `is_valid_order`); `src/dbn_bridge.rs` (comments only);
+  `src/export/mod.rs` and `src/export/schema.rs` (`sequence`); three test files
+  (`carrier_routing_discriminator.rs`, `lob_stats_counters.rs`, `decode_sentinel_contract.rs`);
+  `CODEBASE.md`, `WARNINGS.md`, `ARCHITECTURE.md`, `README.md`. The `dbn_bridge` disjunction waiver was
+  re-read and re-pinned in the 2026-09-11 root companion commit to
+  `scripts/ci/check_carrier_disjunction.py`. NOT swept (follow-ups): the gitignored module
+  `CLAUDE.md`, `ARCHITECTURE.md`'s "18 fields" count, and the `message_index` doc's XNAS-only
+  9,314,830.
+
+**Acceptance.** `tests/l_admit_half_landing_lock.rs` is a NEW file, because every pre-existing
+carrier test pins `.with_skip_system_messages(false)` or feeds `order_id != 0`, and no reconstructor
+fixture fed `T` with `order_id == 0` (the real-data integration tests pre-filter it out at 13 sites).
+Nine tests — six drive the DEFAULT config through `process_message_into`, three are predicate truth
+tables over every `Action` and all three sides — with side-asymmetric fixtures and literal
+expectations. Each mutation was driven RED in a copy of the tree: G2 reverted →
+`Err(InvalidOrderId(0))`; G1 reverted → `aggregate_trades_observed` 0 with `system_messages_skipped`
+1; `is_heartbeat`'s `Clear` arm set to the field shape → `clear_is_never_a_heartbeat`;
+`is_system_message()` exempting `TradeAggregate` → `design_b_is_system_message_truth_table_unchanged`;
+`validate_admission`'s `Modify` arm returning `Ok(())` → `validate_admission_truth_table`; the
+undefined-price clause deleted from `validate_fields` → the truth table on an `Add` row AND the
+malformed-trade-print test.
+
+G-SIGN (`scripts/ci/check_carrier_sign.py`, run from a byte-verified snapshot of the root working
+tree) on fresh post-fix `export_to_parquet` arms: XNAS 2025-07-01 and 07-02 `--assert` rc 0 — every
+tier's `failed_ids` empty, admission regime `heartbeat_only_skip` with 0 skipped, 375,643 = 160,209 /
+147,371 / 68,063 and 319,230 = 125,651 / 123,041 / 70,538; ARCX 2025-07-01 and 07-02 `--venue arcx
+--assert` rc 0 — reference trusted under the gate's message-scoped criterion (`FINDING-211`: T-less
+`F` = P1 175 + P2 2 and P1 384 + P2 0, residual 0), per side 104,268 / 81,261 / 49,788 and 80,692 /
+68,838 / 40,206. ⚠️ **A 4A-ONLY RECEIPT**: G-SIGN reads `{day}_reconstruction_stats.json` and the tape,
+nothing else, and is structurally blind to the extractor. The extractor, rebuilt through the path
+seam with no extractor edit, passes its workspace suite unchanged (996 passed / 0 failed / 20
+ignored, identical per test name), and its exports are byte-identical to the pre-4A arms (42 of 42
+per-day artifacts; metadata modulo its two timestamps and `config_hash`) — Design B leaked nothing.
+
+**Corrected — a pre-registration this change measured wrong.** `DECISION-041` Ruling 2 pre-registers
+the post-rung-4 ARCX outcome as `_ask = 0, _bid = 0, _none = 49,788`. That is the PRE-4A state. The
+post-4A ARCX reconstructor census is `104,268 / 81,261 / 49,788` on 2025-07-01 (80,692 / 68,838 /
+40,206 on 07-02), equal to the vendor census.
+
+**Not in this change.** The crate version (`DECISION-041` Ruling 1 rules **v0.4.0**) is a tag-time
+step: bumping `Cargo.toml` rewrites this crate's `Cargo.lock` and, through the path seam, all three
+consumer lockfiles. The root VALUE-SEMANTICS clause in `VERSIONING.md` R7 (Ruling 1 requires it there
+as well as here) and the `LADDER.md` ARCX triple scoped as pre-4A land in the 2026-09-11 root companion
+commit. Rung 4B (the extractor's two call sites, its drop counters and the sign locks) is a separate
+commit in `feature-extractor-MBO-LOB`.
+
 ### The `T`/`F` carrier split — L-DECODE then L-ROUTE
 
 The decoder used to map `b'T' | b'F' => Ok(Action::Trade)`, merging two vendor populations whose

@@ -25,7 +25,10 @@ use crate::types::{Action, BookConsistency, LobState, MboMessage, Order, Side};
 /// History — keep this in step with the constant, which it drifted out of once:
 /// - `2.0.0` M.A.5: the conceptual break from the legacy flat shape (no
 ///   envelope existed before — pre-M.A.5 was implicit-1.0).
-/// - `2.1.0` COMMIT 2a (L-ROUTE): +6 carrier/Fill-oracle fields.
+/// - `2.1.0` COMMIT 2a (L-ROUTE): +6 carrier/Fill-oracle fields. ⚠ Bumped as
+///   MINOR, but L-ROUTE also changed existing VALUES (`cancel_order_not_found`
+///   261,386 -> 0 on XNAS NVDA 2025-07-01), so under root `VERSIONING.md` R7 it
+///   was a MAJOR change. Recorded here; not re-versioned.
 /// - `2.2.0` COMMIT 2b (carrier census): +12 per-side rows.
 /// - `2.3.0` W31 (the side-None drop counter): +1 field,
 ///   `add_side_none_dropped`. ⚠ THE ABSENT-VS-ZERO HAZARD IS SHARPEST HERE:
@@ -34,18 +37,68 @@ use crate::types::{Action, BookConsistency, LobState, MboMessage, Order, Side};
 ///   genuinely observed nothing are numerically identical. The envelope
 ///   version is the only thing that separates "never counted" from
 ///   "counted nothing".
+/// - `3.0.0` RUNG 4A (L-ADMIT, reconstructor half): NO field added, removed or
+///   renamed — a VALUE change, MAJOR under the policy below. The skip gate keys on
+///   `MboMessage::is_heartbeat()` and the validation gate on
+///   `MboMessage::validate_admission()`, so every `TradeAggregate` is processed and
+///   COUNTED instead of skipped.
+///   * FIELDS WHOSE POPULATION CHANGES BY CONSTRUCTION: `system_messages_skipped`,
+///     `messages_processed`, the seven `aggregate_trades_*` fields — and
+///     `crossed_quotes`, `locked_quotes` and `last_timestamp`, because the
+///     consistency check and the timestamp update now also run at every trade-print
+///     instant. Those three measured unchanged on the four measured venue-days (XNAS
+///     and ARCX NVDA, 2025-07-01 and 07-02) only because the book was never crossed or
+///     locked there (both counters 0 before and after) and the day's last timestamped
+///     record did not move. That is an absence of exposure, not invariance.
+///   * Measured field by field on the pre/post `export_to_parquet` arms, 2025-07-01.
+///     XNAS: `system_messages_skipped` 375,643 -> 0; `messages_processed` 8,939,187 ->
+///     9,314,830 (8,939,187 + 375,643 = 9,314,830: the skipped trade prints become
+///     processed messages); `aggregate_trades_observed` 0 -> 375,643, i.e. `_ask`
+///     0 -> 160,209, `_bid` 0 -> 147,371, `_none` 0 -> 68,063, `_volume_ask`
+///     0 -> 13,982,947, `_volume_bid` 0 -> 13,663,164, `_volume_none` 0 -> 19,661,605
+///     — equal to the vendor census cell for cell (G-SIGN `--assert` rc 0 on 2025-07-01
+///     and 07-02); 28 of 37 fields unchanged. ARCX: `system_messages_skipped` 185,529
+///     -> 0; `messages_processed` 5,049,347 -> 5,234,876; `aggregate_trades_observed`
+///     49,788 -> 235,317, i.e. `_ask` 0 -> 104,268 and `_bid` 0 -> 81,261
+///     (`_volume_ask` 0 -> 7,651,408, `_volume_bid` 0 -> 6,153,219), while `_none`
+///     stays 49,788 — the `T|N` cell carries `order_id != 0` and was admitted before;
+///     30 of 37 unchanged.
+///   * CROSSED-QUOTE POLICY INTERACTION: a trade print now passes through
+///     `LobConfig::crossed_quote_policy`. Under `Allow` (the default; the COMMIT A
+///     review found every consumer linked to the candidate on it) nothing changes beyond
+///     the fields above. Under `Error`, a trade print arriving on a crossed or locked
+///     book now returns `Err(CrossedQuote | LockedQuote)` where it used to be skipped
+///     with `Ok`; under `UseLastValid` / `SkipUpdate`, the state emitted for it is
+///     `last_valid_state` (when one exists) rather than the current book.
+///   * THE BOOK ITSELF IS UNCHANGED BY CONSTRUCTION, not by measurement: the router's
+///     `TradeAggregate` arm calls only `LobStats::count_aggregate_trade`, a method on
+///     this struct, which cannot name `bids`, `asks` or `orders` (locked by
+///     `tests/l_admit_half_landing_lock.rs::t_is_a_book_noop`). Outside this envelope,
+///     `LobState::message_index` is `messages_processed`, so the exported Parquet
+///     `sequence` column changes on every row after the day's first trade print —
+///     hence the Parquet `SCHEMA_VERSION` bump to `3.0` in the same change.
 ///
-/// **Independent of** [`crate::export::SCHEMA_VERSION`] (`"1.0"`), which
-/// versions the Parquet export schema — a different artifact. When either
-/// constant bumps, the other should NOT auto-bump.
+/// **Independent of** [`crate::export::SCHEMA_VERSION`], which versions the Parquet
+/// export schema — a different artifact. Neither constant auto-bumps with the other;
+/// each bumps on its own artifact's merits (rung 4A bumps both, for two different value
+/// changes).
 ///
-/// # Versioning policy (per hft-rules §1)
+/// # Versioning policy (per hft-rules §1, aligned with root `VERSIONING.md` R7/R8)
 ///
 /// - MAJOR: any breaking change to the on-disk JSON shape (e.g., remove a
 ///   field, rename a field, change an envelope key).
-/// - MINOR: additive non-breaking changes (e.g., new `LobStats` field).
-/// - PATCH: docs-only changes.
-pub const LOB_STATS_SCHEMA_VERSION: &str = "2.3.0";
+/// - MAJOR — VALUES: ANY change to the value an existing field takes on the same
+///   input — its population or its meaning — so a result computed before is not
+///   comparable with one computed after (root `VERSIONING.md` R7: output values change
+///   => MAJOR; its clause (b) binds this embedded schema version although the row above
+///   is worded in terms of shape). Added at `3.0.0` by operator ruling `DECISION-041`
+///   Ruling 1: before this row the policy could not express a value change and so
+///   authorised NO bump for one, leaving a pre-change `0` indistinguishable from a
+///   post-change genuine `0` (`FINDING-155`).
+/// - MINOR: additive only (e.g., a new `LobStats` field), with every EXISTING field
+///   bit-identical on real data — proven, not asserted (root `VERSIONING.md` R8).
+/// - PATCH: no numerical change of any kind (docs, tests, internal refactor).
+pub const LOB_STATS_SCHEMA_VERSION: &str = "3.0.0";
 
 /// How to handle crossed quotes (bid >= ask) when they occur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -83,14 +136,18 @@ pub struct LobConfig {
     /// Whether to log warnings for consistency issues
     pub log_warnings: bool,
 
-    /// Skip system messages (order_id=0, size=0, price<=0) instead of erroring.
+    /// Skip heartbeats — records for which [`MboMessage::is_heartbeat`] is true —
+    /// instead of erroring.
     ///
-    /// DBN/MBO data often contains system messages (heartbeats, status updates)
-    /// that have order_id=0. These are NOT valid orders and cannot be processed
-    /// by the LOB reconstructor.
+    /// A heartbeat has the field shape `order_id == 0 || size == 0 || price <= 0`
+    /// and is neither `Action::Clear` nor `Action::TradeAggregate`: those two match
+    /// the shape but are a book reset and a counted trade print, so they are never
+    /// skipped (Phase O B.2a and rung 4 respectively). The field keeps its historical
+    /// name; since rung 4 it keys on `is_heartbeat()`, not `is_system_message()`.
     ///
-    /// When true (default): silently skip these messages and track count in stats.
-    /// When false: attempt to process (will fail validation if validate_messages=true).
+    /// When true (default): skip heartbeats and count them in
+    /// `LobStats::system_messages_skipped`. When false: attempt to process them
+    /// (a heartbeat then fails validation if `validate_messages` is true).
     ///
     /// This is the recommended setting for LOB reconstruction from real market data.
     pub skip_system_messages: bool,
@@ -135,15 +192,18 @@ impl LobConfig {
         self
     }
 
-    /// Enable/disable skipping of system messages.
+    /// Enable/disable skipping of heartbeats ([`MboMessage::is_heartbeat`]).
     ///
-    /// System messages are identified by:
-    /// - order_id = 0 (heartbeats, status updates, metadata)
+    /// A heartbeat is a record with the field shape
+    /// - order_id = 0 (no associated order)
     /// - size = 0 (invalid order size)
     /// - price <= 0 (invalid price)
     ///
-    /// When true (default): these messages are silently skipped.
-    /// When false: these messages will be processed (and likely fail validation).
+    /// on any action except `Action::Clear` and `Action::TradeAggregate`, which are
+    /// never skipped.
+    ///
+    /// When true (default): heartbeats are skipped and counted.
+    /// When false: they will be processed (and likely fail validation).
     pub fn with_skip_system_messages(mut self, skip: bool) -> Self {
         self.skip_system_messages = skip;
         self
@@ -227,10 +287,19 @@ pub struct LobReconstructor {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct LobStats {
-    /// Total messages processed (excludes system messages if skip_system_messages=true)
+    /// Total messages processed (excludes heartbeats skipped under
+    /// `skip_system_messages = true`; see [`MboMessage::is_heartbeat`]).
+    ///
+    /// ⚠ Its population changed at `LOB_STATS_SCHEMA_VERSION` 3.0.0 (rung 4A):
+    /// every `TradeAggregate` is now processed, so values on either side of that
+    /// bump are not comparable.
     pub messages_processed: u64,
 
-    /// System messages skipped (order_id=0, size=0, price<=0)
+    /// Heartbeats skipped: records for which [`MboMessage::is_heartbeat`] is
+    /// true — the field-shape test (`order_id == 0 || size == 0 || price <= 0`)
+    /// on every action EXCEPT `Clear` and `TradeAggregate`, which are never
+    /// skipped. ⚠ Before 3.0.0 this also counted every trade print with
+    /// `order_id == 0` (375,643 on XNAS NVDA 2025-07-01; 0 since).
     pub system_messages_skipped: u64,
 
     /// Number of active orders
@@ -290,8 +359,11 @@ pub struct LobStats {
     /// Number of `Action::TradeAggregate` records observed (book no-op).
     ///
     /// The vendor's aggregate trade print, whose `side` is the AGGRESSOR's.
-    /// On XNAS.ITCH 100% carry `order_id == 0` and are dropped upstream by
-    /// `is_system_message()`, so this reads 0 there; on ARCX it is non-zero.
+    /// On XNAS.ITCH 100% carry `order_id == 0`; since rung 4A (L-ADMIT,
+    /// `LOB_STATS_SCHEMA_VERSION` 3.0.0) they are admitted and counted under the
+    /// DEFAULT config on every venue. ⚠ Before 3.0.0 the field-shape skip gate
+    /// dropped them ahead of the router, so this read a STRUCTURAL 0 on XNAS —
+    /// a pre-3.0.0 value is not comparable with a post-3.0.0 one.
     #[serde(default)]
     pub aggregate_trades_observed: u64,
 
@@ -355,35 +427,37 @@ pub struct LobStats {
     // subject: dropping `T|N` (68,063 records on 2025-07-01) is one of the
     // traps the gate exists to catch.
     //
-    // ⚠ EVERY `aggregate_trades_*` ROW READS 0 ON XNAS UNTIL RUNG 4, AND THAT
-    // IS THE PASSING VALUE THERE. 100% of the XNAS.ITCH `TradeAggregate`
-    // population carries `order_id == 0`, so `is_system_message()` drops it
-    // ahead of the router (L-ADMIT, rung 4). The zero is STRUCTURAL and carries
-    // no correctness information — the class `FINDING-155` describes — so these
-    // six rows are validated by the behavioural tests below, never by live
-    // XNAS data.
+    // ⚠ SINCE RUNG 4A (L-ADMIT, `LOB_STATS_SCHEMA_VERSION` 3.0.0) EVERY
+    // `aggregate_trades_*` ROW IS POPULATED ON BOTH VENUES UNDER THE DEFAULT
+    // CONFIG. Before it, 100% of the XNAS.ITCH `TradeAggregate` population
+    // carried `order_id == 0` and the field-shape skip gate dropped it ahead of
+    // the router, so all six rows read a STRUCTURAL 0 on XNAS — a zero that
+    // carried no correctness information (the class `FINDING-155` describes).
+    // Post-4A the XNAS rows equal the vendor census cell for cell and G-SIGN
+    // `--assert` exits 0 (the measured values are in the 3.0.0 entry of
+    // `LOB_STATS_SCHEMA_VERSION`). The behavioural tests below and
+    // `tests/l_admit_half_landing_lock.rs` remain the only validation of the
+    // rows a live day can leave at 0.
     //
-    // ⚠ "0 IS PASSING" DOES NOT MEAN "THE GATE IS GREEN". G-SIGN still exits 1
-    // at this rung, with `C-aggregate_trades-total` and the six
-    // `S-aggregate_trades-*` red. Those reds ARE the acceptance criterion
-    // (LADDER rung 2b: grade the exact failed-ID set in REPORT mode). A reader
-    // who "fixes" them here has smuggled L-ADMIT into 2b, which the ladder
-    // enumerates as its own distinct failure — a MISSING id.
+    // ⚠ G-SIGN IS A RECONSTRUCTOR-ONLY RECEIPT. It reads
+    // `{day}_reconstruction_stats.json` and the tape, nothing else, so its rc 0
+    // says nothing about whether the sibling extractor admits `T` (rung 4B).
     //
-    // ⚠ THE ARCX SHAPE IS NOT PROPORTIONAL, AND AN EARLIER VERSION OF THIS
-    // COMMENT IMPLIED IT WAS. Measured directly off the ARCX tape
+    // ⚠ THE ARCX SHAPE IS NOT PROPORTIONAL. Measured directly off the ARCX tape
     // (arcx-pillar-20250701, dbn-cli 0.20.1, 2026-08-23):
     //
-    //     T|A 104,268  order_id==0 104,268 (100%)  -> dropped by L-ADMIT
-    //     T|B  81,261  order_id==0  81,261 (100%)  -> dropped by L-ADMIT
-    //     T|N  49,788  order_id!=0  49,788 (100%)  -> REACHES this arm
+    //     T|A 104,268  order_id==0 104,268 (100%)  -> skipped before 4A; counted since
+    //     T|B  81,261  order_id==0  81,261 (100%)  -> skipped before 4A; counted since
+    //     T|N  49,788  order_id!=0  49,788 (100%)  -> reached this arm before 4A too
     //
-    // So the 21.16% of ARCX `T` carrying `order_id != 0` is ENTIRELY `T|N`, and
-    // the ARCX outcome is `_ask = 0, _bid = 0, _none = 49,788` — not ~20%
-    // spread across three rows. A reader expecting a proportional split would
-    // diagnose a CORRECT subject as broken. (Those `order_id`s reference no
-    // order the book ever held, so they are trade identifiers and must never be
-    // routed by `order_id`.)
+    // So BEFORE rung 4A the ARCX outcome was `_ask = 0, _bid = 0, _none =
+    // 49,788` (all of the 21.16% of ARCX `T` carrying `order_id != 0` is `T|N`),
+    // and SINCE rung 4A it is `_ask = 104,268, _bid = 81,261, _none = 49,788`,
+    // equal to the vendor census on every side (measured on the post-4A arm).
+    // ⚠ A pre-registration that carries the PRE-4A triple into a post-4A table
+    // diagnoses a CORRECT subject as broken. (The `T|N` `order_id`s reference no
+    // order the book ever held; they are trade identifiers and must never be
+    // used to route a `T`.)
     /// Count of vendor `T` records with `side == Ask` (aggressor sold).
     #[serde(default)]
     pub aggregate_trades_observed_ask: u64,
@@ -509,7 +583,8 @@ pub struct LobStats {
     /// Number of `Action::Add` records discarded because `side == Side::None`.
     ///
     /// A non-directional add clears both admission guards
-    /// ([`MboMessage::is_system_message`] and `validate()`) and reaches
+    /// ([`MboMessage::is_heartbeat`] and [`MboMessage::validate_admission`], which
+    /// for an `Add` are exactly the field-shape test and `validate()`) and reaches
     /// `LobReconstructor::add_order` (private), which has no side to file it
     /// under and therefore drops it. **FAIL-OPEN, deliberately**: absorbing one
     /// unfileable record is worth more than aborting a day of reconstruction —
@@ -546,9 +621,17 @@ impl LobStats {
     ///
     /// `side` here is the **AGGRESSOR's** — the OPPOSITE convention from
     /// [`Self::count_resting_fill`]. That opposition is the whole reason the
-    /// per-side rows exist, and it is why admitting this carrier (rung 4) must
-    /// re-derive the signed-flow expression at `MboComputer::extract_flow` in
-    /// the SAME commit.
+    /// per-side rows exist.
+    ///
+    /// ⚠ CORRECTED at rung 4A (2026-09-11). This paragraph used to say that
+    /// admitting this carrier "must re-derive the signed-flow expression at
+    /// `MboComputer::extract_flow` in the SAME commit". Rung 4A admits `T` to
+    /// THIS crate's router and counters only — no feature is computed here — and
+    /// operator ruling `DECISION-041` Ruling 3 keeps `T` OUT of the sibling
+    /// extractor's `MboWindow` population, so `extract_flow`'s formula does not
+    /// change. What `DECISION-034` R9 binds to the admission is a DECLARED and
+    /// LOCKED sign convention, in the extractor commit (rung 4B) that admits `T`
+    /// to the feature path.
     ///
     /// ⚠ CORRECTED 2026-08-23 — ADMITTING `T` ALONGSIDE `F` DOES NOT INVERT
     /// THE SIGN. IT ANNIHILATES THE FEATURE. The ladder, the execution-lane
@@ -556,29 +639,42 @@ impl LobStats {
     /// They are wrong, and the correct statement follows in one line from the
     /// ANTI-DIAGONAL identity these very counters expose: one execution has one
     /// aggressor and one resting counterparty on opposite sides, so
-    /// `T|A ≡ F|B` and `T|B ≡ F|A`. Admit both and
+    /// `T|A ≡ F|B` and `T|B ≡ F|A` — ⚠ SCOPED TO ONE VENUE MESSAGE (`FINDING-211`):
+    /// exact among the records sharing one `(channel_id, sequence)`, 0 violations in
+    /// 3,575,126 T-bearing messages over 11 NVDA venue-days. Over a whole DAY it is only
+    /// near-exact: `F` records in messages carrying no `T` (cross fills on both venues,
+    /// booked-taker fills on ARCX) leave a one-signed residual — ARCX 2025-07-01
+    /// `F|B - T|A` +78 and `F|A - T|B` +99 records; XNAS 2025-07-01 0 and +4. Admit both and
     ///
     /// ```text
     /// ask = T|A + F|A = T|A + T|B      bid = T|B + F|B = T|B + T|A
     /// ```
     ///
-    /// are IDENTICAL, so `net_trade_flow -> 0`. Measured on the vendor census
-    /// for both development days: `T|A == F|B` EXACTLY (160,209 on 2025-07-01;
-    /// 125,651 on 07-02), and the day-level `net_trade_flow` with both carriers
-    /// admitted is `6.50e-06` / `4.02e-06` against a genuine F-only signal of
-    /// `-0.0417` / `-0.0105`. On 60-second bars an independent decode measured
-    /// `corr(F-only, T-only) = -1.00000000` and `net_trade_flow` EXACTLY 0.0 in
-    /// 925 of 926 bars — the one survivor being the bar holding the auction
-    /// cross.
+    /// are IDENTICAL (up to that residual), so `net_trade_flow -> 0`. Measured on the
+    /// XNAS NVDA vendor census for both development days: `T|A == F|B` EXACTLY (160,209
+    /// on 2025-07-01; 125,651 on 07-02), and the day-level `net_trade_flow` with both
+    /// carriers admitted is `6.50e-06` / `4.02e-06` against a genuine F-only signal of
+    /// `-0.0417` / `-0.0105`. On XNAS NVDA 60-s bars an independent decode measured
+    /// `corr(F-only, T-only) = -1.00000000` (rounded) and `net_trade_flow` EXACTLY 0.0 in
+    /// 925 of 926 bars — the one survivor being the bar holding the auction cross.
     ///
     /// WHY THIS MATTERS MORE THAN AN INVERSION WOULD. An inverted feature keeps
     /// all of its information: a model learns a negative coefficient and every
     /// evaluation gate still sees signal at unchanged magnitude. An annihilated
     /// one carries ZERO bits and is silently constant — the `FINDING-155` /
     /// `FINDING-122` class. And a reviewer watching for a SIGN FLIP sees none,
-    /// concludes the admission was safe, and ships a dead column. ⇒ The rung-4
+    /// concludes the admission was safe, and ships a dead column.
+    ///
+    /// ⚠ SUPERSEDED at rung 4A: this paragraph used to conclude that "the rung-4
     /// acceptance must be a NON-DEGENERACY lock (`sd(net_trade_flow) > 0` per
-    /// day), never a sign check.
+    /// day), never a sign check". Measured since (`RUNG4_ADJUDICATION.md`,
+    /// 2026-09-07): that falsifier is green on a no-op, green on an inverted
+    /// sign, and already green before rung 4. Rung 4's acceptance is a
+    /// CONJUNCTION — G-SIGN over this census (reconstructor half), an
+    /// extractor-side admission ledger (rung 4B), and side-asymmetric sign
+    /// polarity locks — and it must never assert `corr(F-only, T-only) == -1.0`,
+    /// which measures -0.9999999977 (07-01) and -0.9999985165 (07-02) on correct data
+    /// (XNAS NVDA, 60-s bars).
     ///
     /// The total and its side row advance in ONE expression under ONE `?`, so
     /// `observed == observed_ask + observed_bid + observed_none` holds for
@@ -721,7 +817,7 @@ impl LobStats {
     /// rename to `path`. Eliminates the SIGKILL-mid-write partial-file risk
     /// of the pre-M.A.5 `BufWriter + serde_json::to_writer_pretty` path.
     ///
-    /// **Envelope wrapper**: output JSON is `{ "schema_version": "2.3.0",
+    /// **Envelope wrapper**: output JSON is `{ "schema_version": "3.0.0",
     /// "stats": {...} }`. The `schema_version` field is the
     /// [`LOB_STATS_SCHEMA_VERSION`] constant. **Breaking change** for the
     /// on-disk format; pre-M.A.5 flat-shape files cannot round-trip through
@@ -798,7 +894,7 @@ impl LobStats {
     /// Load stats from a JSON file (dual-format aware).
     ///
     /// Phase M M.A.5 (REV 3 boundary discipline cycle): accepts BOTH:
-    /// - **Envelope shape** (post-M.A.5): `{ "schema_version": "2.3.0",
+    /// - **Envelope shape** (post-M.A.5): `{ "schema_version": "3.0.0",
     ///   "stats": {...} }` — preferred.
     /// - **Legacy flat shape** (pre-M.A.5): `{messages_processed: ..., ...}`
     ///   without an envelope. Emits a `log::warn!` (per call) so operators
@@ -897,7 +993,7 @@ impl LobStats {
 #[derive(Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct LobStatsExportEnvelope {
-    /// Schema version string (e.g., `"2.3.0"`).
+    /// Schema version string (e.g., `"3.0.0"`).
     pub schema_version: String,
 
     /// The wrapped [`LobStats`] payload.
@@ -1643,30 +1739,12 @@ impl LobReconstructor {
     /// ```
     #[inline]
     pub fn process_message_into(&mut self, msg: &MboMessage, state: &mut LobState) -> Result<()> {
-        // System messages (heartbeats, status updates) are not valid orders.
-        //
-        // Phase O Cycle 1 / B.2a (NEW-AUDIT-A3 closure): exempt
-        // `Action::Clear` from this filter. Clear messages are SEMANTIC
-        // market events (mid-day book wipes from circuit-breaker /
-        // market-wide auction halts) that canonically carry the same
-        // zero-field shape as system heartbeats (`order_id=0, size=0,
-        // price=0`). Pre-B.2a this filter silently swallowed them,
-        // making the `Action::Clear => self.reset()` handler at the
-        // match dispatch below UNREACHABLE for default-config callers
-        // (`LobConfig::default()` sets `skip_system_messages: true`).
-        // The companion Phase O B.2b fix in the extractor's outer
-        // filter (`feature-extractor-MBO-LOB/crates/hft-extractor/src/
-        // pipeline.rs:346` as of 2026-07-07 — grep `msg.action !=
-        // Action::Clear` there if the line drifts) is
-        // the operator-visible counter side; B.2a is the load-bearing
-        // book-state fix. `Action::None` is intentionally NOT exempted
-        // — it has identical zero-field shape but per types.rs:48 is a
-        // "no-op action" with no required handler side effect; silent-
-        // drop preserves pre-B.2a behavior.
-        if self.config.skip_system_messages
-            && msg.is_system_message()
-            && msg.action != Action::Clear
-        {
+        // G1 — THE SKIP GATE. Heartbeats (records carrying no order and no book
+        // event) are skipped. The predicate is ACTION-AWARE: `Action::Clear`
+        // (Phase O B.2a) and `Action::TradeAggregate` (rung 4, L-ADMIT) are never
+        // heartbeats, although both match the field-shape `is_system_message()`.
+        // The B.2a rationale that stood here now lives in `MboMessage::is_heartbeat`.
+        if self.config.skip_system_messages && msg.is_heartbeat() {
             self.stats.system_messages_skipped += 1;
             // Still populate temporal info even for skipped messages
             self.fill_lob_state_with_temporal(
@@ -1678,22 +1756,23 @@ impl LobReconstructor {
             return Ok(());
         }
 
-        // Validate message (if enabled).
+        // G2 — THE VALIDATION GATE, ACTION-AWARE (`MboMessage::validate_admission`):
+        // `Clear` is exempt (Phase O B.2a), `TradeAggregate` is exempt from the
+        // `order_id == 0` clause ONLY, every other action gets `validate()` unchanged.
         //
-        // Phase O B.2a: also exempt `Action::Clear` from validation.
-        // `MboMessage::validate()` (types.rs:186-202) requires
-        // `order_id > 0 AND price > 0 AND size > 0` — the docstring at
-        // types.rs:183-185 explicitly says "checks whether a message
-        // that *should* represent a valid order actually has valid
-        // field values. System messages (heartbeats, status) should be
-        // filtered first." Clear is NOT supposed to represent a valid
-        // order, so it is correctly excluded from this validation
-        // contract. Without this exemption, the B.2a inner-filter
-        // exemption above would only move the silent-drop ONE LINE
-        // DOWN (Clear would pass the filter then be rejected by
-        // validation as `InvalidOrderId(0)`) — defeating the whole fix.
-        if self.config.validate_messages && msg.action != Action::Clear {
-            msg.validate()?;
+        // ⚠ G1 AND G2 ARE ONE CHANGE (rung 4A). G1 now admits every `TradeAggregate`,
+        // and 100% of XNAS.ITCH trade prints carry `order_id == 0`. With `validate()`
+        // here every one of them would come back `Err(InvalidOrderId(0))`, and four
+        // production sites turn that into a silent skip — three `.is_err()` sites
+        // (`xsec_equity_discovery/extractor`'s panel producer `continue`s;
+        // `fill_bracket_extract` and `auction_book_extract` return from the
+        // per-message handler) plus one counted, WARN-logged `Err` arm in this
+        // crate's `export_to_parquet` — losing the carrier on a green build with
+        // exit code 0. Locked by `tests/l_admit_half_landing_lock.rs`. Never "fix" a
+        // rejection by setting `validate_messages: false`: that also drops the price,
+        // sentinel, size and order-id guards for Add, Modify, Cancel and Fill.
+        if self.config.validate_messages {
+            msg.validate_admission()?;
         }
 
         // Process based on action
@@ -1735,15 +1814,20 @@ impl LobReconstructor {
             // the vendor's assertion unobservable and discard ~300,000 conformance events/day.
             // `observe_resting_fill` verifies it and mutates nothing.
             Action::TradeAggregate => {
-                // The aggressor-side print. Carries `order_id == 0` on XNAS.ITCH (100%,
-                // 375,643/375,643 on 2025-07-01) so L-ADMIT drops it upstream there.
+                // The aggressor-side print: a vendor book no-op, COUNTED here and never
+                // routed into the book.
                 //
-                // ⚠ ON ARCX IT IS THE `T|N` CELL — AND ONLY THAT CELL — THAT REACHES HERE.
-                // Measured 2026-08-23 on arcx-pillar-20250701: T|A and T|B carry
-                // `order_id == 0` at 100% (104,268 / 81,261) and are dropped; T|N carries
-                // `order_id != 0` at 100% (49,788) and arrives. The often-quoted "~19.8% of
-                // ARCX T reaches the arm" is that one cell, not a proportional share.
-                // Either way: no-op.
+                // ⚠ SINCE RUNG 4A (L-ADMIT) EVERY `T` REACHES THIS ARM UNDER THE DEFAULT
+                // CONFIG, ON BOTH VENUES: `is_heartbeat()` exempts `TradeAggregate`, and
+                // `validate_admission()` exempts it from the `order_id == 0` clause only.
+                // Before rung 4A the field-shape skip gate dropped every `T` carrying
+                // `order_id == 0` — 100% of XNAS.ITCH `T` (375,643/375,643 on 2025-07-01)
+                // and ARCX's `T|A` / `T|B` cells (104,268 / 81,261 on arcx-pillar-20250701,
+                // 100% `order_id == 0`) — so on ARCX only the `T|N` cell (49,788,
+                // `order_id != 0` at 100%) arrived. The measured post-4A census is in the
+                // `LOB_STATS_SCHEMA_VERSION` 3.0.0 entry. An ARCX `T|N`'s `order_id`
+                // references no order the book ever held — it is a trade identifier and
+                // must never be used to route a `T`.
                 //
                 // COMMIT 2b: the census lives HERE, in the arm, and not inside a helper
                 // returning `()`. `process_message_into` returns `Result<()>`, which is what
@@ -4379,26 +4463,30 @@ mod tests {
     // COMMIT 2b — THE PER-SIDE CARRIER CENSUS
     // ════════════════════════════════════════════════════════════════════════
     //
-    // ⚠ THESE TESTS ARE NOT OPTIONAL COVERAGE. THEY ARE THE ONLY VALIDATION
-    // THE `aggregate_trades_*` ROWS CAN EVER RECEIVE ON XNAS.
+    // ⚠ THESE TESTS ARE NOT OPTIONAL COVERAGE. THEY WERE WRITTEN WHEN THEY WERE
+    // THE ONLY VALIDATION THE `aggregate_trades_*` ROWS COULD RECEIVE ON XNAS.
     //
-    // 100% of the XNAS.ITCH `TradeAggregate` population carries `order_id == 0`
-    // and is dropped by `is_system_message()` ahead of the router, so all six
-    // `aggregate_trades_*` rows read 0 on live XNAS data until rung 4 admits
-    // the carrier. A correct implementation and a completely absent one are
-    // INDISTINGUISHABLE on that data — the class `FINDING-155` describes. The
-    // fixtures below defeat that by constructing `TradeAggregate` records with
-    // `order_id != 0`, which is the ARCX shape (~19.8% of its `T` population),
-    // and are therefore also the pre-validation of rung 4.
+    // Before rung 4A, 100% of the XNAS.ITCH `TradeAggregate` population carried
+    // `order_id == 0` and was dropped by the field-shape skip gate ahead of the
+    // router, so all six `aggregate_trades_*` rows read 0 on live XNAS data. A
+    // correct implementation and a completely absent one were INDISTINGUISHABLE
+    // on that data — the class `FINDING-155` describes. The fixtures below
+    // defeat that by constructing `TradeAggregate` records with `order_id != 0`,
+    // the ARCX `T|N` shape. Since rung 4A the XNAS shape (`order_id == 0`)
+    // reaches the router too; it is locked separately, under the DEFAULT config,
+    // in `tests/l_admit_half_landing_lock.rs`.
     //
     // Every fixture drives the FULL `process_message` path, not the helper, so
     // it proves the ARM increments — not merely that the helper can.
 
-    /// Build a carrier record that clears `is_system_message()` and `validate()`.
+    /// Build a carrier record that clears the heartbeat test and validation for
+    /// EVERY action it is used with.
     ///
-    /// `order_id != 0`, `price > 0`, `size > 0` — the ARCX `T` shape. A record
-    /// built with `order_id == 0` is dropped ahead of the router and would make
-    /// every assertion below vacuously pass against a broken implementation.
+    /// `order_id != 0`, `price > 0`, `size > 0` — the ARCX `T|N` shape. An `Add`
+    /// or `Fill` built with `order_id == 0` is a heartbeat and never reaches the
+    /// router, which would make every assertion below vacuously pass against a
+    /// broken implementation. (A `TradeAggregate` with `order_id == 0` DOES reach
+    /// it since rung 4A; that shape is covered by the lock file named above.)
     fn carrier_msg(order_id: u64, action: Action, side: Side, size: u32) -> MboMessage {
         MboMessage::new(order_id, action, side, 100_000_000_000, size)
     }

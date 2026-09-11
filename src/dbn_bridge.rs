@@ -97,15 +97,20 @@ impl DbnBridge {
         //     `ts_event == 0` and ZERO ARCX records carry that. The ARCX
         //     divergence bites at the `is_system_message()` admission guards in
         //     `queue_position` / `order_lifecycle` / the extractor's
-        //     `adapters.rs`, which are a DIFFERENT code path (resolved at
-        //     L-ADMIT). The census is cited here as the reason to key on the
-        //     ACTION rather than on field shape — not as a defect this
+        //     `adapters.rs`, which are a DIFFERENT code path (the
+        //     reconstructor's own guard was resolved at rung 4A by the
+        //     action-aware `MboMessage::is_heartbeat()`; the extractor's is
+        //     rung 4B; the two trackers keep the field-shape guard, which is
+        //     counter-neutral there). The census is cited here as the reason
+        //     to key on the ACTION rather than on field shape — not as a defect this
         //     predicate is repairing today.
         //   * It is a fourth, greppable-only-by-luck copy of a predicate the
-        //     L-ADMIT layer deletes. No search for the function NAME finds
-        //     it, so deleting the method would have left this copy alive
-        //     under a local variable name and the deletion would have been
-        //     cosmetic.
+        //     L-ADMIT layer was then expected to delete. No search for the
+        //     function NAME finds it, so deleting the method would have left
+        //     this copy alive under a local variable name and the deletion
+        //     would have been cosmetic. (Rung 4A did NOT delete it: under
+        //     DESIGN B `is_system_message()` stays byte-identical and the
+        //     action-aware `is_heartbeat()` was added beside it.)
         //
         // The actions for which a missing timestamp is legitimate are the
         // NON-ORDER-BEARING ones: `TradeAggregate` (the aggressing order's
@@ -119,8 +124,12 @@ impl DbnBridge {
         // `Add|Modify|Cancel|Fill` fail-loud — and is silent on
         // `Action::None`. An exhaustive match must place it. It is grouped
         // with the permissive set on two grounds: (a) the L-ADMIT layer's
-        // specified `validate()` rewrite groups it exactly the same way
-        // (`Action::None | Action::Clear => Ok(())`); and (b) fail-loud there
+        // specified `validate()` rewrite grouped it exactly the same way
+        // (`Action::None | Action::Clear => Ok(())`) — ⚠ WITHDRAWN at rung 4A:
+        // the landed `MboMessage::validate_admission()` exempts only `Clear`
+        // (and `TradeAggregate`'s `order_id` clause) and validates `None`
+        // normally, so ground (a) no longer holds and (b) stands alone; and
+        // (b) fail-loud there
         // would be a NEW hard rejection of an unmeasured population that also
         // silently deflates `LobStats::noop_messages`, whereas the permissive
         // choice cannot lose a record. `N` measures ZERO records on both
@@ -670,8 +679,10 @@ mod tests {
         );
         // Resulting MboMessage MUST self-classify as a system message via
         // is_system_message(), so the typed iterator's F-010 counter
-        // increments for it. (That predicate is deleted by the L-ADMIT layer;
-        // this assertion moves to the action-keyed successor at that commit.)
+        // increments for it. (The predicate was expected to be deleted at
+        // L-ADMIT; rung 4A kept it byte-identical under DESIGN B and added the
+        // action-aware `is_heartbeat()` beside it. The F-010 loader counter
+        // still keys on `is_system_message()`, so this assertion stands.)
         assert!(
             mbo_msg.is_system_message(),
             "converted message must self-identify as system message for F-010 counter to fire"

@@ -29,7 +29,8 @@
 //! // Create LOB reconstructor (skip_system_messages=true by default)
 //! let mut lob = LobReconstructor::new(10);
 //!
-//! // Process all messages - system messages are automatically skipped
+//! // Process all messages - heartbeats are skipped by the reconstructor;
+//! // Clear and trade prints are not
 //! for mbo_msg in loader.iter_messages()? {
 //!     let state = lob.process_message(&mbo_msg)?;
 //!     // ... use state ...
@@ -42,8 +43,11 @@
 //!
 //! # System Messages
 //!
-//! DBN/MBO data contains system messages (order_id=0, heartbeats, status updates)
-//! that are NOT valid orders. These are handled by `LobReconstructor` with the
+//! Some records match the field-shape test `order_id == 0 || size == 0 || price <= 0`
+//! (on the measured corpus: every `Clear` and every XNAS trade print). The loader yields
+//! them all and counts them in `LoaderStats::system_messages_seen`; what to skip is the
+//! consumer's decision. `LobReconstructor` skips only `MboMessage::is_heartbeat()`
+//! records — that shape on any action except `Clear` and `TradeAggregate` — under its
 //! `skip_system_messages` config option (default: true).
 //!
 //! This loader focuses on I/O and decode errors only. Use `skip_invalid(true)`
@@ -224,6 +228,24 @@ pub struct LoaderStats {
     /// counter incremented. Downstream consumers retain the freedom to
     /// filter them via their own policy. Per hft-rules §8: never silently
     /// drop data without observability.
+    ///
+    /// ⚠ **Since rung 4A this is NOT comparable with
+    /// `LobStats::system_messages_skipped`.** This counter still counts every
+    /// field-shape match — which includes every `Action::Clear` and every
+    /// XNAS.ITCH `Action::TradeAggregate` — while the reconstructor now skips
+    /// only heartbeats ([`crate::types::MboMessage::is_heartbeat`]), a structural
+    /// 0 on the measured corpus. (375,644 here on XNAS NVDA 2025-07-01, as the
+    /// sibling extractor's diagnostics sidecar records it.)
+    ///
+    /// The one documented cross-counter identity over this counter is the sibling
+    /// extractor's (`feature-extractor-MBO-LOB`, `pipeline.rs`):
+    /// `loader.system_messages_seen.dropped_structural ==
+    /// pipeline.process_messages.dropped_structural + lob.book_clears.count`
+    /// (375,644 == 375,643 + 1 on that day). It is written over the EXTRACTOR's
+    /// own pre-filter counter, not over `LobStats::system_messages_skipped`, so
+    /// rung 4A leaves it intact; it breaks at rung 4B, when the extractor stops
+    /// dropping trade prints, and must be restated there with the admitted
+    /// `TradeAggregate` term.
     pub system_messages_seen: u64,
 }
 
@@ -468,8 +490,10 @@ impl DbnLoader {
     /// When enabled, messages that fail DBN decoding or conversion
     /// will be logged and skipped, and processing will continue.
     ///
-    /// This handles DECODE errors only. System messages (order_id=0)
-    /// are handled by `LobReconstructor` with `skip_system_messages`.
+    /// This handles DECODE and conversion errors only. Field-shape "system
+    /// messages" are not errors here: the loader yields and counts them, and
+    /// `LobReconstructor` skips only heartbeats (`MboMessage::is_heartbeat`) under
+    /// `skip_system_messages` — never a `Clear` or a trade print.
     pub fn skip_invalid(mut self, skip: bool) -> Self {
         self.skip_invalid = skip;
         self
@@ -949,17 +973,27 @@ impl<D: DecodeRecord> TypedMessageIterator<D> {
 
 /// Check if an MBO message represents a valid order (not a system message).
 ///
-/// Returns `false` for system messages (heartbeats, status updates).
+/// Returns `false` for system messages (heartbeats, status updates). Its body is the
+/// field-shape test and is left unchanged: a deprecated public function keeps the value
+/// it has always returned.
 ///
 /// # Deprecated
 ///
-/// Use [`MboMessage::is_system_message()`] instead:
+/// Use [`MboMessage::is_system_message()`] for the identical field-shape test — but do
+/// NOT use either one to pre-filter records before reconstruction. Both match every
+/// `Action::Clear` and every XNAS.ITCH `Action::TradeAggregate`, so a pre-filter built
+/// on them stops the book from resetting and drops the trade-print carrier before the
+/// reconstructor can count it. The reconstructor already skips heartbeats itself; if a
+/// caller must pre-filter, use [`MboMessage::is_heartbeat()`]:
 /// ```ignore
-/// if !msg.is_system_message() {
+/// if !msg.is_heartbeat() {
 ///     lob.process_message(&msg)?;
 /// }
 /// ```
-#[deprecated(since = "0.2.0", note = "Use `!msg.is_system_message()` instead")]
+#[deprecated(
+    since = "0.2.0",
+    note = "Use `!msg.is_heartbeat()` to decide whether to skip a record; `is_system_message()` also matches every Clear and every XNAS trade print"
+)]
 #[inline]
 pub fn is_valid_order(msg: &MboMessage) -> bool {
     !msg.is_system_message()

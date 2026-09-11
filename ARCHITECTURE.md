@@ -120,7 +120,10 @@ record. Their filters also differ; see the source-verified API table below.
 - `MboMessage::is_system_message()` is an internal structural heuristic
   (`order_id == 0 || size == 0 || price <= 0`), not a DBN record taxonomy. On
   the measured NVDA/XNAS path, `order_id == 0` also identifies true Trade rows;
-  `Action::Clear` is explicitly exempted so reset semantics survive.
+  `Action::Clear` is explicitly exempted so reset semantics survive. Since rung
+  4A the reconstructor's skip gate is `MboMessage::is_heartbeat()`, which exempts
+  `TradeAggregate` as well, so the XNAS trade prints are counted rather than
+  skipped; `is_system_message()` is byte-identical (Design B).
 - Fixed `i64` prices use a 1e9 storage scale after sentinel handling. The
   decoded value is instrument-native; USD/share terminology is valid only
   after the selected equity dataset and instrument context establish it.
@@ -220,7 +223,16 @@ Key methods and limitations:
 
 - `is_system_message() -> bool` is the crate's structural predicate
   `order_id == 0 || size == 0 || price <= 0`; it is not a universal DBN
-  heartbeat definition. `Action::Clear` is exempt in reconstruction.
+  heartbeat definition, and it is ACTION-BLIND. Its body is deliberately
+  unchanged across rung 4 (Design B), because three consumers call it through the
+  path-linked candidate seam.
+- `is_heartbeat() -> bool` (rung 4A) is the reconstructor's action-aware skip
+  predicate: `is_system_message()` for `Add`, `Modify`, `Cancel`, `Fill` and
+  `None`; `false` for `Clear` (a book reset) and `TradeAggregate` (a counted
+  book-no-op trade print), whatever their fields.
+- `validate_admission() -> Result<()>` (rung 4A) is `validate()` made
+  action-aware: `Clear` is exempt, `TradeAggregate` is exempt from the
+  `order_id == 0` clause only, every other action gets `validate()` unchanged.
 - `price_as_f64() -> f64` divides by the crate's 1e9 constant. The result is
   instrument-native; callers may label it dollars only when instrument context
   establishes a USD-quoted product.
@@ -337,9 +349,9 @@ pub struct Order { pub side: Side, pub price: i64, pub size: u32 }
 |-------|------|---------|-------------|
 | `levels` | `usize` | 10 | Price levels to track |
 | `crossed_quote_policy` | `CrossedQuotePolicy` | `Allow` | How to handle crossed quotes |
-| `validate_messages` | `bool` | `true` | Validate messages before processing |
+| `validate_messages` | `bool` | `true` | Validate with `MboMessage::validate_admission()` before processing (`Clear` exempt; `TradeAggregate` exempt from the `order_id == 0` clause only) |
 | `log_warnings` | `bool` | `true` | Log warnings for consistency issues |
-| `skip_system_messages` | `bool` | `true` | Skip order_id=0, size=0, price<=0 |
+| `skip_system_messages` | `bool` | `true` | Skip `MboMessage::is_heartbeat()` records: `order_id == 0`, `size == 0` or `price <= 0` on any action except `Clear` and `TradeAggregate`, which are never skipped (rung 4A) |
 
 Builder: `new(levels)`, `with_crossed_quote_policy()`, `with_validation()`, `with_logging()`, `with_skip_system_messages()`.
 
@@ -663,9 +675,12 @@ filters are intentionally different:
 ### System Message Filtering
 
 `MboMessage::is_system_message()` (`src/types.rs`) returns true for the internal
-structural shape `order_id == 0 || size == 0 || price <= 0`. The
-`LobReconstructor` uses it when `skip_system_messages` is true, but exempts
-`Action::Clear`; external consumers may also apply it. Do not equate this
+structural shape `order_id == 0 || size == 0 || price <= 0`. Since rung 4A the
+`LobReconstructor` no longer calls it at its gates: when `skip_system_messages`
+is true it skips `MboMessage::is_heartbeat()` records — that shape with
+`Action::Clear` and `Action::TradeAggregate` exempt — and validates with
+`MboMessage::validate_admission()`. External consumers may still apply
+`is_system_message()` (the sibling extractor does, until rung 4B). Do not equate this
 predicate with a DBN heartbeat/status record class. FINDING-122 measured
 `order_id == 0` on every true-Trade row and on no Fill row in the bounded
 NVDA/XNAS census, so applying the predicate upstream changes trade coverage and
@@ -807,7 +822,7 @@ Additionally, from `src/loader/mod.rs`: `IO_BUFFER_SIZE: usize = 1_048_576` (1 M
 
 From `src/types.rs`: `MAX_LOB_LEVELS: usize = 20`.
 
-From `src/export/mod.rs`: `SCHEMA_VERSION: &str = "1.0"`, `DEFAULT_BATCH_SIZE: usize = 65_536`.
+From `src/export/mod.rs`: `SCHEMA_VERSION` (read the constant for its value; its docs carry the history `1.0` → `2.0` at L-DECODE → `3.0` at rung 4A), `DEFAULT_BATCH_SIZE: usize = 65_536`.
 
 ---
 
@@ -815,7 +830,7 @@ From `src/export/mod.rs`: `SCHEMA_VERSION: &str = "1.0"`, `DEFAULT_BATCH_SIZE: u
 
 ### Schema Version
 
-`SCHEMA_VERSION = "1.0"` (embedded in every Parquet file's metadata). Any breaking schema change requires a version bump.
+`SCHEMA_VERSION` (embedded in every Parquet file's metadata; read the constant for its value and history — this line said `"1.0"` long after it moved). Any breaking schema change requires a version bump, and so does any change to the values an existing column carries (root `VERSIONING.md` R7, clause (b)): `3.0` is such a bump, for the `sequence` column.
 
 ### LOB Snapshot Schema (`lob_snapshot_schema()`)
 

@@ -457,7 +457,7 @@ println!("Wrote {} snapshots", stats.rows_written);
 - **Prices**: raw `Int64` fixed-point values; sentinel-check first, then divide by `1_000_000_000`. The generic DBN result is in the instrument-native price unit; the current XNAS/ARCX equity exports interpret that unit as USD and retain the historical footer label `price_unit = "nanodollars"`.
 - **Sizes**: raw `UInt32` instrument/publisher-native quantities; the current equity exports interpret them as shares and retain `size_unit = "shares"`.
 - **Timestamps**: `Int64` nanoseconds since epoch. In the current v0.3.0 export they come from internal `MboMessage.timestamp`, which `DbnBridge` populates from `hd.ts_event`, not from MBO's DBN primary/index timestamp `ts_recv`.
-- **Parquet schema version**: `1.0` (embedded in file metadata)
+- **Parquet schema version**: `SCHEMA_VERSION` in `src/export/mod.rs` (embedded in file metadata) — bumped on any breaking schema change and on any change to an existing column's values; read the constant and its history rather than a value copied here
 - **Reconstruction-stats JSON**: carries its **own** `LOB_STATS_SCHEMA_VERSION` — independent of the Parquet version above (bumped on any change to the stats envelope). See `CHANGELOG.md` / `src/lob/reconstructor.rs` for the current value.
 
 See `src/export/schema.rs` for the authoritative Parquet column definitions.

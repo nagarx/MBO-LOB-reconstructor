@@ -6,7 +6,8 @@
 //!
 //! # Data Contract
 //!
-//! - **Schema version**: `1.0` -- any breaking change requires a version bump
+//! - **Schema version**: [`SCHEMA_VERSION`] -- bumped on any breaking schema change AND on
+//!   any change to an existing column's values (see its history); do not hand-copy the value
 //! - **Price unit**: nanodollars (`i64`, divide by 1e9 for dollars)
 //! - **Timestamp unit**: nanoseconds since epoch
 //! - **Size unit**: shares
@@ -37,7 +38,22 @@ use parquet::basic::Compression;
 use crate::types::MAX_LOB_LEVELS;
 
 /// Schema version embedded in every exported Parquet file.
-/// Bump on any breaking schema change.
+/// Bump on any breaking schema change, AND on any change to the VALUES an existing column
+/// carries: root `VERSIONING.md` R7 (output values change => MAJOR), whose clause (b) binds
+/// this constant although the rule above is worded in terms of shape.
+///
+/// # 3.0 — rung 4A (L-ADMIT): the `sequence` column counts every trade print
+///
+/// `2.0` → `3.0` is a VALUE change to an existing column; no column is added, removed or
+/// retyped. `sequence` is `LobState::message_index`, which the reconstructor sets from
+/// `LobStats::messages_processed`, and since rung 4A that counts every admitted
+/// `TradeAggregate`: in a `2.0` file each row emitted for a skipped trade print repeated the
+/// previous value, while in a `3.0` file it advances. Measured on XNAS NVDA 2025-07-01 (the
+/// `--downsample-every 5000000` arm): the second sampled row's `sequence` moved 4,789,812 →
+/// 5,000,003 at the same `timestamp_ns`, every other column identical. The book columns are
+/// unchanged by construction (the router's `TradeAggregate` arm touches no book state). The
+/// shape did not change, so without this bump a post-4A file would carry the same metadata as
+/// a pre-4A one and a consumer could not tell the two apart.
 ///
 /// # 2.0 — the `T`/`F` carrier split (L-DECODE)
 ///
@@ -59,7 +75,7 @@ use crate::types::MAX_LOB_LEVELS;
 /// contain zero fills. Every exported file additionally carries an `action_carrier_split`
 /// metadata key (see `schema::schema_metadata`) — the explicit, data-independent signal a
 /// consumer should branch on.
-pub const SCHEMA_VERSION: &str = "2.0";
+pub const SCHEMA_VERSION: &str = "3.0";
 
 /// Default number of rows buffered before flushing to a Parquet row group.
 pub const DEFAULT_BATCH_SIZE: usize = 65_536;

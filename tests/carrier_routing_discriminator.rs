@@ -13,8 +13,21 @@
 //! On the XNAS tape W4 is **bit-identical to the correct fix on every counter**,
 //! because 100% of the `TradeAggregate` population there carries `order_id == 0`
 //! (375,643/375,643 on 2025-07-01; 319,230/319,230 on 2025-07-02) and is dropped
-//! by `is_system_message()` at L-ADMIT *before* it reaches the router. The T arm
-//! is **dormant on XNAS data**. Nothing in the XNAS acceptance set can see it.
+//! by the field-shape `is_system_message()` skip gate — the gate rung 4 (L-ADMIT)
+//! later relaxed — *before* it reaches the router. The T arm is **dormant on XNAS
+//! data**. Nothing in the XNAS acceptance set can see it.
+//!
+//! ⚠ **UPDATED AT RUNG 4A (L-ADMIT, reconstructor half).** The paragraph above is
+//! the pre-4A state. Since rung 4A the skip gate keys on `is_heartbeat()`, which
+//! exempts `TradeAggregate`, so every XNAS `T` now REACHES the router under the
+//! default config and the T arm is live on XNAS data. So W4 is no longer invisible
+//! there: a `T` routed into the reduction path misses at Stage 1 (`order_id == 0`
+//! names no resting order), and a Stage-1 miss adds 1 to `cancel_order_not_found`
+//! and returns `Ok` — on live XNAS a mis-routed `T` shows as `cancel_order_not_found`
+//! ≈ count(T) instead of 0, and lock tests (b)/(d) in
+//! `tests/l_admit_half_landing_lock.rs` assert that counter stays 0. What this file
+//! still owns alone is observing the mutation as a BOOK change: the record shape
+//! constructed below (a carrier whose `order_id` resolves to a resting order).
 //!
 //! Measured 2026-08-16, three built arms (baseline / W4 / correct), same source
 //! except the two router arms, full-day replay:
@@ -194,9 +207,10 @@ fn fingerprint(lob: &LobReconstructor) -> BookFingerprint {
 ///
 /// This is REQUIRED by the test contract and is not cosmetic. The records under
 /// test already carry `order_id != 0 && size != 0 && price > 0`, so
-/// `is_system_message()` is false and L-ADMIT would not drop them either way —
+/// `is_system_message()` is false and the skip gate would not drop them either way —
 /// but pinning the flag off makes this a **pure router test** that stays valid
-/// when COMMIT 3 (L-ADMIT) changes the admission predicate underneath it.
+/// across rung 4 (L-ADMIT, landed as rung 4A), which changed the admission predicate
+/// underneath it.
 fn seeded_book() -> LobReconstructor {
     let config = LobConfig::new(10)
         .with_skip_system_messages(false)
@@ -439,8 +453,8 @@ fn trade_aggregate_with_resolvable_order_id_must_not_mutate_the_book() {
     //   side     = Bid   -> a real side, not Side::None
     //   size     = 100   -> PARTIAL (< the resting 500), so `active_orders` cannot
     //                       detect the mutation and the level state must
-    // This shape does not occur on the XNAS tape; it exists to make the dormant
-    // T arm observable.
+    // This shape does not occur on the XNAS tape; it exists to make a
+    // book-mutating T arm observable as a book change.
     lob.process_message(&msg(1001, Action::TradeAggregate, Side::Bid, 100.00, 100))
         .expect("TradeAggregate must not error");
 
@@ -452,9 +466,12 @@ fn trade_aggregate_with_resolvable_order_id_must_not_mutate_the_book() {
          `Action::TradeAggregate` is a documented vendor BOOK NO-OP, but processing one \
          with a resolvable order_id changed the book.\n\
          This is the W4 signature: `Fill` fixed, `TradeAggregate` left routed into \
-         the reduction path. Every XNAS live-data counter is bit-identical to the correct \
-         fix because 100% of the real XNAS T population carries order_id == 0 and is \
-         dropped at L-ADMIT — so on XNAS ONLY this test can see it. (On ARCX the \
+         the reduction path. No XNAS live-data book level can show it: 100% of the real \
+         XNAS T population carries order_id == 0, which resolves to no resting order. \
+         Since rung 4A every such T reaches the router, so on live XNAS a mis-routed T \
+         shows instead as cancel_order_not_found ~= count(T) (each Stage-1 miss adds 1 \
+         and returns Ok), and lock tests (b)/(d) catch that too; this test is the one \
+         that shows it as a BOOK change. (On ARCX the \
          live-data instrument is `cancel_order_not_found`: 157,493 -> 0 on 2025-07-01 \
          and 127,527 -> 0 on 2025-07-02. NOT `trade_order_not_found` — that counter \
          has no increment site post-COMMIT-2a and reads 0 under W4 too.)\n\
